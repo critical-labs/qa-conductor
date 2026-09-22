@@ -92,13 +92,13 @@ test('waitHealthyPg throws after exhausting retries', async () => {
   assert.equal(exec.calls.length, 3)
 })
 
-test('cloneDb creates the target db then pipes pg_dump into psql via one bash -lc', async () => {
+test('cloneDb creates the target db then pipes pg_dump into psql via one sh -c', async () => {
   const exec = recordingExec()
   const docker = createDocker({ execFileFn: exec })
   await docker.cloneDb('homefree-db-1', 'qa-pg-base', 'idp')
   assert.deepEqual(exec.calls, [
     ['docker', 'exec', 'qa-pg-base', 'psql', '-U', 'homefree', '-d', 'postgres', '-c', 'CREATE DATABASE idp'],
-    ['bash', '-lc', 'docker exec homefree-db-1 pg_dump -U homefree --clean --if-exists idp | docker exec -i qa-pg-base psql -q -U homefree -d idp'],
+    ['sh', '-c', 'docker exec homefree-db-1 pg_dump -U homefree --clean --if-exists idp | docker exec -i qa-pg-base psql -q -U homefree -d idp'],
   ])
 })
 
@@ -107,7 +107,7 @@ test('cloneDb tolerates already-exists on CREATE DATABASE', async () => {
   const docker = createDocker({ execFileFn: exec })
   await docker.cloneDb('homefree-db-1', 'qa-pg-base', 'idp')
   assert.equal(exec.calls.length, 2)
-  assert.equal(exec.calls[1][0], 'bash')
+  assert.equal(exec.calls[1][0], 'sh')
 })
 
 test('cloneDb rethrows other CREATE DATABASE failures', async () => {

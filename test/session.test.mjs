@@ -89,10 +89,14 @@ function makeDeps({ tagExists = true, failAt = null } = {}) {
     '/cd/.env.image.rc': 'APP_IMAGE=ghcr.io/238855/homefree-app:1.0.0-rc.38\nMIGRATE_IMAGE=m\n',
     '/cd/.env': 'APP_DOMAIN=homefree.cloud\nRESEND_API_KEY=r\n',
   }
+  let tagCalls = 0
   const deps = {
+    sleepFn: rec('sleep'),
     github: {
       prHead: rec('prHead', () => 'abcdef123456ffff'),
-      ghcrTagExists: rec('ghcrTagExists', () => tagExists),
+      // First call checks the app tag; later calls (migrate wait) succeed so
+      // the dispatch-path test terminates without sleeping.
+      ghcrTagExists: rec('ghcrTagExists', () => tagExists || ++tagCalls > 1),
       dispatchPreviewBuild: rec('dispatch'),
       awaitPreviewImage: rec('await'),
       latestRcTag: rec('latestRcTag', () => '1.0.0-rc.99'),
@@ -142,6 +146,16 @@ test('bootSession happy path: order, tags, tokens', async () => {
   // progress order
   const steps = calls.filter(c => c[0] === 'progress').map(c => c[1])
   assert.deepEqual(steps, ['ensuring-image', 'cloning', 'migrating', 'starting'])
+})
+
+test('bootSession waits for the migrate tag when it lags the app tag', async () => {
+  const { deps, calls } = makeDeps()
+  const answers = [true, false, false, true] // app tag, then migrate polls
+  deps.github.ghcrTagExists = async () => answers.shift()
+  await bootSession(deps, 7)
+  const sleeps = calls.filter(c => c[0] === 'sleep')
+  assert.equal(sleeps.length, 2)
+  assert.equal(sleeps[0][1], 15000)
 })
 
 test('bootSession dispatches + awaits the build when the tag is missing', async () => {
