@@ -106,6 +106,8 @@ function makeDeps({ tagExists = true, failAt = null } = {}) {
       runPg: rec('runPg'),
       waitHealthyPg: rec('waitHealthyPg'),
       cloneDb: rec('cloneDb'),
+      ensureImage: rec('ensureImage'),
+      login: rec('login'),
       runMigrate: rec('runMigrate'),
       runApp: rec('runApp'),
       waitHealthyApp: rec('waitHealthyApp'),
@@ -143,6 +145,14 @@ test('bootSession happy path: order, tags, tokens', async () => {
   const migs = calls.filter(c => c[0] === 'runMigrate')
   assert.equal(migs[0][1], 'ghcr.io/238855/homefree-app:migrate-1.0.0-rc.38')
   assert.equal(migs[1][1], 'ghcr.io/238855/homefree-app:migrate-pr-7-abcdef123456')
+  // every image is pulled (ensureImage) before it is run: 2 migrate + 2 app
+  const ensured = calls.filter(c => c[0] === 'ensureImage').map(c => c[1])
+  assert.deepEqual(ensured, [
+    'ghcr.io/238855/homefree-app:migrate-1.0.0-rc.38',
+    'ghcr.io/238855/homefree-app:migrate-pr-7-abcdef123456',
+    'ghcr.io/238855/homefree-app:1.0.0-rc.38',
+    'ghcr.io/238855/homefree-app:pr-7-abcdef123456',
+  ])
   // progress order
   const steps = calls.filter(c => c[0] === 'progress').map(c => c[1])
   assert.deepEqual(steps, ['ensuring-image', 'cloning', 'migrating', 'starting'])
