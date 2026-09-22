@@ -190,3 +190,10 @@ test('teardownSession without created falls back to all known names', async () =
   assert.deepEqual(rm[1], [PANES.base.app, PANES.pr.app, PANES.base.pg, PANES.pr.pg])
   assert.ok(calls.some(c => c[0] === 'rmNetwork' && c[1] === NETWORK))
 })
+
+test('teardownSession removes the deterministic pane env files even without created', async () => {
+  const { deps, calls } = makeDeps()
+  await teardownSession({ docker: deps.docker, fsx: deps.fsx, composeDir: '/cd' }, null)
+  const unlinked = calls.filter(c => c[0] === 'unlink').map(c => c[1]).sort()
+  assert.deepEqual(unlinked, ['/cd/.env.qa-base', '/cd/.env.qa-pr'])
+})
