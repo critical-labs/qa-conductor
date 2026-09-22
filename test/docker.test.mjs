@@ -108,6 +108,47 @@ test('login pipes the token via child env and stdin, never argv', async () => {
   assert.equal(opts.env.GHCR_USER, '238855')
 })
 
+test('login merges the parent env so HOME survives (credential goes to the right place)', async () => {
+  const calls = []
+  const execFileFn = async (file, args, opts) => { calls.push([file, args, opts]); return { stdout: '' } }
+  const docker = createDocker({ execFileFn })
+  await docker.login('238855', 'tok')
+  const opts = calls[0][2]
+  // asserts we spread process.env rather than replacing it: PATH (always set) is present
+  assert.ok('PATH' in opts.env)
+  assert.equal(opts.env.GHCR_TOKEN, 'tok')
+})
+
+test('ensureImage no-ops when the image is already present', async () => {
+  const exec = recordingExec(['{}\n']) // image inspect succeeds
+  const docker = createDocker({ execFileFn: exec })
+  await docker.ensureImage('ghcr.io/x/app:pr-1-abc')
+  assert.deepEqual(exec.calls, [['docker', 'image', 'inspect', 'ghcr.io/x/app:pr-1-abc']])
+})
+
+test('ensureImage pulls, retrying with a relogin on transient denied', async () => {
+  const exec = recordingExec([
+    new Error('No such image'), // inspect fails -> not present
+    new Error('denied'),        // pull attempt 1 fails
+    'pulled\n',                 // pull attempt 2 succeeds
+  ])
+  const docker = createDocker({ execFileFn: exec })
+  let relogins = 0
+  await docker.ensureImage('ghcr.io/x/app:pr-1-abc', { sleepFn: async () => {}, relogin: async () => { relogins++ } })
+  assert.equal(relogins, 1)
+  assert.deepEqual(exec.calls[1], ['docker', 'pull', 'ghcr.io/x/app:pr-1-abc'])
+  assert.deepEqual(exec.calls[2], ['docker', 'pull', 'ghcr.io/x/app:pr-1-abc'])
+})
+
+test('ensureImage throws after exhausting pull retries', async () => {
+  const exec = recordingExec([new Error('nope'), new Error('denied'), new Error('denied'), new Error('denied')])
+  const docker = createDocker({ execFileFn: exec })
+  await assert.rejects(
+    docker.ensureImage('ghcr.io/x/app:pr-1-abc', { retries: 3, sleepFn: async () => {} }),
+    /failed after 3 attempts/,
+  )
+})
+
 test('cloneDb creates the target db then pipes pg_dump into psql via one sh -c', async () => {
   const exec = recordingExec()
   const docker = createDocker({ execFileFn: exec })
