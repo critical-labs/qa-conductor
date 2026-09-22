@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HomeFree PR-QA</title>
+<style>
+  :root { --bg:#14171a; --card:#1e2328; --line:#2c333a; --text:#e6e9ec; --dim:#9aa4ad; --green:#4e8f68; --red:#c05b5b; --amber:#d9a441; }
+  * { box-sizing: border-box }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui, sans-serif; height:100vh; display:flex; flex-direction:column }
+  header { display:flex; align-items:center; gap:12px; padding:8px 14px; background:var(--green); color:#fff }
+  header b { font-size:15px }
+  header .meta { color:#eafff2; opacity:.9; font-size:12px }
+  header .spacer { flex:1 }
+  button { background:#2c333a; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px 12px; cursor:pointer; font:inherit }
+  button:hover { background:#39424b }
+  button.primary { background:var(--green); border-color:var(--green); color:#fff }
+  button.danger { background:var(--red); border-color:var(--red); color:#fff }
+  button.on { outline:2px solid var(--green) }
+  main { flex:1; display:flex; flex-direction:column; min-height:0 }
+  #picker, #progress { max-width:760px; margin:32px auto; width:100% }
+  .pr { display:flex; align-items:center; gap:10px; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px 14px; margin-bottom:8px }
+  .pr .n { color:var(--dim) }
+  .pr .t { flex:1 }
+  #progress ol { list-style:none; padding:0 }
+  #progress li { padding:6px 0; color:var(--dim) }
+  #progress li.done::before { content:'✓ '; color:var(--green) }
+  #progress li.now::before { content:'… '; color:var(--amber) }
+  #progress pre { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:10px; white-space:pre-wrap; color:var(--red) }
+  #panes { flex:1; display:none; min-height:0; flex-direction:column }
+  #panes.active { display:flex }
+  #paneRow { flex:1; display:flex; min-height:0 }
+  .pane { flex:1; display:flex; flex-direction:column; min-width:0; border-right:1px solid var(--line) }
+  .pane:last-child { border-right:0 }
+  .paneBar { display:flex; gap:8px; align-items:center; padding:4px 10px; background:var(--card); border-bottom:1px solid var(--line); font-size:12px; color:var(--dim) }
+  .paneBar .url { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
+  .paneWrap { flex:1; display:flex; justify-content:center; background:#0d0f11; min-height:0 }
+  iframe { border:0; height:100%; width:100%; background:#fff }
+  .flash { animation: flash .6s }
+  @keyframes flash { 0%,100% { box-shadow:none } 50% { box-shadow: inset 0 0 0 4px var(--amber) } }
+  footer { display:flex; gap:10px; align-items:center; padding:10px 14px; background:var(--card); border-top:1px solid var(--line) }
+  footer textarea { flex:1; background:#14171a; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:8px; font:inherit; resize:vertical; min-height:38px }
+  #result a { color:#8fd3ae }
+</style>
+</head>
+<body>
+<header>
+  <b>PR-QA</b>
+  <span class="meta" id="headMeta">side-by-side preview</span>
+  <span class="spacer"></span>
+  <button id="mirrorBtn" class="on" title="Mirror interactions between panes">Mirror: on</button>
+  <button id="resyncBtn" title="Reload right pane at left pane's URL">Re-sync →</button>
+  <button data-width="375">375</button>
+  <button data-width="768">768</button>
+  <button data-width="0" class="on">Full</button>
+  <button id="teardownBtn" class="danger">End session</button>
+</header>
+<main>
+  <div id="picker"><h3>Open pull requests</h3><div id="prList">Loading…</div></div>
+  <div id="progress" style="display:none">
+    <h3 id="progressTitle">Booting…</h3>
+    <ol>
+      <li data-step="ensuring-image">Ensure PR image (builds on first open — can take ~10 min)</li>
+      <li data-step="cloning">Clone prod databases into both panes</li>
+      <li data-step="migrating">Run each pane's migrations</li>
+      <li data-step="starting">Start base + PR apps, sign in</li>
+    </ol>
+    <pre id="bootError" style="display:none"></pre>
+  </div>
+  <div id="panes">
+    <div id="paneRow">
+      <div class="pane">
+        <div class="paneBar"><b>BASE</b><span class="url" id="baseUrl"></span></div>
+        <div class="paneWrap"><iframe id="baseFrame" title="base"></iframe></div>
+      </div>
+      <div class="pane">
+        <div class="paneBar"><b>PR</b><span class="url" id="prUrl"></span></div>
+        <div class="paneWrap"><iframe id="prFrame" title="pr"></iframe></div>
+      </div>
+    </div>
+  </div>
+</main>
+<footer>
+  <textarea id="notes" placeholder="QA notes (land on the PR comment)…"></textarea>
+  <button id="acceptBtn" class="primary">✅ Accept</button>
+  <button id="rejectBtn" class="danger">❌ Reject</button>
+  <span id="result"></span>
+</footer>
+<script src="/qa/harness.js"></script>
+</body>
+</html>
