@@ -92,6 +92,22 @@ test('waitHealthyPg throws after exhausting retries', async () => {
   assert.equal(exec.calls.length, 3)
 })
 
+test('login pipes the token via child env and stdin, never argv', async () => {
+  const calls = []
+  const execFileFn = async (file, args, opts) => {
+    calls.push([file, args, opts])
+    return { stdout: '' }
+  }
+  const docker = createDocker({ execFileFn })
+  await docker.login('238855', 'sekret-tok')
+  const [cmd, args, opts] = calls[0]
+  assert.equal(cmd, 'sh')
+  assert.ok(args[1].includes('docker login ghcr.io'))
+  assert.ok(!args.join(' ').includes('sekret-tok'))
+  assert.equal(opts.env.GHCR_TOKEN, 'sekret-tok')
+  assert.equal(opts.env.GHCR_USER, '238855')
+})
+
 test('cloneDb creates the target db then pipes pg_dump into psql via one sh -c', async () => {
   const exec = recordingExec()
   const docker = createDocker({ execFileFn: exec })
