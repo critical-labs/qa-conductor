@@ -67,19 +67,38 @@ test('runMigrate builds the exact docker run argv', async () => {
   ]])
 })
 
-test('waitHealthyPg polls pg_isready until it succeeds', async () => {
+test('waitHealthyPg needs two consecutive isready+query probes', async () => {
   const exec = recordingExec([
-    new Error('not ready'),
-    new Error('not ready'),
-    'accepting connections\n',
+    new Error('not ready'),      // attempt 1: pg_isready fails
+    new Error('not ready'),      // attempt 2: pg_isready fails
+    'accepting connections\n',   // attempt 3: pg_isready ok
+    '1\n',                       // attempt 3: SELECT 1 ok (1st consecutive)
+    'accepting connections\n',   // attempt 4: pg_isready ok
+    '1\n',                       // attempt 4: SELECT 1 ok (2nd consecutive -> done)
   ])
   const sleeps = []
   const sleepFn = async (ms) => sleeps.push(ms)
   const docker = createDocker({ execFileFn: exec })
   await docker.waitHealthyPg('qa-pg-base', { retries: 5, sleepFn })
-  assert.equal(exec.calls.length, 3)
+  assert.equal(exec.calls.length, 6)
   assert.deepEqual(exec.calls[0], ['docker', 'exec', 'qa-pg-base', 'pg_isready', '-U', 'homefree'])
-  assert.equal(sleeps.length, 2)
+  assert.deepEqual(exec.calls[3], ['docker', 'exec', 'qa-pg-base', 'psql', '-U', 'homefree', '-d', 'postgres', '-c', 'SELECT 1'])
+  assert.equal(sleeps.length, 3)
+})
+
+test('waitHealthyPg resets the streak when the temporary init server drops', async () => {
+  const exec = recordingExec([
+    'accepting connections\n',   // attempt 1: temporary initdb server answers
+    '1\n',                       //            ...and even runs a query
+    new Error('shutting down'),  // attempt 2: entrypoint restart gap -> reset
+    'accepting connections\n',   // attempt 3: real server up
+    '1\n',
+    'accepting connections\n',   // attempt 4: still up -> done
+    '1\n',
+  ])
+  const docker = createDocker({ execFileFn: exec })
+  await docker.waitHealthyPg('qa-pg-base', { retries: 6, sleepFn: async () => {} })
+  assert.equal(exec.calls.length, 7)
 })
 
 test('waitHealthyPg throws after exhausting retries', async () => {
@@ -167,11 +186,36 @@ test('cloneDb tolerates already-exists on CREATE DATABASE', async () => {
   assert.equal(exec.calls[1][0], 'sh')
 })
 
-test('cloneDb rethrows other CREATE DATABASE failures', async () => {
-  const exec = recordingExec([new Error('connection refused')])
+test('cloneDb rethrows non-transient CREATE DATABASE failures immediately', async () => {
+  const exec = recordingExec([new Error('ERROR:  permission denied to create database')])
   const docker = createDocker({ execFileFn: exec })
-  await assert.rejects(docker.cloneDb('homefree-db-1', 'qa-pg-base', 'idp'), /connection refused/)
+  await assert.rejects(docker.cloneDb('homefree-db-1', 'qa-pg-base', 'idp'), /permission denied/)
   assert.equal(exec.calls.length, 1)
+})
+
+test('cloneDb retries CREATE DATABASE through the postgres restart window', async () => {
+  const exec = recordingExec([
+    new Error('psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed'),
+    '',   // CREATE DATABASE succeeds on retry
+    '',   // pg_dump | psql pipeline
+  ])
+  const sleeps = []
+  const docker = createDocker({ execFileFn: exec })
+  await docker.cloneDb('homefree-db-1', 'qa-pg-base', 'idp', { sleepFn: async (ms) => sleeps.push(ms) })
+  assert.equal(exec.calls.length, 3)
+  assert.equal(exec.calls[2][0], 'sh')
+  assert.equal(sleeps.length, 1)
+})
+
+test('cloneDb gives up on transient errors after exhausting retries', async () => {
+  const transient = () => new Error('connection to server at "localhost" failed')
+  const exec = recordingExec([transient(), transient(), transient()])
+  const docker = createDocker({ execFileFn: exec })
+  await assert.rejects(
+    docker.cloneDb('homefree-db-1', 'qa-pg-base', 'idp', { retries: 3, sleepFn: async () => {} }),
+    /connection to server/,
+  )
+  assert.equal(exec.calls.length, 3)
 })
 
 test('cloneDb rejects names that fail the safe-name pattern', async () => {
