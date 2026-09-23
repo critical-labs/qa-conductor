@@ -175,6 +175,51 @@ test('bootSession dispatches + awaits the build when the tag is missing', async 
   assert.ok(calls.some(c => c[0] === 'await'))
 })
 
+test('bootSession cold path surfaces the preview run via onBuild', async () => {
+  const { deps, calls } = makeDeps({ tagExists: false })
+  deps.github.findPreviewRun = async () => ({ url: 'https://gh/run/1', status: 'queued' })
+  const builds = []
+  deps.onBuild = async ev => { builds.push(ev) }
+  await bootSession(deps, 7)
+  assert.ok(calls.some(c => c[0] === 'dispatch'))
+  assert.equal(builds.length, 1)
+  assert.deepEqual(builds[0], { runUrl: 'https://gh/run/1', runStatus: 'queued' })
+})
+
+test('bootSession warm path never calls onBuild even when findPreviewRun exists', async () => {
+  const { deps, calls } = makeDeps() // tag already exists
+  deps.github.findPreviewRun = async () => ({ url: 'u', status: 'queued' })
+  const builds = []
+  deps.onBuild = async ev => { builds.push(ev) }
+  await bootSession(deps, 7)
+  assert.ok(!calls.some(c => c[0] === 'dispatch'))
+  assert.equal(builds.length, 0)
+})
+
+test('bootSession re-queries the run in the wait loop and reports only status changes', async () => {
+  const { deps } = makeDeps({ tagExists: false })
+  // app tag missing -> dispatch; then the migrate tag lags a few polls.
+  const answers = [false, false, false, false, true]
+  deps.github.ghcrTagExists = async () => answers.shift()
+  let n = 0
+  const statuses = ['queued', 'queued', 'in_progress', 'completed']
+  deps.github.findPreviewRun = async () => ({ url: 'https://gh/run/9', status: statuses[Math.min(n++, statuses.length - 1)] })
+  const builds = []
+  deps.onBuild = async ev => { builds.push(ev) }
+  await bootSession(deps, 7)
+  // first at dispatch, then only when the status actually changed
+  assert.deepEqual(builds.map(b => b.runStatus), ['queued', 'in_progress'])
+  assert.ok(builds.every(b => b.runUrl === 'https://gh/run/9'))
+})
+
+test('bootSession swallows onBuild errors and still boots', async () => {
+  const { deps } = makeDeps({ tagExists: false })
+  deps.github.findPreviewRun = async () => ({ url: 'u', status: 'queued' })
+  deps.onBuild = async () => { throw new Error('boom') }
+  const out = await bootSession(deps, 7)
+  assert.equal(out.prTag, 'ghcr.io/238855/homefree-app:pr-7-abcdef123456')
+})
+
 test('bootSession failure mid-boot tears down what was created and rethrows', async () => {
   const { deps, calls } = makeDeps({ failAt: 'runMigrate' })
   await assert.rejects(() => bootSession(deps, 7), /fail:runMigrate/)

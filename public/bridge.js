@@ -131,6 +131,13 @@ function resolveSelector(desc, doc) {
     }
   }
 
+  // Heartbeat: a lightweight liveness ping so the harness can tell a live pane
+  // from a crashed or navigated-away one. Reuses send() for its postMessage +
+  // try/catch; independent of the capture/replay paths.
+  setInterval(function () {
+    send({ qa: 1, kind: 'ping' })
+  }, 5000)
+
   function valueOf(el) {
     const tag = el.tagName
     if (tag === 'INPUT') {

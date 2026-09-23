@@ -168,6 +168,128 @@ test('awaitPreviewImage throws after timeoutMs of polling', async () => {
   assert.deepEqual(sleeps, [15000, 15000, 15000])
 })
 
+test('findPreviewRun returns the newest run by created_at with mapped fields', async () => {
+  const { calls, fetchFn } = makeFetch(() =>
+    response(200, {
+      workflow_runs: [
+        {
+          html_url: 'https://github.com/238855/homefree/actions/runs/1',
+          status: 'completed',
+          conclusion: 'success',
+          created_at: '2026-09-20T00:00:00Z',
+          run_started_at: '2026-09-20T00:01:00Z',
+          display_title: 'old preview',
+          head_branch: 'main',
+        },
+        {
+          html_url: 'https://github.com/238855/homefree/actions/runs/2',
+          status: 'in_progress',
+          conclusion: null,
+          created_at: '2026-09-22T00:00:00Z',
+          run_started_at: '2026-09-22T00:01:00Z',
+          display_title: 'newest preview',
+          head_branch: 'main',
+        },
+      ],
+    }),
+  )
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn })
+  const run = await gh.findPreviewRun(41)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].url, `${API}/repos/${REPO}/actions/workflows/pr-preview.yml/runs?per_page=10`)
+  assert.equal(calls[0].options.method, 'GET')
+  assertGithubHeaders(calls[0].options)
+  assert.deepEqual(run, {
+    url: 'https://github.com/238855/homefree/actions/runs/2',
+    status: 'in_progress',
+    conclusion: null,
+    startedAt: '2026-09-22T00:01:00Z',
+  })
+})
+
+test('findPreviewRun prefers a run referencing the PR over a newer unrelated run', async () => {
+  const { fetchFn } = makeFetch(() =>
+    response(200, [
+      {
+        html_url: 'https://github.com/238855/homefree/actions/runs/3',
+        status: 'completed',
+        conclusion: 'success',
+        created_at: '2026-09-22T00:00:00Z',
+        run_started_at: '2026-09-22T00:00:30Z',
+        display_title: 'unrelated build',
+        head_branch: 'main',
+      },
+      {
+        html_url: 'https://github.com/238855/homefree/actions/runs/4',
+        status: 'completed',
+        conclusion: 'failure',
+        created_at: '2026-09-21T00:00:00Z',
+        run_started_at: '2026-09-21T00:00:30Z',
+        display_title: 'preview for pull request',
+        head_branch: 'pr-41',
+      },
+    ]),
+  )
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn })
+  const run = await gh.findPreviewRun(41)
+  assert.equal(run.url, 'https://github.com/238855/homefree/actions/runs/4')
+  assert.equal(run.conclusion, 'failure')
+  assert.equal(run.startedAt, '2026-09-21T00:00:30Z')
+})
+
+test('findPreviewRun falls back to created_at and null conclusion when fields are missing', async () => {
+  const { fetchFn } = makeFetch(() =>
+    response(200, [
+      { html_url: 'https://github.com/238855/homefree/actions/runs/5', status: 'queued', created_at: '2026-09-23T00:00:00Z' },
+    ]),
+  )
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn })
+  const run = await gh.findPreviewRun(41)
+  assert.deepEqual(run, {
+    url: 'https://github.com/238855/homefree/actions/runs/5',
+    status: 'queued',
+    conclusion: null,
+    startedAt: '2026-09-23T00:00:00Z',
+  })
+})
+
+test('findPreviewRun returns null when there are no runs', async () => {
+  const { fetchFn } = makeFetch(() => response(200, { workflow_runs: [] }))
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn })
+  assert.equal(await gh.findPreviewRun(41), null)
+})
+
+test('listPrImageTags flattens and dedups tags across one paginated walk', async () => {
+  const page1 = Array.from({ length: 100 }, (_, i) =>
+    i === 0
+      ? version(i, ['pr-41-aaaaaaaaaaaa', 'shared-tag'], '2026-09-01T00:00:00Z')
+      : version(i, [`other-${i}`], '2026-09-01T00:00:00Z'),
+  )
+  const page2 = [
+    version(200, ['pr-42-bbbbbbbbbbbb', 'shared-tag'], '2026-09-02T00:00:00Z'),
+    version(201, ['pr-43-cccccccccccc'], '2026-09-02T00:00:00Z'),
+  ]
+  const { calls, fetchFn } = makeFetch((url) =>
+    url.endsWith('page=1') ? response(200, page1) : response(200, page2),
+  )
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn })
+  const tags = await gh.listPrImageTags()
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].url, `${API}/user/packages/container/homefree-app/versions?per_page=100&page=1`)
+  assert.equal(calls[1].url, `${API}/user/packages/container/homefree-app/versions?per_page=100&page=2`)
+  assert.ok(tags.includes('pr-41-aaaaaaaaaaaa'))
+  assert.ok(tags.includes('pr-42-bbbbbbbbbbbb'))
+  assert.ok(tags.includes('pr-43-cccccccccccc'))
+  assert.equal(tags.filter((t) => t === 'shared-tag').length, 1)
+})
+
+test('listPrImageTags returns an empty array when there are no versions', async () => {
+  const { calls, fetchFn } = makeFetch(() => response(200, []))
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn })
+  assert.deepEqual(await gh.listPrImageTags(), [])
+  assert.equal(calls.length, 1)
+})
+
 test('postComment POSTs the body and returns html_url', async () => {
   const { calls, fetchFn } = makeFetch(() => response(201, { html_url: 'https://github.com/238855/homefree/pull/41#issuecomment-1' }))
   const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn })

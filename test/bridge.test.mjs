@@ -207,3 +207,14 @@ test('selector for body itself round-trips as an empty path', () => {
   assert.deepEqual(desc, { t: 'path', v: '' })
   assert.equal(resolveSelector(desc, b.document), b.document.body)
 })
+
+// --- module shape (heartbeat lives in the inert IIFE) ----------------------
+// The heartbeat setInterval runs only inside the browser IIFE, which stays
+// dormant here (window is undefined). Guard that adding it left the pure-helper
+// exports intact so the harness can still build and resolve selectors.
+
+test('the CJS guard still exports both pure selector helpers', () => {
+  assert.equal(typeof buildSelector, 'function')
+  assert.equal(typeof resolveSelector, 'function')
+  assert.deepEqual(Object.keys(cjsModule.exports).sort(), ['buildSelector', 'resolveSelector'])
+})

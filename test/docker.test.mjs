@@ -278,3 +278,34 @@ test('inspectImageOf returns the trimmed image ref', async () => {
   ]])
   assert.equal(image, 'ghcr.io/x/app:1.2.3-rc.4')
 })
+
+test('logsTail builds the exact docker logs argv and returns stdout', async () => {
+  const exec = recordingExec(['line one\nline two\n'])
+  const docker = createDocker({ execFileFn: exec })
+  const out = await docker.logsTail('qa-app-pr')
+  assert.deepEqual(exec.calls, [[
+    'docker', 'logs', '--tail', '40', 'qa-app-pr',
+  ]])
+  assert.equal(out, 'line one\nline two\n')
+})
+
+test('logsTail honours a custom tail count and defaults missing stdout to empty', async () => {
+  const calls = []
+  const execFileFn = async (file, args) => {
+    calls.push([file, ...args])
+    return {} // no stdout key at all
+  }
+  const docker = createDocker({ execFileFn })
+  const out = await docker.logsTail('qa-app-pr', 10)
+  assert.deepEqual(calls, [[
+    'docker', 'logs', '--tail', '10', 'qa-app-pr',
+  ]])
+  assert.equal(out, '')
+})
+
+test('logsTail rejects an unsafe container name without any exec call', async () => {
+  const exec = recordingExec()
+  const docker = createDocker({ execFileFn: exec })
+  await assert.rejects(docker.logsTail('bad;name'), /unsafe/)
+  assert.equal(exec.calls.length, 0)
+})
