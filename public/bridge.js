@@ -171,22 +171,32 @@ function resolveSelector(desc, doc) {
     document.addEventListener(MIRRORED_EVENTS[i], onCaptured, true)
   }
 
-  // Page scroll, throttled to one message per 150 ms. A replayed scrollTo can
-  // fire its scroll event asynchronously — after the __qaReplaying guard has
-  // been reset — so capture is also suppressed briefly after a scroll replay
-  // to avoid echo loops.
-  let scrollPending = false
+  // Page scroll, coalesced to one message per animation frame (smooth, near
+  // real-time tracking rather than a 150 ms lurch). Each message carries both
+  // the absolute offset and the fraction of the scrollable extent plus that
+  // extent, so the receiver can hold the panes proportionally aligned when the
+  // two documents have different heights (base vs PR diff). A replayed scrollTo
+  // fires its own scroll event asynchronously, so capture is suppressed briefly
+  // after a replay to avoid echo loops.
+  function scrollMetrics() {
+    const de = document.documentElement
+    const maxX = Math.max(1, de.scrollWidth - de.clientWidth)
+    const maxY = Math.max(1, de.scrollHeight - de.clientHeight)
+    return { x: window.scrollX, y: window.scrollY, fx: window.scrollX / maxX, fy: window.scrollY / maxY, maxX: maxX, maxY: maxY }
+  }
+  let scrollScheduled = false
   let suppressScrollUntil = 0
   document.addEventListener('scroll', function (event) {
     if (window.__qaReplaying || Date.now() < suppressScrollUntil) return
     if (event.target !== document && event.target !== document.documentElement) return
-    if (scrollPending) return
-    scrollPending = true
-    setTimeout(function () {
-      scrollPending = false
+    if (scrollScheduled) return
+    scrollScheduled = true
+    requestAnimationFrame(function () {
+      scrollScheduled = false
       if (window.__qaReplaying || Date.now() < suppressScrollUntil) return
-      send({ qa: 1, kind: 'event', type: 'scroll', scroll: [window.scrollX, window.scrollY] })
-    }, 150)
+      const m = scrollMetrics()
+      send({ qa: 1, kind: 'event', type: 'scroll', scroll: [m.x, m.y], frac: [m.fx, m.fy], ext: [m.maxX, m.maxY] })
+    })
   }, true)
 
   // --- replay side ----------------------------------------------------------
@@ -218,8 +228,20 @@ function resolveSelector(desc, doc) {
   function replay(data) {
     if (data.type === 'scroll') {
       if (Array.isArray(data.scroll)) {
-        suppressScrollUntil = Date.now() + 300
-        window.scrollTo(data.scroll[0], data.scroll[1])
+        suppressScrollUntil = Date.now() + 200
+        const de = document.documentElement
+        const myMaxX = Math.max(1, de.scrollWidth - de.clientWidth)
+        const myMaxY = Math.max(1, de.scrollHeight - de.clientHeight)
+        let x = data.scroll[0]
+        let y = data.scroll[1]
+        // When this pane's scrollable extent differs materially from the
+        // sender's, follow the proportional position instead of the raw pixel
+        // offset so the same region stays visible in both panes.
+        if (data.ext && data.frac) {
+          if (Math.abs(data.ext[1] - myMaxY) > 4) y = Math.round(data.frac[1] * myMaxY)
+          if (Math.abs(data.ext[0] - myMaxX) > 4) x = Math.round(data.frac[0] * myMaxX)
+        }
+        window.scrollTo(x, y)
       }
       return
     }

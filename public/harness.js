@@ -426,6 +426,8 @@
     const t = e.target
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return
     if ($('session').hidden) return
+    const keys = ['m', 's', 'r', '1', '2', '3', 'v', 'e']
+    if (keys.includes(e.key)) e.preventDefault()
     switch (e.key) {
       case 'm': setMirror(!S.mirror); break
       case 's': $('scrollMirror').checked = !$('scrollMirror').checked; S.scrollMirror = $('scrollMirror').checked; break
