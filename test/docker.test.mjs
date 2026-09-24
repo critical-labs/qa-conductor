@@ -39,6 +39,52 @@ test('runPg builds the exact docker run argv', async () => {
   ]])
 })
 
+test('createDocker threads a custom postgres identity and label through argv', async () => {
+  const exec = recordingExec(['', 'accepting\n', '1\n', 'accepting\n', '1\n'])
+  const docker = createDocker({
+    execFileFn: exec,
+    label: 'widget-qa-session',
+    postgres: { image: 'postgres:15', user: 'widget', password: 'hunter2', db: 'maindb' },
+  })
+  await docker.runPg('widget-pg', 'widget-qa')
+  assert.deepEqual(exec.calls[0], [
+    'docker', 'run', '-d',
+    '--name', 'widget-pg',
+    '--network', 'widget-qa',
+    '--label', 'widget-qa-session',
+    '-e', 'POSTGRES_USER=widget',
+    '-e', 'POSTGRES_PASSWORD=hunter2',
+    '-e', 'POSTGRES_DB=maindb',
+    'postgres:15',
+  ])
+  // readiness probes use the custom superuser + db
+  await docker.waitHealthyPg('widget-pg', {})
+  assert.deepEqual(exec.calls[1], ['docker', 'exec', 'widget-pg', 'pg_isready', '-U', 'widget'])
+  assert.deepEqual(exec.calls[2], ['docker', 'exec', 'widget-pg', 'psql', '-U', 'widget', '-d', 'maindb', '-c', 'SELECT 1'])
+})
+
+test('createDocker partial postgres override fills the rest from defaults', async () => {
+  const exec = recordingExec()
+  const docker = createDocker({ execFileFn: exec, postgres: { user: 'widget' } })
+  await docker.runPg('p', 'n')
+  const argv = exec.calls[0]
+  assert.ok(argv.includes('POSTGRES_USER=widget'))
+  assert.ok(argv.includes('POSTGRES_PASSWORD=qa')) // default retained
+  assert.ok(argv.includes('POSTGRES_DB=postgres')) // default retained
+  assert.ok(argv.includes('postgres:16')) // default image retained
+  assert.ok(argv.includes('homefree-qa-session')) // default label retained
+})
+
+test('cloneDb and psql use the configured superuser', async () => {
+  const exec = recordingExec(['', ''])
+  const docker = createDocker({ execFileFn: exec, postgres: { user: 'widget', db: 'maindb' } })
+  await docker.cloneDb('widget-db-1', 'widget-pg', 'core')
+  assert.deepEqual(exec.calls[0], ['docker', 'exec', 'widget-pg', 'psql', '-U', 'widget', '-d', 'maindb', '-c', 'CREATE DATABASE core'])
+  assert.equal(exec.calls[1][0], 'sh')
+  assert.ok(exec.calls[1][2].includes('pg_dump -U widget'))
+  assert.ok(exec.calls[1][2].includes('psql -q -U widget -d core'))
+})
+
 test('runApp builds the exact docker run argv with loopback port mapping', async () => {
   const exec = recordingExec()
   const docker = createDocker({ execFileFn: exec })

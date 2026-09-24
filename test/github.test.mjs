@@ -90,6 +90,13 @@ test('ghcrTagExists returns true when a version carries the tag', async () => {
   assertGithubHeaders(calls[0].options)
 })
 
+test('ghcrTagExists targets the configured package name', async () => {
+  const { calls, fetchFn } = makeFetch(() => response(200, [version(1, ['pr-9-abc'], '2026-09-01T00:00:00Z')]))
+  const gh = createGithub({ token: TOKEN, repo: 'acme/widget', fetchFn, packageName: 'widget-app' })
+  await gh.ghcrTagExists('pr-9-abc')
+  assert.equal(calls[0].url, `${API}/user/packages/container/widget-app/versions?per_page=100&page=1`)
+})
+
 test('ghcrTagExists paginates until a short page, false when absent', async () => {
   const fullPage = Array.from({ length: 100 }, (_, i) => version(i, [`other-${i}`], '2026-09-01T00:00:00Z'))
   const { calls, fetchFn } = makeFetch((url) =>

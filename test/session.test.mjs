@@ -73,6 +73,18 @@ test('paneEnv strips prod blob entirely when no QA space configured', () => {
   assert.equal(env.BLOB_S3_SECRET_ACCESS_KEY, undefined)
 })
 
+test('paneEnv threads a custom postgres identity into the pane DB URL and vars', () => {
+  const env = paneEnv({}, PANES.pr, {
+    publicHost: 'h.ts.net',
+    blob: { bucket: '' },
+    postgres: { user: 'widget', password: 'hunter2', db: 'maindb' },
+  })
+  assert.equal(env.CI_POSTGRES_URL, 'postgresql://widget:hunter2@qa-pg-pr:5432')
+  assert.equal(env.POSTGRES_USER, 'widget')
+  assert.equal(env.POSTGRES_PASSWORD, 'hunter2')
+  assert.equal(env.POSTGRES_DB, 'maindb')
+})
+
 test('migrateImageFor', () => {
   assert.equal(migrateImageFor('ghcr.io/x/homefree-app:1.0.0-rc.38'), 'ghcr.io/x/homefree-app:migrate-1.0.0-rc.38')
   assert.equal(migrateImageFor('ghcr.io/x/homefree-app:pr-7-abc'), 'ghcr.io/x/homefree-app:migrate-pr-7-abc')
@@ -123,7 +135,7 @@ function makeDeps({ tagExists = true, failAt = null } = {}) {
       writeFile: rec('writeFile'),
       unlink: rec('unlink'),
     },
-    env: { composeDir: '/cd', imageRepo: 'ghcr.io/238855/homefree-app', operatorEmail: 'op@x.com', publicHost: 'h.ts.net', blob: { bucket: '' } },
+    env: { composeDir: '/cd', imageRepo: 'ghcr.io/238855/homefree-app', operatorEmail: 'op@homefree.local', publicHost: 'h.ts.net', blob: { bucket: '' } },
     onProgress: step => calls.push(['progress', step]),
   }
   return { deps, calls }
@@ -156,6 +168,30 @@ test('bootSession happy path: order, tags, tokens', async () => {
   // progress order
   const steps = calls.filter(c => c[0] === 'progress').map(c => c[1])
   assert.deepEqual(steps, ['ensuring-image', 'cloning', 'migrating', 'starting'])
+})
+
+test('bootSession threads config overrides (network, databases, source container) through docker calls', async () => {
+  const { deps, calls } = makeDeps()
+  deps.env.network = 'widget-qa'
+  deps.env.databases = ['core', 'billing']
+  deps.env.sourceDbContainer = 'widget-db-1'
+  await bootSession(deps, 7)
+  // network flows into createNetwork, runPg, runMigrate, runApp
+  assert.ok(calls.some(c => c[0] === 'createNetwork' && c[1] === 'widget-qa'))
+  assert.ok(calls.filter(c => c[0] === 'runPg').every(c => c[2] === 'widget-qa'))
+  assert.ok(calls.filter(c => c[0] === 'runApp').every(c => c[3] === 'widget-qa'))
+  // the overridden 2-db list is cloned from the overridden source container
+  const clones = calls.filter(c => c[0] === 'cloneDb')
+  assert.equal(clones.length, 2 * 2) // 2 dbs x 2 panes
+  assert.ok(clones.every(c => c[1] === 'widget-db-1'))
+  assert.deepEqual([...new Set(clones.map(c => c[3]))].sort(), ['billing', 'core'])
+})
+
+test('bootSession teardown-on-failure removes the overridden network', async () => {
+  const { deps, calls } = makeDeps({ failAt: 'runApp' })
+  deps.env.network = 'widget-qa'
+  await assert.rejects(() => bootSession(deps, 7), /fail:runApp/)
+  assert.ok(calls.some(c => c[0] === 'rmNetwork' && c[1] === 'widget-qa'))
 })
 
 test('bootSession waits for the migrate tag when it lags the app tag', async () => {
