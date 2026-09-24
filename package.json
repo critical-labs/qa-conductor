@@ -1,0 +1,21 @@
+{
+  "name": "@homefree/qa-conductor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Side-by-side PR-QA harness: boots base-vs-PR app panes against cloned data behind mirrored proxies, with a pluggable five-seam adapter interface (Provisioner, BuildConvention, Seed, EnvTransform, AuthBootstrap).",
+  "type": "module",
+  "exports": {
+    ".": "./lib/server.mjs",
+    "./session": "./lib/session.mjs",
+    "./config": "./lib/config.mjs",
+    "./docker": "./lib/docker.mjs",
+    "./github": "./lib/github.mjs",
+    "./exec": "./lib/exec.mjs",
+    "./proxy": "./lib/proxy.mjs",
+    "./verdict": "./lib/verdict.mjs",
+    "./adapters/provisioner-docker": "./lib/adapters/provisioner-docker.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}
