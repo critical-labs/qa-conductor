@@ -224,6 +224,36 @@ test('cloneDb creates the target db then pipes pg_dump into psql via one sh -c',
   ])
 })
 
+test('createDatabase issues CREATE and returns; tolerates already-exists', async () => {
+  const ok = recordingExec([''])
+  const docker = createDocker({ execFileFn: ok })
+  await docker.createDatabase('qa-pg-base', 'idp')
+  assert.deepEqual(ok.calls, [['docker', 'exec', 'qa-pg-base', 'psql', '-U', 'homefree', '-d', 'postgres', '-c', 'CREATE DATABASE idp']])
+
+  const exists = recordingExec([new Error('ERROR:  database "idp" already exists')])
+  const docker2 = createDocker({ execFileFn: exists })
+  await docker2.createDatabase('qa-pg-base', 'idp') // resolves, no throw
+  assert.equal(exists.calls.length, 1)
+})
+
+test('createDatabase retries transient connection errors then succeeds', async () => {
+  const exec = recordingExec([new Error('connection to server on socket failed'), ''])
+  const sleeps = []
+  const docker = createDocker({ execFileFn: exec })
+  await docker.createDatabase('qa-pg-base', 'idp', { sleepFn: async ms => sleeps.push(ms) })
+  assert.equal(exec.calls.length, 2)
+  assert.equal(sleeps.length, 1)
+})
+
+test('pipeDump runs one sh -c pg_dump|psql and validates names', async () => {
+  const exec = recordingExec([''])
+  const docker = createDocker({ execFileFn: exec })
+  await docker.pipeDump('homefree-db-1', 'qa-pg-base', 'idp')
+  assert.equal(exec.calls[0][0], 'sh')
+  assert.equal(exec.calls[0][2], 'docker exec homefree-db-1 pg_dump -U homefree --clean --if-exists idp | docker exec -i qa-pg-base psql -q -U homefree -d idp')
+  await assert.rejects(docker.pipeDump('bad;name', 'qa-pg-base', 'idp'), /unsafe/)
+})
+
 test('cloneDb tolerates already-exists on CREATE DATABASE', async () => {
   const exec = recordingExec([new Error('ERROR:  database "idp" already exists')])
   const docker = createDocker({ execFileFn: exec })
