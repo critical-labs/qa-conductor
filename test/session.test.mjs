@@ -1,8 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  createSession, reduce, touch, isIdle, parseEnv, paneEnv, renderEnv,
-  migrateImageFor, bootSession, teardownSession, PANES, DBS, NETWORK,
+  createSession, reduce, touch, isIdle, parseEnv, renderEnv,
+  migrateImageFor, bootSession, teardownSession, PANES,
 } from '../lib/session.mjs'
 
 test('reducer walks the happy path and enforces single session', () => {
@@ -51,230 +51,152 @@ test('parseEnv / renderEnv round trip, comments ignored', () => {
   assert.equal(renderEnv(env), 'A=1\nB=x=y\n')
 })
 
-test('paneEnv overrides hosts/db/auth/email and swaps blob to QA space', () => {
-  const prod = { APP_DOMAIN: 'homefree.cloud', CI_POSTGRES_URL: 'x', BLOB_S3_BUCKET: 'homefree-media', BLOB_S3_ACCESS_KEY_ID: 'k', RESEND_API_KEY: 'r' }
-  const env = paneEnv(prod, PANES.pr, {
-    publicHost: 'h.ts.net',
-    blob: { bucket: 'homefree-media-qa', endpoint: 'https://e', accessKeyId: 'qk', secretAccessKey: 'qs' },
-  })
-  assert.equal(env.CI_POSTGRES_URL, 'postgresql://homefree:qa@qa-pg-pr:5432')
-  assert.equal(env.WEB_CLIENT_URL, 'https://h.ts.net:10000')
-  assert.equal(env.WEBAUTHN_RP_ID, 'h.ts.net')
-  assert.equal(env.AUTH_REFRESH_ORIGIN, 'http://127.0.0.1:3000')
-  assert.equal(env.EMAIL_ADAPTER, 'console')
-  assert.equal(env.BLOB_S3_BUCKET, 'homefree-media-qa')
-  assert.equal(env.BLOB_S3_ACCESS_KEY_ID, 'qk')
-  assert.equal(env.RESEND_API_KEY, 'r')
-})
-
-test('paneEnv strips prod blob entirely when no QA space configured', () => {
-  const env = paneEnv({ BLOB_S3_BUCKET: 'homefree-media', BLOB_S3_SECRET_ACCESS_KEY: 's' }, PANES.base, { publicHost: 'h', blob: { bucket: '' } })
-  assert.equal(env.BLOB_S3_BUCKET, undefined)
-  assert.equal(env.BLOB_S3_SECRET_ACCESS_KEY, undefined)
-})
-
-test('paneEnv threads a custom postgres identity into the pane DB URL and vars', () => {
-  const env = paneEnv({}, PANES.pr, {
-    publicHost: 'h.ts.net',
-    blob: { bucket: '' },
-    postgres: { user: 'widget', password: 'hunter2', db: 'maindb' },
-  })
-  assert.equal(env.CI_POSTGRES_URL, 'postgresql://widget:hunter2@qa-pg-pr:5432')
-  assert.equal(env.POSTGRES_USER, 'widget')
-  assert.equal(env.POSTGRES_PASSWORD, 'hunter2')
-  assert.equal(env.POSTGRES_DB, 'maindb')
-})
-
 test('migrateImageFor', () => {
   assert.equal(migrateImageFor('ghcr.io/x/homefree-app:1.0.0-rc.38'), 'ghcr.io/x/homefree-app:migrate-1.0.0-rc.38')
   assert.equal(migrateImageFor('ghcr.io/x/homefree-app:pr-7-abc'), 'ghcr.io/x/homefree-app:migrate-pr-7-abc')
 })
 
-function makeDeps({ tagExists = true, failAt = null } = {}) {
+// --- bootSession: v3 orchestrator over the five adapter seams --------------
+
+const BASE_IMG = 'ghcr.io/x/app:1.0.0-rc.38'
+const PR_IMG = 'ghcr.io/x/app:pr-7-abcdef123456'
+
+function makeDeps({ failAt = null, migrationStrategy = 'one-shot-image', requiresDb = true, envContributions = null, withOnBuild = false } = {}) {
   const calls = []
   const rec = (name, impl) => async (...args) => {
     calls.push([name, ...args])
     if (failAt === name) throw new Error(`fail:${name}`)
     return impl ? impl(...args) : undefined
   }
-  const files = {
-    '/cd/.env.image.rc': 'APP_IMAGE=ghcr.io/238855/homefree-app:1.0.0-rc.38\nMIGRATE_IMAGE=m\n',
-    '/cd/.env': 'APP_DOMAIN=homefree.cloud\nRESEND_API_KEY=r\n',
-  }
-  let tagCalls = 0
+  let subscribed = null
   const deps = {
-    sleepFn: rec('sleep'),
-    github: {
-      prHead: rec('prHead', () => 'abcdef123456ffff'),
-      // First call checks the app tag; later calls (migrate wait) succeed so
-      // the dispatch-path test terminates without sleeping.
-      ghcrTagExists: rec('ghcrTagExists', () => tagExists || ++tagCalls > 1),
-      dispatchPreviewBuild: rec('dispatch'),
-      awaitPreviewImage: rec('await'),
-      latestRcTag: rec('latestRcTag', () => '1.0.0-rc.99'),
+    adapters: {
+      provisioner: {
+        network: 'qa-session',
+        provisionDatabase: rec('provisionDatabase', ({ paneRef }) => ({
+          dsn: `dsn-${paneRef.role}`,
+          db: { dsn: `dsn-${paneRef.role}`, query: async () => '1' },
+        })),
+        reserveServices: rec('reserveServices', ({ paneRef }) => ({ app: { url: `http://127.0.0.1:311${paneRef.role === 'base' ? 1 : 2}`, port: paneRef.role === 'base' ? 3111 : 3112 } })),
+        launchServices: rec('launchServices'),
+        waitHealthy: rec('waitHealthy'),
+        teardown: rec('teardown'),
+      },
+      build: {
+        migrationStrategy,
+        subscribeBuild: cb => { subscribed = cb },
+        ensureBuilt: rec('ensureBuilt'),
+        resolveBaseImages: rec('resolveBaseImages', () => ({ services: { app: BASE_IMG }, migrate: { image: migrateImageFor(BASE_IMG) } })),
+        resolvePrImages: rec('resolvePrImages', () => ({ services: { app: PR_IMG }, migrate: { image: migrateImageFor(PR_IMG) } })),
+      },
+      seed: { databases: ['idp', 'userdb'], seedPane: rec('seedPane') },
+      // derivePaneEnv is PURE (sync) per the frozen contract — record manually.
+      envTransform: { derivePaneEnv: ({ prodEnv, pane }) => { calls.push(['derivePaneEnv', { prodEnv, pane }]); return { app: { DSN: pane.dsn } } } },
+      auth: {
+        requiresDb,
+        ...(envContributions ? { envContributions: () => envContributions } : {}),
+        establishSession: rec('establishSession', ({ pane }) => ({ landingUrl: `login-${pane.ref.role}`, cookies: [] })),
+      },
     },
-    docker: {
-      createNetwork: rec('createNetwork'),
-      runPg: rec('runPg'),
-      waitHealthyPg: rec('waitHealthyPg'),
-      cloneDb: rec('cloneDb'),
-      ensureImage: rec('ensureImage'),
-      login: rec('login'),
-      runMigrate: rec('runMigrate'),
-      runApp: rec('runApp'),
-      waitHealthyApp: rec('waitHealthyApp'),
-      rmForce: rec('rmForce'),
-      rmNetwork: rec('rmNetwork'),
-    },
-    mint: rec('mint', ({ dbContainer }) => `tok-${dbContainer}`),
+    docker: { login: rec('login'), ensureImage: rec('ensureImage'), runMigrate: rec('runMigrate') },
     fsx: {
-      readFile: rec('readFile', p => {
-        if (!(p in files)) throw new Error('ENOENT')
-        return files[p]
-      }),
+      readFile: rec('readFile', p => { if (p.endsWith('/.env')) return 'APP_DOMAIN=homefree.cloud\n'; throw new Error('ENOENT') }),
       writeFile: rec('writeFile'),
       unlink: rec('unlink'),
     },
-    env: { composeDir: '/cd', imageRepo: 'ghcr.io/238855/homefree-app', operatorEmail: 'op@homefree.local', publicHost: 'h.ts.net', blob: { bucket: '' } },
+    env: { composeDir: '/cd', operatorEmail: 'op@homefree.local', publicHost: 'h.ts.net', ghcrUser: 'u', ghcrToken: 't' },
     onProgress: step => calls.push(['progress', step]),
+    ...(withOnBuild ? { onBuild: p => calls.push(['onBuild', p]) } : {}),
   }
-  return { deps, calls }
+  return { deps, calls, getSubscribed: () => subscribed }
 }
 
-test('bootSession happy path: order, tags, tokens', async () => {
+test('bootSession happy path: seam order, tags, loginUrls', async () => {
   const { deps, calls } = makeDeps()
   const out = await bootSession(deps, 7)
-  assert.equal(out.prTag, 'ghcr.io/238855/homefree-app:pr-7-abcdef123456')
-  assert.equal(out.baseTag, 'ghcr.io/238855/homefree-app:1.0.0-rc.38')
-  assert.deepEqual(out.tokens, { base: 'tok-qa-pg-base', pr: 'tok-qa-pg-pr' })
-  // no build dispatched when the tag exists
-  assert.ok(!calls.some(c => c[0] === 'dispatch'))
-  // 7 dbs x 2 panes cloned from the prod db container
-  const clones = calls.filter(c => c[0] === 'cloneDb')
-  assert.equal(clones.length, DBS.length * 2)
-  assert.ok(clones.every(c => c[1] === 'homefree-db-1'))
-  // migrate ran with derived migrate images, base first
-  const migs = calls.filter(c => c[0] === 'runMigrate')
-  assert.equal(migs[0][1], 'ghcr.io/238855/homefree-app:migrate-1.0.0-rc.38')
-  assert.equal(migs[1][1], 'ghcr.io/238855/homefree-app:migrate-pr-7-abcdef123456')
-  // every image is pulled (ensureImage) before it is run: 2 migrate + 2 app
-  const ensured = calls.filter(c => c[0] === 'ensureImage').map(c => c[1])
-  assert.deepEqual(ensured, [
-    'ghcr.io/238855/homefree-app:migrate-1.0.0-rc.38',
-    'ghcr.io/238855/homefree-app:migrate-pr-7-abcdef123456',
-    'ghcr.io/238855/homefree-app:1.0.0-rc.38',
-    'ghcr.io/238855/homefree-app:pr-7-abcdef123456',
-  ])
+  assert.equal(out.baseTag, BASE_IMG)
+  assert.equal(out.prTag, PR_IMG)
+  assert.deepEqual(out.loginUrls, { base: { landingUrl: 'login-base', cookies: [] }, pr: { landingUrl: 'login-pr', cookies: [] } })
   // progress order
-  const steps = calls.filter(c => c[0] === 'progress').map(c => c[1])
-  assert.deepEqual(steps, ['ensuring-image', 'cloning', 'migrating', 'starting'])
+  assert.deepEqual(calls.filter(c => c[0] === 'progress').map(c => c[1]), ['ensuring-image', 'cloning', 'migrating', 'starting'])
+  // registry login happens before any image work
+  assert.equal(calls.findIndex(c => c[0] === 'login') < calls.findIndex(c => c[0] === 'ensureBuilt'), true)
+  // per pane: provision -> seed -> reserve
+  const seq = calls.map(c => c[0])
+  const iProv = seq.indexOf('provisionDatabase')
+  assert.deepEqual(seq.slice(iProv, iProv + 3), ['provisionDatabase', 'seedPane', 'reserveServices'])
+  // seed gets the provisioner's db handle and the declared databases
+  const seedCall = calls.find(c => c[0] === 'seedPane')[1]
+  assert.equal(seedCall.db.dsn, 'dsn-base')
+  assert.deepEqual(seedCall.databases, ['idp', 'userdb'])
+  // env derived from pane.dsn, written 0600 to the pane env file, then migrate
+  const writes = calls.filter(c => c[0] === 'writeFile')
+  assert.deepEqual(writes.map(c => c[1]), ['/cd/.env.qa-base', '/cd/.env.qa-pr'])
+  assert.equal(writes[0][2], 'DSN=dsn-base\n')
+  assert.deepEqual(writes[0][3], { mode: 0o600 })
+  const migs = calls.filter(c => c[0] === 'runMigrate')
+  assert.deepEqual(migs.map(c => [c[1], c[2], c[3]]), [
+    [migrateImageFor(BASE_IMG), 'qa-session', '/cd/.env.qa-base'],
+    [migrateImageFor(PR_IMG), 'qa-session', '/cd/.env.qa-pr'],
+  ])
+  // migrate images are ensured before running
+  assert.deepEqual(calls.filter(c => c[0] === 'ensureImage').map(c => c[1]), [migrateImageFor(BASE_IMG), migrateImageFor(PR_IMG)])
+  // launch receives the service map, env file hint, and reservation
+  const launches = calls.filter(c => c[0] === 'launchServices')
+  assert.deepEqual(launches[0][1].services, { app: BASE_IMG })
+  assert.deepEqual(launches[0][1].envFiles, { app: '/cd/.env.qa-base' })
+  assert.equal(launches[0][1].reserved.app.port, 3111)
+  assert.equal(calls.filter(c => c[0] === 'waitHealthy').length, 2)
 })
 
-test('bootSession threads config overrides (network, databases, source container) through docker calls', async () => {
-  const { deps, calls } = makeDeps()
-  deps.env.network = 'widget-qa'
-  deps.env.databases = ['core', 'billing']
-  deps.env.sourceDbContainer = 'widget-db-1'
+test('bootSession passes db to establishSession only when auth.requiresDb', async () => {
+  const withDb = makeDeps({ requiresDb: true })
+  await bootSession(withDb.deps, 7)
+  assert.equal(withDb.calls.find(c => c[0] === 'establishSession')[1].db.dsn, 'dsn-base')
+
+  const noDb = makeDeps({ requiresDb: false })
+  await bootSession(noDb.deps, 7)
+  assert.equal('db' in noDb.calls.find(c => c[0] === 'establishSession')[1], false)
+})
+
+test('bootSession skips the migrate step entirely for on-boot strategies', async () => {
+  const { deps, calls } = makeDeps({ migrationStrategy: 'on-boot' })
   await bootSession(deps, 7)
-  // network flows into createNetwork, runPg, runMigrate, runApp
-  assert.ok(calls.some(c => c[0] === 'createNetwork' && c[1] === 'widget-qa'))
-  assert.ok(calls.filter(c => c[0] === 'runPg').every(c => c[2] === 'widget-qa'))
-  assert.ok(calls.filter(c => c[0] === 'runApp').every(c => c[3] === 'widget-qa'))
-  // the overridden 2-db list is cloned from the overridden source container
-  const clones = calls.filter(c => c[0] === 'cloneDb')
-  assert.equal(clones.length, 2 * 2) // 2 dbs x 2 panes
-  assert.ok(clones.every(c => c[1] === 'widget-db-1'))
-  assert.deepEqual([...new Set(clones.map(c => c[3]))].sort(), ['billing', 'core'])
+  assert.equal(calls.filter(c => c[0] === 'runMigrate').length, 0)
+  assert.equal(calls.filter(c => c[0] === 'ensureImage').length, 0)
 })
 
-test('bootSession teardown-on-failure removes the overridden network', async () => {
-  const { deps, calls } = makeDeps({ failAt: 'runApp' })
-  deps.env.network = 'widget-qa'
-  await assert.rejects(() => bootSession(deps, 7), /fail:runApp/)
-  assert.ok(calls.some(c => c[0] === 'rmNetwork' && c[1] === 'widget-qa'))
-})
-
-test('bootSession waits for the migrate tag when it lags the app tag', async () => {
-  const { deps, calls } = makeDeps()
-  const answers = [true, false, false, true] // app tag, then migrate polls
-  deps.github.ghcrTagExists = async () => answers.shift()
+test('bootSession merges auth envContributions into the written pane env', async () => {
+  const { deps, calls } = makeDeps({ envContributions: { app: { DEV_LOGIN_BYPASS: '1' } } })
   await bootSession(deps, 7)
-  const sleeps = calls.filter(c => c[0] === 'sleep')
-  assert.equal(sleeps.length, 2)
-  assert.equal(sleeps[0][1], 15000)
+  const firstWrite = calls.find(c => c[0] === 'writeFile')
+  assert.equal(firstWrite[2], 'DSN=dsn-base\nDEV_LOGIN_BYPASS=1\n')
 })
 
-test('bootSession dispatches + awaits the build when the tag is missing', async () => {
-  const { deps, calls } = makeDeps({ tagExists: false })
+test('bootSession wires onBuild through build.subscribeBuild', async () => {
+  const { deps, getSubscribed } = makeDeps({ withOnBuild: true })
   await bootSession(deps, 7)
-  assert.ok(calls.some(c => c[0] === 'dispatch'))
-  assert.ok(calls.some(c => c[0] === 'await'))
+  assert.equal(typeof getSubscribed(), 'function')
+
+  const without = makeDeps()
+  await bootSession(without.deps, 7)
+  assert.equal(without.getSubscribed(), null)
 })
 
-test('bootSession cold path surfaces the preview run via onBuild', async () => {
-  const { deps, calls } = makeDeps({ tagExists: false })
-  deps.github.findPreviewRun = async () => ({ url: 'https://gh/run/1', status: 'queued' })
-  const builds = []
-  deps.onBuild = async ev => { builds.push(ev) }
-  await bootSession(deps, 7)
-  assert.ok(calls.some(c => c[0] === 'dispatch'))
-  assert.equal(builds.length, 1)
-  assert.deepEqual(builds[0], { runUrl: 'https://gh/run/1', runStatus: 'queued' })
+test('bootSession failure mid-boot tears down both panes and env files, then rethrows', async () => {
+  const { deps, calls } = makeDeps({ failAt: 'launchServices' })
+  await assert.rejects(() => bootSession(deps, 7), /fail:launchServices/)
+  assert.deepEqual(calls.filter(c => c[0] === 'teardown').map(c => c[1].paneRef.role), ['base', 'pr'])
+  assert.deepEqual(calls.filter(c => c[0] === 'unlink').map(c => c[1]).sort(), ['/cd/.env.qa-base', '/cd/.env.qa-pr'])
 })
 
-test('bootSession warm path never calls onBuild even when findPreviewRun exists', async () => {
-  const { deps, calls } = makeDeps() // tag already exists
-  deps.github.findPreviewRun = async () => ({ url: 'u', status: 'queued' })
-  const builds = []
-  deps.onBuild = async ev => { builds.push(ev) }
-  await bootSession(deps, 7)
-  assert.ok(!calls.some(c => c[0] === 'dispatch'))
-  assert.equal(builds.length, 0)
-})
-
-test('bootSession re-queries the run in the wait loop and reports only status changes', async () => {
-  const { deps } = makeDeps({ tagExists: false })
-  // app tag missing -> dispatch; then the migrate tag lags a few polls.
-  const answers = [false, false, false, false, true]
-  deps.github.ghcrTagExists = async () => answers.shift()
-  let n = 0
-  const statuses = ['queued', 'queued', 'in_progress', 'completed']
-  deps.github.findPreviewRun = async () => ({ url: 'https://gh/run/9', status: statuses[Math.min(n++, statuses.length - 1)] })
-  const builds = []
-  deps.onBuild = async ev => { builds.push(ev) }
-  await bootSession(deps, 7)
-  // first at dispatch, then only when the status actually changed
-  assert.deepEqual(builds.map(b => b.runStatus), ['queued', 'in_progress'])
-  assert.ok(builds.every(b => b.runUrl === 'https://gh/run/9'))
-})
-
-test('bootSession swallows onBuild errors and still boots', async () => {
-  const { deps } = makeDeps({ tagExists: false })
-  deps.github.findPreviewRun = async () => ({ url: 'u', status: 'queued' })
-  deps.onBuild = async () => { throw new Error('boom') }
-  const out = await bootSession(deps, 7)
-  assert.equal(out.prTag, 'ghcr.io/238855/homefree-app:pr-7-abcdef123456')
-})
-
-test('bootSession failure mid-boot tears down what was created and rethrows', async () => {
-  const { deps, calls } = makeDeps({ failAt: 'runMigrate' })
-  await assert.rejects(() => bootSession(deps, 7), /fail:runMigrate/)
-  assert.ok(calls.some(c => c[0] === 'rmForce'))
-  assert.ok(calls.some(c => c[0] === 'rmNetwork'))
-  assert.ok(calls.some(c => c[0] === 'unlink'))
-})
-
-test('teardownSession without created falls back to all known names', async () => {
-  const { deps, calls } = makeDeps()
-  await teardownSession(deps, null)
-  const rm = calls.find(c => c[0] === 'rmForce')
-  assert.deepEqual(rm[1], [PANES.base.app, PANES.pr.app, PANES.base.pg, PANES.pr.pg])
-  assert.ok(calls.some(c => c[0] === 'rmNetwork' && c[1] === NETWORK))
-})
-
-test('teardownSession removes the deterministic pane env files even without created', async () => {
-  const { deps, calls } = makeDeps()
-  await teardownSession({ docker: deps.docker, fsx: deps.fsx, composeDir: '/cd' }, null)
-  const unlinked = calls.filter(c => c[0] === 'unlink').map(c => c[1]).sort()
-  assert.deepEqual(unlinked, ['/cd/.env.qa-base', '/cd/.env.qa-pr'])
+test('teardownSession tears down each pane via the provisioner and scrubs env files, tolerating errors', async () => {
+  const calls = []
+  const provisioner = { teardown: async a => { calls.push(['teardown', a.paneRef.role]); throw new Error('already gone') } }
+  const fsx = { unlink: async p => { calls.push(['unlink', p]); throw new Error('ENOENT') } }
+  await teardownSession({ provisioner, fsx, composeDir: '/cd' }, null) // resolves despite both failing
+  assert.deepEqual(calls, [
+    ['teardown', 'base'], ['teardown', 'pr'],
+    ['unlink', `/cd/${PANES.base.envFile}`], ['unlink', `/cd/${PANES.pr.envFile}`],
+  ])
 })
