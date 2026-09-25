@@ -277,3 +277,28 @@ test('rewrites absolute upstream Locations to relative, passes others through', 
   const foreign = await request(proxyPort, '/foreign')
   assert.equal(foreign.headers.location, 'https://example.com/x')
 })
+
+// --- upstream resolution ---------------------------------------------------
+
+test('upstreamPort may be a function, resolved per request', async (t) => {
+  const a = http.createServer((req, res) => res.end('A'))
+  const b = http.createServer((req, res) => res.end('B'))
+  const portA = await listen(a)
+  const portB = await listen(b)
+  let current = portA
+  const proxy = http.createServer(createPaneProxy({ upstreamPort: () => current, bridgePath: '/nonexistent', httpMod: http }))
+  const proxyPort = await listen(proxy)
+  t.after(async () => { for (const s of [a, b, proxy]) await new Promise(r => s.close(r)) })
+  assert.equal((await request(proxyPort, '/')).body.toString(), 'A')
+  current = portB
+  assert.equal((await request(proxyPort, '/')).body.toString(), 'B')
+})
+
+test('no upstream (no session) yields a 503, not a connection attempt', async (t) => {
+  const proxy = http.createServer(createPaneProxy({ upstreamPort: () => null, bridgePath: '/nonexistent', httpMod: http }))
+  const proxyPort = await listen(proxy)
+  t.after(() => new Promise(r => proxy.close(r)))
+  const res = await request(proxyPort, '/dashboard')
+  assert.equal(res.status, 503)
+  assert.match(res.body.toString(), /no QA session/)
+})
