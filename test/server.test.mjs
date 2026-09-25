@@ -2,6 +2,7 @@
 // fake adapters — no docker, no network beyond loopback.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import http from 'node:http'
 
 import { startConductor } from '../lib/server.mjs'
 
@@ -12,16 +13,24 @@ function deferred() {
 }
 
 // Fake adapter set. `ensureBuilt` for a PR listed in `hang` blocks until the
-// test releases it — modelling a boot stuck waiting on a GHCR image.
-function makeWorld({ hang = {} } = {}) {
+// test releases it — modelling a boot stuck waiting on a GHCR image. Each pane
+// "app" is a real loopback server, so the pane proxies can be exercised.
+function makeWorld({ hang = {}, failAt = null } = {}) {
   const calls = []
+  const apps = {
+    base: http.createServer((req, res) => res.end('pane-base')),
+    pr: http.createServer((req, res) => res.end('pane-pr')),
+  }
+  for (const s of Object.values(apps)) s.listen(0, '127.0.0.1')
+  const appPort = role => apps[role].address().port
   const provisioner = {
-    network: 'qa-session',
     provisionDatabase: async ({ paneRef }) => ({ dsn: `dsn-${paneRef.role}`, db: { dsn: `dsn-${paneRef.role}`, query: async () => '1' } }),
-    reserveServices: async ({ paneRef }) => ({ app: { url: 'http://127.0.0.1:1', port: paneRef.role === 'base' ? 3111 : 3112 } }),
-    launchServices: async () => {},
+    reserveServices: async ({ paneRef }) => ({ app: { url: `http://127.0.0.1:${appPort(paneRef.role)}`, port: appPort(paneRef.role) } }),
+    launchServices: async () => { if (failAt === 'launchServices') throw new Error('launch failed') },
     waitHealthy: async () => {},
     teardown: async ({ paneRef }) => { calls.push(['teardown', paneRef.role]) },
+    sweep: async () => { calls.push(['sweep']) },
+    logs: async ({ paneRef, stage, lines }) => { calls.push(['logs', paneRef.role, stage, lines]); return 'tail-lines' },
   }
   const build = {
     migrationStrategy: 'on-boot',
@@ -46,15 +55,28 @@ function makeWorld({ hang = {} } = {}) {
     auth: { requiresDb: false, establishSession: async ({ pane }) => ({ landingUrl: `login-${pane.ref.role}`, cookies: [] }) },
   }
   const cfg = {
-    publicHost: 'h.ts.net', composeDir: '/cd', operatorEmail: 'op@homefree.local',
-    ghcrUser: 'u', githubToken: null, idleMinutes: 30,
+    publicHost: 'h.ts.net', operatorEmail: 'op@homefree.local', idleMinutes: 30,
     ports: { harness: 0, base: 0, pr: 0 },
+    paneOrigins: { base: 'https://h:8443', pr: 'https://h:10000' },
+    verdictLabels: { accept: 'ok', reject: 'nope' },
   }
-  const docker = { login: async () => {}, sweepQaContainers: async () => [], logsTail: async () => '' }
-  const fsx = { readFile: async () => 'A=1\n', writeFile: async () => {}, unlink: async () => {} }
+  const github = {
+    listOpenPrs: async () => [{ number: 7, title: 't', headRef: 'r', author: 'a', headSha: 'abc' }],
+    prHead: async () => 'abc',
+    postComment: async pr => { calls.push(['comment', pr]); return 'https://c' },
+    setQaLabel: async (pr, label) => { calls.push(['label', pr, label]) },
+  }
+  const fsx = { readFile: async () => 'x' }
+  const readBaseEnv = async () => { calls.push(['readBaseEnv']); return { A: '1' } }
   const quiet = { log: () => {}, error: () => {} }
-  const c = startConductor({ cfg, github: {}, docker, fsx, adapters, log: quiet })
-  return { c, calls }
+  const conductor = startConductor({ cfg, github, fsx, adapters, readBaseEnv, log: quiet })
+  const c = { ...conductor, stop() { conductor.stop(); for (const s of Object.values(apps)) s.close() } }
+  return { c, calls, adapters }
+}
+
+async function proxyPort(server) {
+  if (!server.listening) await new Promise(r => server.once('listening', r))
+  return server.address().port
 }
 
 async function harnessPort(c) {
@@ -139,5 +161,94 @@ test('takeover also cancels the in-flight boot', async () => {
     assert.equal(after.prTag, 'img:pr-2', 'stale boot must not overwrite the newer session tags')
     // and the stale boot must not have gone on to provision/launch anything
     assert.equal(calls.filter(x => x[0] === 'ensureBuilt').length, 2)
+  } finally { c.stop() }
+})
+
+// --- Stage 2 B: the core reaches infra only through the seams --------------
+
+test('startup calls provisioner.sweep; a provisioner without sweep is fine', async () => {
+  const { c, calls } = makeWorld()
+  try {
+    await harnessPort(c)
+    await waitFor(() => calls.some(x => x[0] === 'sweep'))
+  } finally { c.stop() }
+})
+
+test('the pane env is derived from readBaseEnv', async () => {
+  const { c, calls } = makeWorld()
+  try {
+    const port = await harnessPort(c)
+    await api(port, 'POST', '/api/session', { pr: 7 })
+    await waitFor(async () => (await api(port, 'GET', '/api/state')).status === 'ready')
+    assert.equal(calls.filter(x => x[0] === 'readBaseEnv').length, 1)
+  } finally { c.stop() }
+})
+
+test('/api/prs merges build.describePrs readiness; absent describePrs means none', async () => {
+  const { c, adapters } = makeWorld()
+  try {
+    const port = await harnessPort(c)
+    const before = (await api(port, 'GET', '/api/prs')).prs[0]
+    assert.equal(before.imageStatus, 'none')
+    assert.equal(before.title, 't')
+    adapters.build.describePrs = async prs => prs.map(p => ({ number: p.number, status: 'building', runUrl: 'run' }))
+    const after = (await api(port, 'GET', '/api/prs')).prs[0]
+    assert.deepEqual([after.number, after.imageStatus, after.runUrl], [7, 'building', 'run'])
+  } finally { c.stop() }
+})
+
+test('/api/build-status asks describePrs about the PR head', async () => {
+  const { c, adapters } = makeWorld()
+  try {
+    const port = await harnessPort(c)
+    assert.deepEqual(await api(port, 'GET', '/api/build-status?pr=7'), { pr: 7, status: 'none', exists: false, runUrl: null })
+    let seen = null
+    adapters.build.describePrs = async prs => { seen = prs; return [{ number: 7, status: 'built', runUrl: null }] }
+    assert.deepEqual(await api(port, 'GET', '/api/build-status?pr=7'), { pr: 7, status: 'built', exists: true, runUrl: null })
+    assert.deepEqual(seen, [{ number: 7, headSha: 'abc' }])
+  } finally { c.stop() }
+})
+
+test('pane proxies 503 without a session, route to the reserved ports once ready, 503 after teardown', async () => {
+  const { c } = makeWorld()
+  try {
+    const port = await harnessPort(c)
+    const base = await proxyPort(c.servers.baseProxy)
+    const pr = await proxyPort(c.servers.prProxy)
+    assert.equal((await fetch(`http://127.0.0.1:${base}/x`)).status, 503)
+    await api(port, 'POST', '/api/session', { pr: 7 })
+    await waitFor(async () => (await api(port, 'GET', '/api/state')).status === 'ready')
+    assert.equal(await (await fetch(`http://127.0.0.1:${base}/x`)).text(), 'pane-base')
+    assert.equal(await (await fetch(`http://127.0.0.1:${pr}/x`)).text(), 'pane-pr')
+    await api(port, 'POST', '/api/teardown')
+    assert.equal((await fetch(`http://127.0.0.1:${pr}/x`)).status, 503)
+  } finally { c.stop() }
+})
+
+test('pane origins come from config; verdict uses the configured labels', async () => {
+  const { c, calls } = makeWorld()
+  try {
+    const port = await harnessPort(c)
+    await api(port, 'POST', '/api/session', { pr: 7 })
+    const st = await waitFor(async () => { const s = await api(port, 'GET', '/api/state'); return s.status === 'ready' && s })
+    assert.equal(st.panes.baseOrigin, 'https://h:8443')
+    assert.equal(st.panes.prOrigin, 'https://h:10000')
+    const prev = await api(port, 'GET', '/api/verdict/preview?verdict=reject')
+    assert.deepEqual([prev.applies, prev.removes], ['nope', 'ok'])
+    assert.match(prev.body, /qa-conductor-verdict/)
+    await api(port, 'POST', '/api/verdict', { verdict: 'accept', notes: '' })
+    assert.deepEqual(calls.find(x => x[0] === 'label'), ['label', 7, 'ok'])
+  } finally { c.stop() }
+})
+
+test('a failed boot surfaces provisioner.logs for the failing pane stage', async () => {
+  const { c, calls } = makeWorld({ failAt: 'launchServices' })
+  try {
+    const port = await harnessPort(c)
+    await api(port, 'POST', '/api/session', { pr: 7 })
+    const st = await waitFor(async () => { const s = await api(port, 'GET', '/api/state'); return s.status === 'error' && s })
+    assert.equal(st.error.step, 'starting')
+    await waitFor(() => calls.some(x => x[0] === 'logs'))
+    assert.deepEqual(calls.find(x => x[0] === 'logs'), ['logs', 'pr', 'starting', 40])
   } finally { c.stop() }
 })
