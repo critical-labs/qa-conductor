@@ -356,3 +356,16 @@ test('setQaLabel rejects an unknown label', async () => {
   await assert.rejects(gh.setQaLabel(41, 'qa-something-else'), /label/)
   assert.equal(calls.length, 0)
 })
+
+test('awaitPreviewImage stops promptly when its signal is aborted', async () => {
+  const ac = new AbortController()
+  let polls = 0
+  const { fetchFn } = makeFetch(() => { polls++; return response(200, []) })
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn })
+  const sleepFn = async () => { if (polls >= 2) ac.abort() }
+  await assert.rejects(
+    gh.awaitPreviewImage(41, 'abcdefabcdef0000', { sleepFn, signal: ac.signal, timeoutMs: 1e9 }),
+    err => err.name === 'AbortError',
+  )
+  assert.equal(polls, 2)
+})

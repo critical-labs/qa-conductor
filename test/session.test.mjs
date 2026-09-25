@@ -200,3 +200,32 @@ test('teardownSession tears down each pane via the provisioner and scrubs env fi
     ['unlink', `/cd/${PANES.base.envFile}`], ['unlink', `/cd/${PANES.pr.envFile}`],
   ])
 })
+
+// --- cancellation (2026-09-25 stale-boot incident) -------------------------
+
+test('bootSession: an abort between stages stops the boot and does NOT tear down', async () => {
+  const ac = new AbortController()
+  const { deps, calls } = makeDeps()
+  deps.signal = ac.signal
+  // abort while ensureBuilt is "running", before any pane work
+  deps.adapters.build.ensureBuilt = async (pr, opts) => { calls.push(['ensureBuilt', pr, opts]); ac.abort() }
+  await assert.rejects(() => bootSession(deps, 7), err => err.name === 'AbortError')
+  assert.equal(calls.find(c => c[0] === 'ensureBuilt')[2].signal, ac.signal, 'signal threaded into ensureBuilt')
+  assert.equal(calls.some(c => c[0] === 'provisionDatabase'), false, 'no pane work after abort')
+  assert.equal(calls.some(c => c[0] === 'teardown'), false, 'aborted boot must not tear down')
+  assert.equal(calls.some(c => c[0] === 'unlink'), false)
+})
+
+test('bootSession: a failure after abort skips teardown; a non-aborted failure tears down', async () => {
+  const ac = new AbortController()
+  const aborted = makeDeps()
+  aborted.deps.signal = ac.signal
+  aborted.deps.adapters.provisioner.launchServices = async () => { ac.abort(); throw new Error('boom') }
+  await assert.rejects(() => bootSession(aborted.deps, 7), /boom/)
+  assert.equal(aborted.calls.some(c => c[0] === 'teardown'), false)
+
+  const live = makeDeps({ failAt: 'launchServices' })
+  live.deps.signal = new AbortController().signal
+  await assert.rejects(() => bootSession(live.deps, 7), /fail:launchServices/)
+  assert.deepEqual(live.calls.filter(c => c[0] === 'teardown').map(c => c[1].paneRef.role), ['base', 'pr'])
+})
