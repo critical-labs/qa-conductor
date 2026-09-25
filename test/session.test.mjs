@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   createSession, reduce, touch, isIdle, parseEnv, renderEnv,
-  migrateImageFor, bootSession, teardownSession, PANES,
+  migrateImageFor, bootSession, teardownSession, ROLES,
 } from '../lib/session.mjs'
 
 test('reducer walks the happy path and enforces single session', () => {
@@ -60,6 +60,7 @@ test('migrateImageFor', () => {
 
 const BASE_IMG = 'ghcr.io/x/app:1.0.0-rc.38'
 const PR_IMG = 'ghcr.io/x/app:pr-7-abcdef123456'
+const ORIGINS = { base: 'https://h.ts.net:8443', pr: 'https://h.ts.net:10000' }
 
 function makeDeps({ failAt = null, migrationStrategy = 'one-shot-image', requiresDb = true, envContributions = null, withOnBuild = false } = {}) {
   const calls = []
@@ -72,12 +73,12 @@ function makeDeps({ failAt = null, migrationStrategy = 'one-shot-image', require
   const deps = {
     adapters: {
       provisioner: {
-        network: 'qa-session',
         provisionDatabase: rec('provisionDatabase', ({ paneRef }) => ({
           dsn: `dsn-${paneRef.role}`,
           db: { dsn: `dsn-${paneRef.role}`, query: async () => '1' },
         })),
         reserveServices: rec('reserveServices', ({ paneRef }) => ({ app: { url: `http://127.0.0.1:311${paneRef.role === 'base' ? 1 : 2}`, port: paneRef.role === 'base' ? 3111 : 3112 } })),
+        runMigrate: rec('runMigrate'),
         launchServices: rec('launchServices'),
         waitHealthy: rec('waitHealthy'),
         teardown: rec('teardown'),
@@ -98,55 +99,55 @@ function makeDeps({ failAt = null, migrationStrategy = 'one-shot-image', require
         establishSession: rec('establishSession', ({ pane }) => ({ landingUrl: `login-${pane.ref.role}`, cookies: [] })),
       },
     },
-    docker: { login: rec('login'), ensureImage: rec('ensureImage'), runMigrate: rec('runMigrate') },
-    fsx: {
-      readFile: rec('readFile', p => { if (p.endsWith('/.env')) return 'APP_DOMAIN=homefree.cloud\n'; throw new Error('ENOENT') }),
-      writeFile: rec('writeFile'),
-      unlink: rec('unlink'),
-    },
-    env: { composeDir: '/cd', operatorEmail: 'op@homefree.local', publicHost: 'h.ts.net', ghcrUser: 'u', ghcrToken: 't' },
+    readBaseEnv: async () => ({ APP_DOMAIN: 'homefree.cloud' }),
+    env: { operatorEmail: 'op@homefree.local', paneOrigins: ORIGINS },
     onProgress: step => calls.push(['progress', step]),
     ...(withOnBuild ? { onBuild: p => calls.push(['onBuild', p]) } : {}),
   }
   return { deps, calls, getSubscribed: () => subscribed }
 }
 
-test('bootSession happy path: seam order, tags, loginUrls', async () => {
+test('bootSession happy path: seam order, tags, loginUrls, upstreams', async () => {
   const { deps, calls } = makeDeps()
   const out = await bootSession(deps, 7)
   assert.equal(out.baseTag, BASE_IMG)
   assert.equal(out.prTag, PR_IMG)
   assert.deepEqual(out.loginUrls, { base: { landingUrl: 'login-base', cookies: [] }, pr: { landingUrl: 'login-pr', cookies: [] } })
+  // the pane proxies route to each pane's reserved primary-service port
+  assert.deepEqual(out.upstreams, { base: 3111, pr: 3112 })
   // progress order
   assert.deepEqual(calls.filter(c => c[0] === 'progress').map(c => c[1]), ['ensuring-image', 'cloning', 'migrating', 'starting'])
-  // registry login happens before any image work
-  assert.equal(calls.findIndex(c => c[0] === 'login') < calls.findIndex(c => c[0] === 'ensureBuilt'), true)
-  // per pane: provision -> seed -> reserve
+  // per pane: provision -> seed -> reserve, with the configured public origin
   const seq = calls.map(c => c[0])
   const iProv = seq.indexOf('provisionDatabase')
   assert.deepEqual(seq.slice(iProv, iProv + 3), ['provisionDatabase', 'seedPane', 'reserveServices'])
+  assert.deepEqual(calls.filter(c => c[0] === 'provisionDatabase').map(c => c[1].paneRef.publicOrigin), [ORIGINS.base, ORIGINS.pr])
   // seed gets the provisioner's db handle and the declared databases
   const seedCall = calls.find(c => c[0] === 'seedPane')[1]
   assert.equal(seedCall.db.dsn, 'dsn-base')
   assert.deepEqual(seedCall.databases, ['idp', 'userdb'])
-  // env derived from pane.dsn, written 0600 to the pane env file, then migrate
-  const writes = calls.filter(c => c[0] === 'writeFile')
-  assert.deepEqual(writes.map(c => c[1]), ['/cd/.env.qa-base', '/cd/.env.qa-pr'])
-  assert.equal(writes[0][2], 'DSN=dsn-base\n')
-  assert.deepEqual(writes[0][3], { mode: 0o600 })
+  // migrate runs through the provisioner with the pane's env map
   const migs = calls.filter(c => c[0] === 'runMigrate')
-  assert.deepEqual(migs.map(c => [c[1], c[2], c[3]]), [
-    [migrateImageFor(BASE_IMG), 'qa-session', '/cd/.env.qa-base'],
-    [migrateImageFor(PR_IMG), 'qa-session', '/cd/.env.qa-pr'],
+  assert.deepEqual(migs.map(c => [c[1].paneRef.role, c[1].migrate.image]), [
+    ['base', migrateImageFor(BASE_IMG)], ['pr', migrateImageFor(PR_IMG)],
   ])
-  // migrate images are ensured before running
-  assert.deepEqual(calls.filter(c => c[0] === 'ensureImage').map(c => c[1]), [migrateImageFor(BASE_IMG), migrateImageFor(PR_IMG)])
-  // launch receives the service map, env file hint, and reservation
+  assert.deepEqual(migs[0][1].env, { app: { DSN: 'dsn-base' } })
+  // launch receives the service map, env map, and reservation
   const launches = calls.filter(c => c[0] === 'launchServices')
   assert.deepEqual(launches[0][1].services, { app: BASE_IMG })
-  assert.deepEqual(launches[0][1].envFiles, { app: '/cd/.env.qa-base' })
+  assert.deepEqual(launches[0][1].env, { app: { DSN: 'dsn-base' } })
   assert.equal(launches[0][1].reserved.app.port, 3111)
   assert.equal(calls.filter(c => c[0] === 'waitHealthy').length, 2)
+})
+
+test('bootSession: readBaseEnv supplies prodEnv to derivePaneEnv; missing readBaseEnv means {}', async () => {
+  const { deps, calls } = makeDeps()
+  await bootSession(deps, 7)
+  assert.deepEqual(calls.find(c => c[0] === 'derivePaneEnv')[1].prodEnv, { APP_DOMAIN: 'homefree.cloud' })
+  const bare = makeDeps()
+  delete bare.deps.readBaseEnv
+  await bootSession(bare.deps, 7)
+  assert.deepEqual(bare.calls.find(c => c[0] === 'derivePaneEnv')[1].prodEnv, {})
 })
 
 test('bootSession passes db to establishSession only when auth.requiresDb', async () => {
@@ -163,14 +164,34 @@ test('bootSession skips the migrate step entirely for on-boot strategies', async
   const { deps, calls } = makeDeps({ migrationStrategy: 'on-boot' })
   await bootSession(deps, 7)
   assert.equal(calls.filter(c => c[0] === 'runMigrate').length, 0)
-  assert.equal(calls.filter(c => c[0] === 'ensureImage').length, 0)
 })
 
-test('bootSession merges auth envContributions into the written pane env', async () => {
+test('bootSession fails clearly when one-shot migration is required but the provisioner cannot run it', async () => {
+  const { deps, calls } = makeDeps()
+  delete deps.adapters.provisioner.runMigrate
+  await assert.rejects(() => bootSession(deps, 7), /runMigrate/)
+  assert.deepEqual(calls.filter(c => c[0] === 'teardown').map(c => c[1].paneRef.role), ['base', 'pr'])
+})
+
+test('bootSession merges auth envContributions into the pane env', async () => {
   const { deps, calls } = makeDeps({ envContributions: { app: { DEV_LOGIN_BYPASS: '1' } } })
   await bootSession(deps, 7)
-  const firstWrite = calls.find(c => c[0] === 'writeFile')
-  assert.equal(firstWrite[2], 'DSN=dsn-base\nDEV_LOGIN_BYPASS=1\n')
+  const launch = calls.find(c => c[0] === 'launchServices')[1]
+  assert.deepEqual(launch.env, { app: { DSN: 'dsn-base', DEV_LOGIN_BYPASS: '1' } })
+})
+
+test('bootSession: the primary service is `app`, else the first service', async () => {
+  const { deps } = makeDeps({ migrationStrategy: 'on-boot' })
+  deps.adapters.build.resolvePrImages = async () => ({ services: { web: 'w', api: 'a' }, migrate: null })
+  deps.adapters.build.resolveBaseImages = async () => ({ services: { web: 'w0', api: 'a0' }, migrate: null })
+  deps.adapters.provisioner.reserveServices = async ({ paneRef }) => ({
+    web: { url: 'u', port: paneRef.role === 'base' ? 4001 : 5001 },
+    api: { url: 'u', port: 4002 },
+  })
+  const out = await bootSession(deps, 7)
+  assert.equal(out.baseTag, 'w0')
+  assert.equal(out.prTag, 'w')
+  assert.deepEqual(out.upstreams, { base: 4001, pr: 5001 })
 })
 
 test('bootSession wires onBuild through build.subscribeBuild', async () => {
@@ -183,22 +204,18 @@ test('bootSession wires onBuild through build.subscribeBuild', async () => {
   assert.equal(without.getSubscribed(), null)
 })
 
-test('bootSession failure mid-boot tears down both panes and env files, then rethrows', async () => {
+test('bootSession failure mid-boot tears down both panes, then rethrows', async () => {
   const { deps, calls } = makeDeps({ failAt: 'launchServices' })
   await assert.rejects(() => bootSession(deps, 7), /fail:launchServices/)
   assert.deepEqual(calls.filter(c => c[0] === 'teardown').map(c => c[1].paneRef.role), ['base', 'pr'])
-  assert.deepEqual(calls.filter(c => c[0] === 'unlink').map(c => c[1]).sort(), ['/cd/.env.qa-base', '/cd/.env.qa-pr'])
 })
 
-test('teardownSession tears down each pane via the provisioner and scrubs env files, tolerating errors', async () => {
+test('teardownSession tears down every role via the provisioner, tolerating errors', async () => {
   const calls = []
-  const provisioner = { teardown: async a => { calls.push(['teardown', a.paneRef.role]); throw new Error('already gone') } }
-  const fsx = { unlink: async p => { calls.push(['unlink', p]); throw new Error('ENOENT') } }
-  await teardownSession({ provisioner, fsx, composeDir: '/cd' }, null) // resolves despite both failing
-  assert.deepEqual(calls, [
-    ['teardown', 'base'], ['teardown', 'pr'],
-    ['unlink', `/cd/${PANES.base.envFile}`], ['unlink', `/cd/${PANES.pr.envFile}`],
-  ])
+  const provisioner = { teardown: async a => { calls.push(a.paneRef.role); throw new Error('already gone') } }
+  await teardownSession({ provisioner }) // resolves despite failing
+  assert.deepEqual(calls, ROLES)
+  assert.deepEqual(ROLES, ['base', 'pr'])
 })
 
 // --- cancellation (2026-09-25 stale-boot incident) -------------------------
@@ -213,7 +230,6 @@ test('bootSession: an abort between stages stops the boot and does NOT tear down
   assert.equal(calls.find(c => c[0] === 'ensureBuilt')[2].signal, ac.signal, 'signal threaded into ensureBuilt')
   assert.equal(calls.some(c => c[0] === 'provisionDatabase'), false, 'no pane work after abort')
   assert.equal(calls.some(c => c[0] === 'teardown'), false, 'aborted boot must not tear down')
-  assert.equal(calls.some(c => c[0] === 'unlink'), false)
 })
 
 test('bootSession: a failure after abort skips teardown; a non-aborted failure tears down', async () => {
