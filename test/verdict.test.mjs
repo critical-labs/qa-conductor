@@ -11,14 +11,14 @@ const base = {
 
 test('formatVerdict for accept starts with the marker and approved heading', () => {
   const md = formatVerdict({ ...base, verdict: 'accept', notes: 'All flows fine.' })
-  assert.ok(md.startsWith('<!-- homefree-pr-qa -->'))
+  assert.ok(md.startsWith('<!-- qa-conductor-verdict -->'))
   assert.ok(md.includes('## ✅ QA approved'))
   assert.ok(!md.includes('changes requested'))
 })
 
 test('formatVerdict for reject uses the changes-requested heading', () => {
   const md = formatVerdict({ ...base, verdict: 'reject', notes: 'Broken checkout.' })
-  assert.ok(md.startsWith('<!-- homefree-pr-qa -->'))
+  assert.ok(md.startsWith('<!-- qa-conductor-verdict -->'))
   assert.ok(md.includes('## ❌ QA changes requested'))
   assert.ok(!md.includes('QA approved'))
 })
@@ -70,4 +70,12 @@ test('postVerdict sets qa-changes-requested on reject', async () => {
   }
   await postVerdict({ github, ...base, verdict: 'reject', notes: 'nope' })
   assert.deepEqual(labels, ['qa-changes-requested'])
+})
+
+test('postVerdict applies the configured label pair', async () => {
+  const labels = []
+  const github = { postComment: async () => ({ html_url: 'u' }), setQaLabel: async (pr, l) => labels.push(l) }
+  await postVerdict({ github, ...base, verdict: 'reject', notes: '', labels: { accept: 'ok', reject: 'nope' } })
+  await postVerdict({ github, ...base, verdict: 'accept', notes: '', labels: { accept: 'ok', reject: 'nope' } })
+  assert.deepEqual(labels, ['nope', 'ok'])
 })

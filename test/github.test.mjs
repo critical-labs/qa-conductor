@@ -333,6 +333,15 @@ test('setQaLabel qa-changes-requested removes qa-approved', async () => {
   assert.equal(calls[1].url, `${API}/repos/${REPO}/issues/41/labels/qa-approved`)
 })
 
+test('setQaLabel honours a configured label pair and removes its opposite', async () => {
+  const { calls, fetchFn } = makeFetch(() => response(200, []))
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn, qaLabels: ['ok', 'nope'] })
+  await gh.setQaLabel(41, 'ok')
+  assert.deepEqual(JSON.parse(calls[0].options.body), { labels: ['ok'] })
+  assert.equal(calls[1].url, `${API}/repos/${REPO}/issues/41/labels/nope`)
+  await assert.rejects(gh.setQaLabel(41, 'qa-approved'), /unknown QA label/)
+})
+
 test('setQaLabel tolerates 404 when the opposite label is absent', async () => {
   const { calls, fetchFn } = makeFetch((url, options) =>
     options.method === 'POST' ? response(200, [{ name: 'qa-approved' }]) : response(404, { message: 'Label does not exist' }),
