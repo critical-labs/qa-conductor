@@ -1,9 +1,20 @@
 {
-  "name": "@homefree/qa-conductor",
+  "name": "@critical-labs/qa-conductor",
   "version": "0.1.0",
   "private": true,
   "description": "Side-by-side PR-QA harness: boots base-vs-PR app panes against cloned data behind mirrored proxies, with a pluggable five-seam adapter interface (Provisioner, BuildConvention, Seed, EnvTransform, AuthBootstrap).",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/critical-labs/qa-conductor.git"
+  },
+  "files": [
+    "lib",
+    "public"
+  ],
   "exports": {
     ".": "./lib/server.mjs",
     "./session": "./lib/session.mjs",
@@ -13,7 +24,8 @@
     "./exec": "./lib/exec.mjs",
     "./proxy": "./lib/proxy.mjs",
     "./verdict": "./lib/verdict.mjs",
-    "./adapters/provisioner-docker": "./lib/adapters/provisioner-docker.mjs"
+    "./adapters/provisioner-docker": "./lib/adapters/provisioner-docker.mjs",
+    "./package.json": "./package.json"
   },
   "scripts": {
     "test": "node --test test/*.test.mjs"
