@@ -31,8 +31,8 @@ test('runPg builds the exact docker run argv', async () => {
     'docker', 'run', '-d',
     '--name', 'qa-pg-base',
     '--network', 'qa-session',
-    '--label', 'homefree-qa-session',
-    '-e', 'POSTGRES_USER=homefree',
+    '--label', 'qa-conductor-session',
+    '-e', 'POSTGRES_USER=qa',
     '-e', 'POSTGRES_PASSWORD=qa',
     '-e', 'POSTGRES_DB=postgres',
     'postgres:16',
@@ -72,7 +72,7 @@ test('createDocker partial postgres override fills the rest from defaults', asyn
   assert.ok(argv.includes('POSTGRES_PASSWORD=qa')) // default retained
   assert.ok(argv.includes('POSTGRES_DB=postgres')) // default retained
   assert.ok(argv.includes('postgres:16')) // default image retained
-  assert.ok(argv.includes('homefree-qa-session')) // default label retained
+  assert.ok(argv.includes('qa-conductor-session')) // default label retained
 })
 
 test('cloneDb and psql use the configured superuser', async () => {
@@ -93,7 +93,7 @@ test('runApp builds the exact docker run argv with loopback port mapping', async
     'docker', 'run', '-d',
     '--name', 'qa-app-pr',
     '--network', 'qa-session',
-    '--label', 'homefree-qa-session',
+    '--label', 'qa-conductor-session',
     '--env-file', '/compose/.env.qa-pr',
     '-p', '127.0.0.1:3112:3000',
     'ghcr.io/x/app:pr-7-abc',
@@ -107,7 +107,7 @@ test('runMigrate builds the exact docker run argv', async () => {
   assert.deepEqual(exec.calls, [[
     'docker', 'run', '--rm',
     '--network', 'qa-session',
-    '--label', 'homefree-qa-session',
+    '--label', 'qa-conductor-session',
     '--env-file', '/compose/.env.qa-pr',
     'ghcr.io/x/app:migrate-pr-7-abc',
   ]])
@@ -127,8 +127,8 @@ test('waitHealthyPg needs two consecutive isready+query probes', async () => {
   const docker = createDocker({ execFileFn: exec })
   await docker.waitHealthyPg('qa-pg-base', { retries: 5, sleepFn })
   assert.equal(exec.calls.length, 6)
-  assert.deepEqual(exec.calls[0], ['docker', 'exec', 'qa-pg-base', 'pg_isready', '-U', 'homefree'])
-  assert.deepEqual(exec.calls[3], ['docker', 'exec', 'qa-pg-base', 'psql', '-U', 'homefree', '-d', 'postgres', '-c', 'SELECT 1'])
+  assert.deepEqual(exec.calls[0], ['docker', 'exec', 'qa-pg-base', 'pg_isready', '-U', 'qa'])
+  assert.deepEqual(exec.calls[3], ['docker', 'exec', 'qa-pg-base', 'psql', '-U', 'qa', '-d', 'postgres', '-c', 'SELECT 1'])
   assert.equal(sleeps.length, 3)
 })
 
@@ -217,10 +217,10 @@ test('ensureImage throws after exhausting pull retries', async () => {
 test('cloneDb creates the target db then pipes pg_dump into psql via one sh -c', async () => {
   const exec = recordingExec()
   const docker = createDocker({ execFileFn: exec })
-  await docker.cloneDb('homefree-db-1', 'qa-pg-base', 'idp')
+  await docker.cloneDb('prod-db', 'qa-pg-base', 'idp')
   assert.deepEqual(exec.calls, [
-    ['docker', 'exec', 'qa-pg-base', 'psql', '-U', 'homefree', '-d', 'postgres', '-c', 'CREATE DATABASE idp'],
-    ['sh', '-c', 'docker exec homefree-db-1 pg_dump -U homefree --clean --if-exists idp | docker exec -i qa-pg-base psql -q -U homefree -d idp'],
+    ['docker', 'exec', 'qa-pg-base', 'psql', '-U', 'qa', '-d', 'postgres', '-c', 'CREATE DATABASE idp'],
+    ['sh', '-c', 'docker exec prod-db pg_dump -U qa --clean --if-exists idp | docker exec -i qa-pg-base psql -q -U qa -d idp'],
   ])
 })
 
@@ -228,7 +228,7 @@ test('createDatabase issues CREATE and returns; tolerates already-exists', async
   const ok = recordingExec([''])
   const docker = createDocker({ execFileFn: ok })
   await docker.createDatabase('qa-pg-base', 'idp')
-  assert.deepEqual(ok.calls, [['docker', 'exec', 'qa-pg-base', 'psql', '-U', 'homefree', '-d', 'postgres', '-c', 'CREATE DATABASE idp']])
+  assert.deepEqual(ok.calls, [['docker', 'exec', 'qa-pg-base', 'psql', '-U', 'qa', '-d', 'postgres', '-c', 'CREATE DATABASE idp']])
 
   const exists = recordingExec([new Error('ERROR:  database "idp" already exists')])
   const docker2 = createDocker({ execFileFn: exists })
@@ -248,16 +248,16 @@ test('createDatabase retries transient connection errors then succeeds', async (
 test('pipeDump runs one sh -c pg_dump|psql and validates names', async () => {
   const exec = recordingExec([''])
   const docker = createDocker({ execFileFn: exec })
-  await docker.pipeDump('homefree-db-1', 'qa-pg-base', 'idp')
+  await docker.pipeDump('prod-db', 'qa-pg-base', 'idp')
   assert.equal(exec.calls[0][0], 'sh')
-  assert.equal(exec.calls[0][2], 'docker exec homefree-db-1 pg_dump -U homefree --clean --if-exists idp | docker exec -i qa-pg-base psql -q -U homefree -d idp')
+  assert.equal(exec.calls[0][2], 'docker exec prod-db pg_dump -U qa --clean --if-exists idp | docker exec -i qa-pg-base psql -q -U qa -d idp')
   await assert.rejects(docker.pipeDump('bad;name', 'qa-pg-base', 'idp'), /unsafe/)
 })
 
 test('cloneDb tolerates already-exists on CREATE DATABASE', async () => {
   const exec = recordingExec([new Error('ERROR:  database "idp" already exists')])
   const docker = createDocker({ execFileFn: exec })
-  await docker.cloneDb('homefree-db-1', 'qa-pg-base', 'idp')
+  await docker.cloneDb('prod-db', 'qa-pg-base', 'idp')
   assert.equal(exec.calls.length, 2)
   assert.equal(exec.calls[1][0], 'sh')
 })
@@ -265,7 +265,7 @@ test('cloneDb tolerates already-exists on CREATE DATABASE', async () => {
 test('cloneDb rethrows non-transient CREATE DATABASE failures immediately', async () => {
   const exec = recordingExec([new Error('ERROR:  permission denied to create database')])
   const docker = createDocker({ execFileFn: exec })
-  await assert.rejects(docker.cloneDb('homefree-db-1', 'qa-pg-base', 'idp'), /permission denied/)
+  await assert.rejects(docker.cloneDb('prod-db', 'qa-pg-base', 'idp'), /permission denied/)
   assert.equal(exec.calls.length, 1)
 })
 
@@ -277,7 +277,7 @@ test('cloneDb retries CREATE DATABASE through the postgres restart window', asyn
   ])
   const sleeps = []
   const docker = createDocker({ execFileFn: exec })
-  await docker.cloneDb('homefree-db-1', 'qa-pg-base', 'idp', { sleepFn: async (ms) => sleeps.push(ms) })
+  await docker.cloneDb('prod-db', 'qa-pg-base', 'idp', { sleepFn: async (ms) => sleeps.push(ms) })
   assert.equal(exec.calls.length, 3)
   assert.equal(exec.calls[2][0], 'sh')
   assert.equal(sleeps.length, 1)
@@ -288,7 +288,7 @@ test('cloneDb gives up on transient errors after exhausting retries', async () =
   const exec = recordingExec([transient(), transient(), transient()])
   const docker = createDocker({ execFileFn: exec })
   await assert.rejects(
-    docker.cloneDb('homefree-db-1', 'qa-pg-base', 'idp', { retries: 3, sleepFn: async () => {} }),
+    docker.cloneDb('prod-db', 'qa-pg-base', 'idp', { retries: 3, sleepFn: async () => {} }),
     /connection to server/,
   )
   assert.equal(exec.calls.length, 3)
@@ -298,8 +298,8 @@ test('cloneDb rejects names that fail the safe-name pattern', async () => {
   const exec = recordingExec()
   const docker = createDocker({ execFileFn: exec })
   await assert.rejects(docker.cloneDb('bad;name', 'qa-pg-base', 'idp'), /unsafe/)
-  await assert.rejects(docker.cloneDb('homefree-db-1', 'a b', 'idp'), /unsafe/)
-  await assert.rejects(docker.cloneDb('homefree-db-1', 'qa-pg-base', 'idp; DROP'), /unsafe/)
+  await assert.rejects(docker.cloneDb('prod-db', 'a b', 'idp'), /unsafe/)
+  await assert.rejects(docker.cloneDb('prod-db', 'qa-pg-base', 'idp; DROP'), /unsafe/)
   assert.equal(exec.calls.length, 0)
 })
 
@@ -332,7 +332,7 @@ test('psql builds the exact docker exec argv and returns stdout', async () => {
   const docker = createDocker({ execFileFn: exec })
   const out = await docker.psql('qa-pg-base', 'idp', 'SELECT 42')
   assert.deepEqual(exec.calls, [[
-    'docker', 'exec', 'qa-pg-base', 'psql', '-U', 'homefree', '-d', 'idp', '-t', '-A', '-c', 'SELECT 42',
+    'docker', 'exec', 'qa-pg-base', 'psql', '-U', 'qa', '-d', 'idp', '-t', '-A', '-c', 'SELECT 42',
   ]])
   assert.equal(out, '42\n')
 })
@@ -361,7 +361,7 @@ test('createNetwork and rmNetwork build exact argv; rmNetwork tolerates errors',
   await docker.createNetwork('qa-session')
   await docker.rmNetwork('qa-session')
   assert.deepEqual(exec.calls, [
-    ['docker', 'network', 'create', '--label', 'homefree-qa-session', 'qa-session'],
+    ['docker', 'network', 'create', '--label', 'qa-conductor-session', 'qa-session'],
     ['docker', 'network', 'rm', 'qa-session'],
   ])
 
@@ -375,7 +375,7 @@ test('sweepQaContainers lists by label then force-removes', async () => {
   const docker = createDocker({ execFileFn: exec })
   const ids = await docker.sweepQaContainers()
   assert.deepEqual(exec.calls, [
-    ['docker', 'ps', '-aq', '--filter', 'label=homefree-qa-session'],
+    ['docker', 'ps', '-aq', '--filter', 'label=qa-conductor-session'],
     ['docker', 'rm', '-f', '-v', 'abc123', 'def456'],
   ])
   assert.deepEqual(ids, ['abc123', 'def456'])
@@ -392,9 +392,9 @@ test('sweepQaContainers with nothing to sweep skips the rm', async () => {
 test('inspectImageOf returns the trimmed image ref', async () => {
   const exec = recordingExec(['ghcr.io/x/app:1.2.3-rc.4\n'])
   const docker = createDocker({ execFileFn: exec })
-  const image = await docker.inspectImageOf('homefree-app-1')
+  const image = await docker.inspectImageOf('prod-app')
   assert.deepEqual(exec.calls, [[
-    'docker', 'inspect', '--format', '{{.Config.Image}}', 'homefree-app-1',
+    'docker', 'inspect', '--format', '{{.Config.Image}}', 'prod-app',
   ]])
   assert.equal(image, 'ghcr.io/x/app:1.2.3-rc.4')
 })
