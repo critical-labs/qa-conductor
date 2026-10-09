@@ -32,6 +32,7 @@ In scope is any way around one of the defences the README's [Security](README.md
 - **the request guards**: the `Host` allowlist, the harness API's same-origin and harness-origin checks, its JSON-only writes, and the pane request guard;
 - **the framing rules**: another page framing the harness, or a pane outside the harness origin and `QA_FRAME_ANCESTORS`, or driving a pane's mirror bridge;
 - **cookie isolation**: a pane app that gets a cookie other than its own jar's and the ones `QA_FORWARD_CLIENT_COOKIES` names, or a cookie an earlier session's app set;
-- **token handling**: `GITHUB_QA_TOKEN`, `QA_GHCR_TOKEN` or the conductor's own environment reaching a pane's process, a page, a log line or the verdict comment.
+- **token handling**: `GITHUB_QA_TOKEN`, `QA_GHCR_TOKEN` or the conductor's own environment reaching a pane's process, a page, a log line or the verdict comment;
+- **pane isolation** in `adapters/provisioner-docker`, on Docker Engine with its default iptables rules: the PR pane's containers reaching the base pane's other than through the host ([Known limits](README.md#known-limits)), or one pane's generated database password reaching the other pane ([its section](README.md#built-in-adaptersprovisioner-docker-docker-provisioner)).
 
 Out of scope are the limits the README already states, such as PR code that passes the trust gate running as the reviewer, the panes' pages sharing the browser's cookies with other apps on their hostname, and the other [known limits](README.md#known-limits); flaws in a consumer's own adapters or front door; and denial of service by someone the gate lets in.

@@ -277,6 +277,20 @@ test('bootSession: an abort between stages stops the boot and does NOT tear down
   assert.equal(calls.some(c => c[0] === 'teardown'), false, 'aborted boot must not tear down')
 })
 
+test('bootSession: an abort while a pane database is provisioned stops the boot before its Seed runs', async () => {
+  const ac = new AbortController()
+  const { deps, calls } = makeDeps()
+  deps.signal = ac.signal
+  // A Provisioner that returns normally although the abort landed during it
+  // (a docker call in flight can't be interrupted): the Seed would write into
+  // whatever database now has that pane's name, possibly the next session's.
+  const provision = deps.adapters.provisioner.provisionDatabase
+  deps.adapters.provisioner.provisionDatabase = async args => { const out = await provision(args); ac.abort(); return out }
+  await assert.rejects(() => bootSession(deps, 7), err => err.name === 'AbortError')
+  assert.equal(calls.some(c => c[0] === 'seedPane'), false, 'no Seed after the abort')
+  assert.equal(calls.some(c => c[0] === 'teardown'), false)
+})
+
 test('bootSession: a failure after abort skips teardown; a non-aborted failure tears down', async () => {
   const ac = new AbortController()
   const aborted = makeDeps()
