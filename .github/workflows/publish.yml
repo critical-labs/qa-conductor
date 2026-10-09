@@ -1,34 +1,62 @@
 name: publish
 
 # A pushed v<version> tag stages that version on npm. Nothing goes live until a
-# maintainer approves the staged version on npmjs.com. NPM_TOKEN is the org's
+# maintainer approves the staged version on npmjs.com. NPM_TOKEN is a
 # stage-only token for @critical-labs, so a plain publish would be refused.
+#
+# Two jobs, so the token never meets the repository's code:
+# - test checks that the tagged commit was main itself, checks the tag, runs
+#   the tests and packs the tarball, with no secrets and no id-token;
+# - publish waits for the npm-release environment's approval, checks the
+#   commit again, checks the tarball, and stages it. It checks out
+#   nothing and runs no code from the repository.
+# A tag runs the workflow file of the commit it names, so these checks catch
+# mistakes, and a run's own results, these checks included, prove nothing
+# until its commit is main's. What holds against an edited file is the
+# approver finding the run's SHA in main's first-parent history
+# (CONTRIBUTING.md, Releasing, step 5), and NPM_TOKEN living in the
+# npm-release environment alone.
 # test/package.test.mjs pins the shape of this file.
 
 on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 
 jobs:
-  publish:
+  test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
+      # The publish job's check, run first here too, before any checkout, so
+      # a tag put on the wrong commit by mistake fails before anyone is asked
+      # to approve it. It is no evidence for the approver: a tag on another
+      # commit runs that commit's copy of this file.
+      - name: Check the tagged commit is on main, before the approval
+        run: |
+          git init --quiet "$RUNNER_TEMP/main-history"
+          cd "$RUNNER_TEMP/main-history"
+          git fetch --quiet --no-tags "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not on main: tag a commit main has merged"
+            exit 1
+          fi
+          git rev-list --first-parent refs/remotes/origin/main > "$RUNNER_TEMP/main-first-parent"
+          if ! grep -qxF "$GITHUB_SHA" "$RUNNER_TEMP/main-first-parent"; then
+            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) was merged into main but never was main: tag main's merge commit"
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          # Staged publishing needs Node >= 22.14 and npm >= 11.15.
           node-version: 22
-          registry-url: https://registry.npmjs.org
           # A release must not restore a cache another run could have written.
           package-manager-cache: false
-      - run: npm install -g npm@^11.15.0
       # The tag names the release, package.json is what gets packed: refuse a
       # tag that would stage some other version under its name.
       - name: Check the tag matches package.json
@@ -39,10 +67,109 @@ jobs:
             exit 1
           fi
       - run: npm test
-      # Lists exactly what the stage step will upload.
-      - run: npm pack --dry-run
+      # Packs the tarball the publish job stages, and lists what it holds.
+      - run: npm pack
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tarball
+          path: critical-labs-qa-conductor-*.tgz
+          if-no-files-found: error
+          # As long as a deployment can wait for its approval.
+          retention-days: 30
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Each run waits for approval (CONTRIBUTING.md, Releasing, step 5). The
+    # environment admits v* tags only.
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # Only a commit that was main itself may be released, as a release's
+      # merge commit is: a v* tag on any other commit stops here. That
+      # includes a branch's or a pull request's own commit, even once main has
+      # merged it: the main ruleset allows merge and squash merges only, and a
+      # rebase merge, re-enabled, would put a pull request's own commits on
+      # main's first-parent line. Git alone, in a directory of its own: main's
+      # history, and no files from the tag. GitHub runs this as bash -e; the
+      # first-parent list goes through a file so that it would hold under
+      # pipefail too, where grep -q quitting early would fail the pipe.
+      - name: Check the tagged commit is on main
+        run: |
+          git init --quiet "$RUNNER_TEMP/main-history"
+          cd "$RUNNER_TEMP/main-history"
+          git fetch --quiet --no-tags "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not on main: tag a commit main has merged"
+            exit 1
+          fi
+          git rev-list --first-parent refs/remotes/origin/main > "$RUNNER_TEMP/main-first-parent"
+          if ! grep -qxF "$GITHUB_SHA" "$RUNNER_TEMP/main-first-parent"; then
+            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) was merged into main but never was main: tag main's merge commit"
+            exit 1
+          fi
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # Staged publishing needs Node >= 22.14 and npm >= 11.15.
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      # This job holds the token, so one npm, by exact version, and none of its
+      # install scripts.
+      - run: npm install -g --ignore-scripts npm@11.21.0
+      # The tarball the test job packed from the commit it tested,
+      # digest-checked on download.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: tarball
+          path: release
+      - name: Check the tarball is the tag's version
+        run: |
+          want="critical-labs-qa-conductor-${GITHUB_REF_NAME#v}.tgz"
+          have="$(ls -A release)"
+          if [ "$have" != "$want" ]; then
+            echo "::error::the test job's tarball is $have, not $want"
+            exit 1
+          fi
+      # npm applies a tarball's publishConfig to the stage, any key in it: a
+      # scoped registry or a proxy there would send the stage, token and all,
+      # elsewhere, whatever --registry says. So read the manifest the way the
+      # stage will: with this npm's own pacote.manifest and the same read
+      # options (fullMetadata, fullReadJson); npm's other options only touch
+      # caching and file modes for a tarball. A second package.json under
+      # another directory, a pax header or an extra gzip member then can't
+      # hand npm a manifest this check didn't see, and no code from the
+      # repository runs. It refuses by default, so a read that never settles
+      # refuses too. Stage only a tarball whose publishConfig is exactly
+      # package.json's.
+      - name: Check the tarball's publishConfig
+        run: |
+          node -e '
+            const path = require("node:path")
+            const { realpathSync } = require("node:fs")
+            const { isDeepStrictEqual } = require("node:util")
+            process.exitCode = 1
+            const root = path.dirname(path.dirname(realpathSync(process.argv[2])))
+            const pacote = require(path.join(root, "node_modules", "pacote"))
+            pacote.manifest(`file:${process.argv[1]}`, { fullMetadata: true, fullReadJson: true }).then(manifest => {
+              if (isDeepStrictEqual(manifest.publishConfig, { "access": "public", "provenance": true })) {
+                process.exitCode = 0
+                return
+              }
+              console.log("::error::the tarball publishConfig is not exactly {access: public, provenance: true}, and the rest of it would apply to the stage")
+            }, err => {
+              console.log(`::error::cannot read the tarball manifest: ${err.code ?? err.message}`)
+            })
+          ' "./release/critical-labs-qa-conductor-${GITHUB_REF_NAME#v}.tgz" "$(command -v npm)"
+      # The ./ makes it a file: npm would read release/<name>.tgz as a GitHub
+      # repository. --registry pins the default registry, and the step above
+      # made sure publishConfig adds nothing to it. No npm script runs for a
+      # tarball.
       - name: Stage publish (a maintainer approves on npmjs.com to go live)
-        run: npm stage publish --access public
+        run: npm stage publish "./release/critical-labs-qa-conductor-${GITHUB_REF_NAME#v}.tgz" --access public --registry https://registry.npmjs.org/
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_PROVENANCE: "true"

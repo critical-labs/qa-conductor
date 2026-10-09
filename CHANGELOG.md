@@ -31,6 +31,17 @@ What changed in each release, newest first. A 0.x minor version may break the in
   - **`fetchFn`** sends those requests. It is fetch-shaped, and the default is plain HTTP over `node:http`, since `fetch` refuses some ports a conductor may listen on (`6000` and `10080`, among others).
   - **`probeTimeoutMs`** defaults to `5000`. Any value but a whole number of milliseconds from 1 to 2147483647 returns `2`.
 
+### Releases
+
+- **The npm token never meets the repository's code, and only `main` is released.** The publish workflow is now two jobs.
+  - **`test`** first checks that the tagged commit was `main` itself: an ancestor of `main` on its first-parent line, as a release's merge commit is. It then checks the tag, runs the tests and packs the tarball, with no secrets and no `id-token`.
+  - **`publish`** waits for the `npm-release` environment's approval, checks the commit again, and checks the test job's tarball: its name, and that its `publishConfig` is exactly `package.json`'s, since npm would apply a scoped registry or proxy there to the stage. The manifest is read with the stage's own npm, so no second `package.json` in the archive can differ from what the check saw. Then it stages the tarball with provenance. It checks out nothing and runs no repository code.
+  - **What's refused:** a `v*` tag put on any other commit by mistake fails before anyone is asked to approve it. That covers a branch, a pull request, or a release branch's own commit, even once merged. The `main` ruleset allows merge and squash merges only, so a pull request reaches `main`'s first-parent line only as its merge or squash commit. Re-enabling rebase merges would weaken the check.
+  - **What holds against an edited workflow:** a tag runs the workflow file of the commit it names, so a run's own results prove nothing until its commit is `main`'s.
+    - Before approving, the approver finds the run's SHA in `main`'s first-parent history, fetched from the canonical repository, which the run can't produce. CONTRIBUTING's Releasing steps give the commands.
+    - The token lives in the `npm-release` environment alone.
+    - The staged version still goes live only once a maintainer approves it on npmjs.com.
+
 ## [0.3.1] — 2026-10-07
 
 Cookie isolation for the panes, a stricter `.env.qa` parser, seams that may be async, and the documentation a public package needs: a README to start from, `CONTRIBUTING.md` and `SECURITY.md`. It is a patch release, but its cookie and `.env.qa` fixes break consumers that relied on what 0.3.0 did: read [Migrating from 0.3.0](#migrating-from-030) before upgrading.

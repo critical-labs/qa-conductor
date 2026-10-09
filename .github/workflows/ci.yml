@@ -24,5 +24,16 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
-      # Zero runtime dependencies: the suite runs on node:test alone.
+      # Zero runtime dependencies: the suite runs on node:test alone. On Node
+      # 22 it runs with Node's own npm, as publish.yml's test job does.
       - run: npm test
+      # Then, on Node 22, the package tests again with the publish job's npm,
+      # so the test of its publishConfig check reads tarballs with the pacote
+      # a release stages with. test/package.test.mjs pins this job, and checks
+      # on that run that the npm beside node is that version.
+      - if: matrix.node == 22
+        run: npm install -g --ignore-scripts npm@11.21.0
+      - if: matrix.node == 22
+        run: node --test test/package.test.mjs
+        env:
+          CI_EXPECTS_PUBLISH_NPM: "true"
