@@ -23,7 +23,7 @@ import { startConductor } from '../lib/server.mjs'
 import { DEMO_REPO } from './fixtures.mjs'
 import { createDemoGithub } from './fake-github.mjs'
 import {
-  createDemoBuild, createDemoProvisioner, createDemoSeed, demoAuth, demoEnvTransform, makePause,
+  createDemoBuild, createDemoInspector, createDemoProvisioner, createDemoSeed, demoAuth, demoEnvTransform, makePause,
 } from './fake-adapters.mjs'
 
 export const DEMO_HOST = '127.0.0.1'
@@ -98,6 +98,8 @@ export async function startDemo({ port = 4100, speed = 1, log = console, harness
     seed: createDemoSeed({ pause }),
     envTransform: demoEnvTransform,
     auth: demoAuth,
+    // a core older than the data checks (#8) ignores it
+    inspector: createDemoInspector(),
   }
   const conductor = startConductor({
     cfg,

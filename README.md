@@ -175,6 +175,7 @@ It serves the harness on `cfg.ports.harness` and one proxy per pane on `cfg.port
 | `@critical-labs/qa-conductor/exposure` | `mountsFor`, `reconcileExposure`, `runExpose` | one [exposure](#exposure-optional) pass, outside a conductor |
 | `@critical-labs/qa-conductor/proxy` | `createPaneProxy`, `panePolicy`, `parseSetCookie`, `isAllowedHost`, `requestHostname`, `misdirected` | the pane proxy, and the [Host allowlist](#security) check every server runs |
 | `@critical-labs/qa-conductor/verdict` | `formatVerdict`, `postVerdict` | the verdict comment and label |
+| `@critical-labs/qa-conductor/data-diff` | `validateRules`, `createMasker`, `sanitizeSnapshot`, `diffSnapshots`, `divergence`, `flagChanges`, `trustOf`, `LIMITS`, `SECRET_NAME` | the [data checks](#data-checks)' engine, with no I/O: what a snapshot keeps and masks, what changed, where the panes differ, and what is destructive. For checking an inspector's snapshots |
 | `@critical-labs/qa-conductor/adapters/provisioner-docker` | `createDockerProvisioner` | a Provisioner that runs each pane as containers on the host's Docker daemon |
 | `@critical-labs/qa-conductor/adapters/provisioner-process` | `createProcessProvisioner` | a Provisioner for local process groups |
 | `@critical-labs/qa-conductor/adapters/build-worktree` | `createWorktreeBuild`, `trustDecision` | a BuildConvention that runs PRs from git worktrees, behind a trust gate |
@@ -316,7 +317,7 @@ The probe doesn't try the node's `tailscale serve` ports: every way through them
 
 ## The seams
 
-A boot runs these five seams in order: `ensureBuilt` → `provisionDatabase` (both panes) → the [isolation check](#isolation-verdicts) → per pane (`seedPane` → `reserveServices`) → `derivePaneEnv` (+ `runMigrate`) → `launchServices` → `waitHealthy` → `establishSession`. A sixth, [Exposure](#exposure-optional), is optional and outside the boot: it publishes the conductor itself. The shapes they pass each other are under [Types](#types).
+A boot runs these five seams in order: `ensureBuilt` → `provisionDatabase` (both panes) → the [isolation check](#isolation-verdicts) → per pane (`seedPane` → `reserveServices`) → `derivePaneEnv` (+ `runMigrate`) → `launchServices` → `waitHealthy` → `establishSession`. A sixth, [Exposure](#exposure-optional), is optional and outside the boot: it publishes the conductor itself. A seventh, the read-only **Inspector** (`adapters.inspector`), is optional too: right after each `seedPane`, and once `establishSession` is done, it lets the [data checks](#data-checks) read each pane's data. The shapes they pass each other are under [Types](#types).
 
 | Seam | Members | Owns |
 |---|---|---|
@@ -325,12 +326,14 @@ A boot runs these five seams in order: `ensureBuilt` → `provisionDatabase` (bo
 | **Seed** | `databases`, `seedPane({paneRef, db, databases, signal})` | Where each pane's data comes from and how it moves |
 | **EnvTransform** | `derivePaneEnv({prodEnv, pane}) → {service: env}` (pure) | Pointing a pane at its own DB and origin, and neutralizing side effects (email, payments, storage) |
 | **AuthBootstrap** | `requiresDb`, `establishSession({pane, operator, db?, signal}) → {landingUrl}`; optional `envContributions() → {service: env}` | Getting the reviewer logged in to each pane |
+| **Inspector** (optional) | `open({paneRef, db, databases, signal}) → {snapshot({limits, signal}) → Snapshot, close?()}`; optional `rules` | Reading each pane's data for the [data checks](#data-checks), and nothing else |
 
 The optional members degrade gracefully when absent:
 - With no `sweep`, nothing is cleaned up at startup, and enrolment trusts that no pane from an earlier run is still up.
 - With no `isolation`, every session's [isolation verdict](#isolation-verdicts) is `unknown`.
 - With no `logs`, failures show no log tail.
 - With no `describePrs`, every PR shows as `none`.
+- With no `inspector`, there are no data checks: `/api/state` says `data: {available: false}`, and the boot is as it was.
 
 The one exception: a build that declares `one-shot-image` migrations with a Provisioner that can't `runMigrate` fails the boot with a clear error.
 
@@ -349,7 +352,13 @@ What the seams pass each other. Any method above may return its result or a prom
 
 ### Contracts between the seams
 
-- **`db` is opaque to the core.** Whatever `provisionDatabase` returns as `db` is passed unchanged to `seedPane` and (when `requiresDb`) to `establishSession`. Its shape is a contract among a consumer's own adapters.
+- **`db` is opaque to the core.** Whatever `provisionDatabase` returns as `db` is passed unchanged to `seedPane`, to `inspector.open` and (when `requiresDb`) to `establishSession`. Its shape is a contract among a consumer's own adapters.
+- **The inspector reads, and never fails a boot.**
+  - **When it runs:** `open` is called right after each pane's `seedPane`, with the same `db`, and the probe it returns takes the `seeded` snapshot there, before anything of the PR's runs on that pane. Both probes take the `ready` snapshot once every pane is signed in, before the boot returns.
+  - **Read only:** a probe must only read. `close()`, if any, frees what the conductor's side holds, and must never touch the store.
+  - **Failures:** an `open` or `snapshot` that throws, returns nothing useful, or takes longer than `limits.timeoutMs` (30 s) fails nothing. Its pane shows why it has no data, and a probe that comes too late is closed unused. The `signal` each call gets aborts at its timeout too, so a call that heeds it stops. A hanging inspector can add up to 150 s to a boot: an open and a seeded read per pane, one after the other, then the ready reads together.
+  - **Cancellation:** an aborted boot calls the inspector no more. Teardown, and the next boot, close the probes before the panes go.
+  - **Rules:** `rules` are the [data checks'](#data-checks) rules, which `startConductor` checks, throwing on bad ones.
 - **Cancellation (`signal`).** Teardown and takeover abort the in-flight boot. An aborted boot never tears anything down, even when the abort lands while its failure log tail is being read: whoever aborted it already did.
   - **Where the core checks it:**
     - between stages;
@@ -375,6 +384,74 @@ What the seams pass each other. Any method above may return its result or a prom
 - **Sessions live in the jar (AuthBootstrap).** The pane app gets the cookies its own responses set this session, which the proxy keeps, and not the browser's. So the session must reach the jar in a `Set-Cookie`: have the `landingUrl`, or a redirect it makes, set it server-side. A session cookie the app's scripts write can't be kept apart for two panes on one hostname, `QA_FORWARD_CLIENT_COOKIES` or not. Cookies ignore ports, so both panes' pages write the same browser cookie, whichever pane signs in last overwrites it, and both proxies would pass that one value on: one pane's app would get the other pane's session (see [Security](#security)).
 
 **Reference consumers:** this repository's self-QA ([`qa/self.mjs`](qa/self.mjs): `build-worktree` and `provisioner-process`, described in [CONTRIBUTING.md](CONTRIBUTING.md#qa-this-repos-own-pull-requests)), the demo's fake adapters ([`demo/fake-adapters.mjs`](demo/fake-adapters.mjs)), and agent-identity's [`packages/qa`](https://github.com/critical-labs/agent-identity/tree/main/packages/qa), a 0.2-era consumer that seeds each pane's DynamoDB Local from a redacted snapshot.
+
+### Data checks
+
+The data checks compare snapshots of each pane's data. They show what a pane's data did between two snapshots, and where the PR pane's changes depart from the base pane's. They also flag the destructive ones. Both panes start from one seed and get the same mirrored actions, so a PR-only change is the PR's. The engine is [`@critical-labs/qa-conductor/data-diff`](#entry-points): pure functions with no I/O.
+
+With an [inspector](#the-seams), each session takes these snapshots of each pane, in memory only:
+- **`seeded`:** right after its seed, before anything of the PR's ran on it. `seeded` to `ready` is the **boot** span: what migrations and the sign-in did.
+- **`ready`:** once both panes are signed in, before the reviewer's first request. It is the baseline. A pane whose ready read failed keeps its `seeded` snapshot, and its first later snapshot is its baseline, so its boot span still shows; why its ready read failed stays in `errors.boot`. That pane's spans then cover another window than the other pane's: they say so (`aligned: false`), are incomplete, and nothing in the base pane excuses a PR change there. A Re-baseline aligns the session span again; the boot span stays as it was.
+- **`now`:** on **Snapshot now** (`POST /api/data/snapshot`). The baseline to `now` is the **session** span: what the reviewer's actions did. A pane whose read failed has no session span, rather than an old one.
+
+**Re-baseline** (`{rebaseline: true}`) makes now the baseline, after a manual sign-in, say: both panes, or, when either read fails, neither. `GET /api/data` gives both spans: each pane's diff, their divergence, and the PR's flags, `trusted` or `advisory` by the session's isolation verdict. A span whose PR pane couldn't be read (a read that failed or hung, which PR code can cause with a lock) has a red `unreadable` flag: its changes are unknown, never none. It never reaches the event stream, a log or GitHub. The event stream says only `{kind: 'capture', pane, phase, ok}`, for the `seeded` and `ready` phases.
+
+
+- **A snapshot** is `{ collections: { name: Collection } }`. A **Collection** is `{ key, rows, count?, truncated?, fields? }`:
+  - `rows` are plain JSON objects;
+  - `key` names the identity fields from the store's own schema (a primary key, a `KeySchema`), or is `null`, and the rows are then compared as a multiset;
+  - `count` is the true row count. A truncated collection shows only a net change in it: a fall reads as deletes, a rise as inserts, and what happened past the cut can't be seen. A collection with fewer rows than its `count` is truncated, and one marked `truncated` with no `count` is a problem;
+  - `fields` are its declared columns, so a dropped column shows. Leave it out for a schemaless store.
+- **Rules** (`validateRules(rules)`) are plain data. Every list is optional, and a collection name in a rule matches exactly or with `*` globs:
+  - `exclude: [name]`: never kept or shown, such as migration history or sessions;
+  - `volatile: [{collection, fields, mode?}]`: fields such as timestamps that change on their own. `ignore` (the default) drops them; `presence` keeps only whether each is set;
+  - `classify: [{collection, fields, as}]`: `as` is `secret` or `pii`. It names top-level fields only. A value inside JSON is masked when its key looks secret, but `classify` doesn't reach it;
+  - `softDelete: [{collection, field}]`: a field whose being set counts as a delete. It is never masked, and `null`, `false`, `0` and `''` count as not set;
+  - `destructive: [{collection, maxChanged?, allowDeletes?}]`: a collection's own mass-change threshold, or deletes it expects. A rule that names the collection exactly wins over a glob.
+
+  An entry with a field no rule has, such as `allowDelete`, is refused.
+- **What a snapshot keeps** (`sanitizeSnapshot(raw, {masker, rules, limits})`, with `createMasker({key, rules})`):
+  - at most `LIMITS.maxRows` (10,000) rows a collection, `LIMITS.maxBytes` (32 MB) in all and `LIMITS.maxCollections` (1,000) collections. The bytes are shared fairly: the collections with the fewest rows go first, each with at most an equal share of what is left, so one big collection, a PR's padding say, can't starve the others. A collection cut short is `truncated`, and only its count is compared;
+  - past `maxCollections`, the collections with the most rows are kept, so many small ones can't push a real one out. The rest are kept as their counts alone (`truncated`, with no rows), up to ten times as many, and only past those is one left out. `problems` names both;
+  - each value as it is, except:
+    - **a secret** is `{t: 'secret', d}`: only whether it changed shows. That is a field whose name matches `SECRET_NAME`, or one `classify` marks `secret`. `SECRET_NAME` matches, in any case:
+      - `pass`, `pwd`, `secret`, `token`, `salt`, `hash`, `otp`, `private`, `session`, `card`, `cvv`, `cvc`, `ssn`, `iban`, `authorization`, `bearer`, `jwt`, `cookie`, `credential`, `signature`, `dsn`, `mnemonic`, anywhere in the name;
+      - `api_key`, `access_key`, `signing_key`, `client_key`, `encryption_key`, `master_key`, `ssh_key`, `database_url`, `mongo_url`, `redis_url`, `amqp_url`, `postgres_url`, `mysql_url`, `connection_string`, `seed_phrase`, `recovery_code`, `backup_code` and `pin_code`, with `_`, `-` or nothing between the words (`apiKey`, `api-key`), and `uri` for `url`;
+      - `pin` as a word of its own (`pin`, `user_pin`).
+
+      A secret-looking name stays secret whatever `classify` says;
+    - **personal data** that `classify` marks `pii` is `{t: 'pii', fp, type, len}`: an 8-hex fingerprint, the type and the length;
+    - `d` and `fp` are HMACs under `key`, which the conductor makes for each session and never sends anywhere. So equal values match across the panes, and say nothing past the session. A secret's digest is its field's, so equal secrets in two fields don't match;
+    - an object or array is `{t: 'json', s}`, its JSON, and so is a string that holds one;
+    - a value under a secret-looking key inside JSON is masked too, with a digest of its collection's and field's. So is the value of a name and value pair whose name looks secret (`{name: 'Authorization', value}`, or `key` for `name`), and the string after a secret-looking one in a list of strings (Node's `rawHeaders`). JSON held in a string inside JSON is read too, up to three deep, and so is JSON encoded twice, and NDJSON line by line. Bytes inside JSON show only their length, and a `Set` or `Map` its entries;
+    - text that isn't JSON, or is over 256 KB, but shows a secret-looking key is masked whole: `[text with a secret-looking key, <length>, <digest>]`. A key counts at a word's start, quoted or not (an escaped quote too), or in brackets, then `:` or `=` (`"password": …`, `\"password\": …`, `api_key=…`, `user[password]=…`), and as a tag (`<password>`). The first 256 KB are read: a cell shows at most its first 200 characters;
+    - in text, a URL's password (`postgres://app:<secret>@db`) and the value after `Bearer`, `Basic` or `Token` are replaced by a digest, the rest kept;
+    - a string or JSON over 200 characters is `{t: 'long', s, len, d}`, cut;
+    - bytes are `{t: 'blob', len, d}`;
+    - a value that isn't set (`null`, `''`, `[]`, `{}`, or an empty `Set` or `Map`) is kept as it is, whatever its field, so clearing a secret shows. A `Set` or `Map` with entries is masked like any other value.
+  - Anything malformed, or that throws as it is read, is listed in `problems`, never thrown. A key that a row lacks, or that two rows share, is dropped.
+  - Collection and field names are the store's, any string: `__proto__` and `constructor` are names like any other.
+- **`diffSnapshots(before, after)`**: per collection, `{status, key, inserted, updated, deleted, fieldsDropped, fieldsAdded, countBefore, countAfter, truncated, keyLost}`. `keyLost` says the after snapshot no longer bears out the key the before one had, for example because two rows share it.
+  - `status` is `same`, `changed`, `added` or `dropped`, or `unknown` for a truncated collection whose count didn't change: it never claims nothing changed.
+  - `inserted` and `deleted` are `[{key, row}]`, and `updated` is `[{key, fields: [{field, before, after}]}]`. A `key` is the JSON of the row's key values. The collection's `key` is the one the diff used: `null` when the rows were compared as a multiset, as they are when either snapshot has no key, or a different one.
+  - A field that the declared `fields` gained or lost is named once, not as an update to every row, with a key or without.
+- **`divergence(baseDiff, prDiff)`**: per collection, `{status, truncated, changes, counts}`.
+  - Each change, by key, is `{kind, key, status, base, pr}`, plus `field` for a schema change. Its `status` is `both`, `pr-only`, `base-only` or `differs`.
+  - Without a key both panes share, and for a truncated collection, only the schema's changes and the `counts` of inserted, updated and deleted rows are compared.
+  - The collection's `status` sums its changes up: `same` when there are none, or `unknown` for a truncated collection whose counts show nothing, one truncated in one pane only, whose count can't be set beside the other's rows, or one the PR pane's diff lacks while the base pane's has it.
+  - A collection one pane dropped or added while the other changed it `differs`.
+- **`flagChanges(baseDiff, prDiff, rules, {trusted})`**: the PR pane's destructive changes, each `{collection, kind, severity, shared, pr, base, field?}`. `pr` and `base` are how many of that kind each pane made, on any rows. `shared` says the base made the same change.
+  - **The kinds:**
+    - `delete`: rows gone, or a `softDelete` field newly set;
+    - `emptied`: a collection whose count fell to 0;
+    - `dropped`: a collection gone;
+    - `column-dropped`: a declared field gone, one flag per field;
+    - `mass-change`: more than 20 rows updated or deleted, or more than 20% of a collection of at least 5 rows, or past a rule's `maxChanged`;
+    - `key-lost`: a collection whose key the PR's rows no longer bear out, so its rows were compared without one, and updates read as deletes and inserts;
+    - `unverified`: a collection the PR pane's snapshot cut short where the base pane's didn't, a cut-short one whose count changed, or one the base pane's diff has and the PR pane's lacks. What happened past the cut can't be seen, so it is never taken for nothing. One cut short in both panes with no change in count is listed too, `amber`;
+    - `cleared`: a value set before, now `null`, `''`, `[]` or `{}`.
+  - **Severity:** `amber` when the base made the same change (`shared`) and `trusted` is `true`, else `red`. The same change means the same rows (by key, or as a multiset without one), with the same fields changed to the same values, the same field, or for two cut-short collections the same change in count. A count stands for rows only when both panes have only counts. Unless `trusted` is `true`, the base's changes excuse nothing, and every flag but `cleared` is `red`. A `cleared` field is `amber` at most. `allowDeletes` turns off a collection's `delete` flags, but not `emptied` or `key-lost`.
+- **`trustOf(isolation)`**: `trusted` only when the session's [isolation verdict](#isolation-verdicts) is `isolated`, else `advisory`. While the PR pane may reach the base pane, what the base pane did can't excuse what the PR pane did. Pass it on as `flagChanges(…, {trusted: trustOf(isolation) === 'trusted'})`.
 
 ### Built in: `adapters/build-worktree` (git-worktree BuildConvention)
 
@@ -767,7 +844,7 @@ It can leave out `operatorEmail`, `publicHost`, `host` (loopback is the default)
 | | |
 |---|---|
 | `GET /` | harness UI |
-| `GET /api/state` | session status, tags, `buildRun: {url, status, conclusion, message}`, pane login URLs + origins, `harnessOrigin`, `isolation: {verdict, reasons, checkedAt}` ([Isolation verdicts](#isolation-verdicts); `null` until known for this session), `requireIsolation` |
+| `GET /api/state` | session status, tags, `buildRun: {url, status, conclusion, message}`, pane login URLs + origins, `harnessOrigin`, `isolation: {verdict, reasons, checkedAt}` ([Isolation verdicts](#isolation-verdicts); `null` until known for this session), `requireIsolation`, `data: {available}` (whether there is an inspector) |
 | `GET /api/prs` | open PRs with build readiness (`imageStatus`, `runUrl`, `reason`) |
 | `GET /api/build-status?pr=N` | `{pr, status, exists, runUrl}`, plus `reason` when `status` is `blocked` |
 | `GET /api/exposure` | the last [exposure](#exposure-optional) reconcile pass: `{mode, managed, ok, checkedAt, drift, added, error}`. Read-only: it never calls the front door. With no adapter, `managed` is `false` and `ok` and `checkedAt` are `null` |
@@ -779,6 +856,8 @@ It can leave out `operatorEmail`, `publicHost`, `host` (loopback is the default)
 | `POST /api/enrol` `{invite?}` | `{token}` for a new browser: while no PR code can be running, or with an invite's ticket at any time. The only `/api/*` route that needs no token |
 | `POST /api/invite` `{}` | `{url, expiresAt}`: a link to the harness that enrols one more browser, once, within ten minutes. `409` with no harness origin to link to |
 | `GET /api/actions?after=N&limit=M` | the ready session's [action log](#security): its requests and marks after sequence number `N` (default `0`), `{active, log, seq, more, requests, marks, dropped, refused, marksDropped}`. One sequence numbers requests and marks alike, in the order they were recorded (a request when it ended). A read gives the next of them, at most `M` together (default and most 2,000), in that order; `more` says there are others, and `seq` is where to read on from. So a reader that reads on until `more` is `false` has had everything, once. `log` names the log: a new session's starts its `seq` again, so when `log` changes, or `active` is `false`, discard what you have and read from `0`. A request is `{seq, pane, at, method, path, status, ms, bytes, aborted}`, and a mark `{seq, pane, at, type}`. **Grouping is the reader's:** a request most likely came from, of the marks no more than 300 ms after it started (`at`), its own pane's nearest within 300 ms either side, else the nearest; the earlier on a tie; none before any mark (the landing). A mark can come after the requests it set off, so a reader groups again as marks come. Each pane keeps its last 5,000 requests, counting those `dropped`, and its last 8,000 marks. `refused` counts what its guards refused, by reason. With no session ready, `active` is `false`, `log` is `null` and the lists are empty. Reading it is no activity |
+| `GET /api/data` | the ready session's [data checks](#data-checks): `{available, active, trust, baselineAt, baselines, rebaselined, comparedAt, errors, problems, boot, session}`. `available` is `false` with no inspector, and `active` is `false` with no session ready. `baselines` is each pane's baseline time. `boot` and `session` are each `{complete, aligned, flags, flagsCount, base, pr, divergence}`, or `null` before a snapshot. `base` and `pr` are each pane's diff, `null` for a pane with none; `aligned` is `false` when the panes' windows differ (one's ready read failed); `complete` is `false` in either case. The answer is bounded, at about 6 MB: a diff lists at most 1,000 collections, the changed first, with `collectionsCount`, and 50 rows of each kind, 50 dropped and 50 added fields a collection, with whole `counts`; divergence 50 changes a collection (`changesCount`); and a span at most 500 flags, red first, with whole `flagsCount` (`{red, amber}`). All of those lists share 2 MB a span; a collection the budget cut says `cut: true`. `errors` says, per pane, why one has no data: `boot` for the open, seeded and ready reads, each reason kept, and `session` for the latest read. Values are masked where they may be secret. The answer is built once for each state and trust, and one that fails to build fails again at once until the state changes. `no-store`, and reading it is no activity |
+| `POST /api/data/snapshot` `{rebaseline?}` | Snapshot now, or with `rebaseline: true` make now the baseline; answers as `GET /api/data`. Concurrent calls of one kind share a snapshot; one of the other kind meanwhile is `409`. `400` for a `rebaseline` that isn't `true` or `false`, `409` with no inspector or no session ready, and when the session ends while the snapshot runs. Activity |
 | `POST /api/actions/mark` `{pane, type}` | `{recorded}`: a mark for an action a pane reported, `pane` `base` or `pr`, `type` `click`, `submit`, `change` or `enter` (`400` for anything else). At most one of each kind a pane every 100 ms, from a budget of 2,000 a pane that refills one a second: `recorded` is `false` past them, counted per pane in `marksDropped`. `409` with no session ready. No activity |
 | `POST /api/pane-entry` `{role, to?}` | `{url}`: a one-time link, for one minute, that loads `role`'s pane (`base` or `pr`) at `to`, a path or URL on that pane (default `/`), and sets its pane cookie on the way. `400` for another role, or a `to` that leads off the pane; `409` while the pane has no origin, or one on another hostname than the harness's |
 
@@ -839,7 +918,7 @@ Open it at `127.0.0.1`: the panes trust only the harness origin, so at `localhos
 
 Demo mode runs the real conductor with fixture PRs and fake adapters, so you can try the whole harness with no GitHub, containers or databases. Everything listens on `127.0.0.1`: the harness on `PORT` (default `4100`), and the pane proxies and the two in-process pane apps on free ports. The demo is always ungated (`exposure: 'none'`), whatever its harness origin: it binds loopback, and nested in self-QA it sits behind the outer conductor's gate. It starts idle, so the browser that opens it enrols by itself ([Using the harness](#using-the-harness)), and so does one after a restart. `QA_DEMO_SPEED` scales the fake build and boot delays (default `1`; `0` makes them instant). Ctrl-C (or SIGTERM/SIGHUP) stops it.
 
-- **#101, #102** are built and open in seconds. **#103** is mid-build. **#104** builds, then its app crashes at *starting*, with a log tail. **#105** is refused by the trust gate (its head is in someone else's fork).
+- **#101, #102** are built and open in seconds. **#103** is mid-build. **#104** builds, then its app crashes at *starting*, with a log tail. **#105** is refused by the trust gate (its head is in someone else's fork). **#106**'s *Empty cart* deletes the saved carts too, which the [data checks](#data-checks) flag: add something to the cart in both panes, empty it, and take a snapshot.
 - The PR pane is visibly different from the base: a new heading, a purple accent and an extra sort control on *Products*. Both panes have several pages, forms and long pages, for trying mirroring.
 - Verdicts go to an in-memory GitHub fake and are printed to the console. Nothing leaves the machine.
 

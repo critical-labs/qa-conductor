@@ -6,8 +6,12 @@
 // The `pr` variant is the change under review: a new heading, a purple accent
 // instead of blue, and a sort control the base doesn't have (using it shows up
 // as an unmatched interaction in the base pane). Everything echoed back is
-// HTML-escaped. The cart and messages live in the instance, so each session
-// starts clean, like a freshly cloned database.
+// HTML-escaped. The cart, the messages and the saved carts live in the
+// pane's store (createStore), which the demo Provisioner makes with the
+// pane's database, so each session starts clean, like a freshly cloned
+// database, and the demo inspector reads it. A PR app made with
+// `clearsSavedCarts` has a bug for the data checks to catch: its "Empty
+// cart" deletes the saved carts too.
 
 export const VARIANTS = {
   base: { heading: 'Acme Widgets', accent: '#1d4ed8', sort: false },
@@ -78,8 +82,13 @@ const options = (pairs, selected) => pairs
   .map(([value, text]) => `<option value="${esc(value)}"${value === selected ? ' selected' : ''}>${esc(text)}</option>`).join('')
 const productCard = p => `<li class="card"><a href="/products/${p.slug}">${esc(p.name)}</a><div class="muted">${money(p.price)} · ${p.category}</div></li>`
 
+// A pane's data: rows with ids, as tables would hold them.
+export function createStore() {
+  return { cart_items: [], messages: [], saved_carts: [], nextId: 1 }
+}
+
 function layout(ctx, { title, body }) {
-  const count = [...ctx.cart.values()].reduce((a, b) => a + b, 0)
+  const count = ctx.store.cart_items.reduce((sum, item) => sum + item.qty, 0)
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -160,15 +169,19 @@ function productPage(slug) {
 }
 
 function cartPage(ctx) {
-  const items = [...ctx.cart].map(([slug, qty]) => ({ p: PRODUCTS.find(x => x.slug === slug), qty }))
-  if (!items.length) return { title: 'Cart', body: '<h2>Your cart</h2>\n<p>Your cart is empty. <a href="/products">Browse the products</a>.</p>' }
+  const items = ctx.store.cart_items.map(({ slug, qty }) => ({ p: PRODUCTS.find(x => x.slug === slug), qty }))
+  const saved = ctx.store.saved_carts.length
+    ? `<h3>Saved for later</h3>\n<ul>${ctx.store.saved_carts.map(c => `<li>${esc(c.name)} (${c.items} items)</li>`).join('')}</ul>`
+    : ''
+  if (!items.length) return { title: 'Cart', body: `<h2>Your cart</h2>\n<p>Your cart is empty. <a href="/products">Browse the products</a>.</p>\n${saved}` }
   const total = items.reduce((sum, { p, qty }) => sum + p.price * qty, 0)
   const rows = items.map(({ p, qty }) => `<tr><td><a href="/products/${p.slug}">${esc(p.name)}</a></td><td>${qty}</td><td>${money(p.price * qty)}</td></tr>`)
   return {
     title: 'Cart',
     body: `<h2>Your cart</h2>
 <table><tr><th>Item</th><th>Qty</th><th>Subtotal</th></tr>${rows.join('')}<tr><th>Total</th><td></td><th>${money(total)}</th></tr></table>
-<form method="post" action="/cart/clear" class="row"><button type="submit">Empty cart</button></form>`,
+<form method="post" action="/cart/clear" class="row"><button type="submit">Empty cart</button></form>
+${saved}`,
   }
 }
 
@@ -252,11 +265,16 @@ async function route(ctx, req, res, url) {
     const form = await readForm(req)
     const slug = form.get('slug')
     const qty = Math.min(9, Math.max(1, Number.parseInt(form.get('qty'), 10) || 1))
-    if (PRODUCTS.some(p => p.slug === slug)) ctx.cart.set(slug, Math.min(99, (ctx.cart.get(slug) ?? 0) + qty))
+    if (PRODUCTS.some(p => p.slug === slug)) {
+      const item = ctx.store.cart_items.find(i => i.slug === slug)
+      if (item) item.qty = Math.min(99, item.qty + qty)
+      else ctx.store.cart_items.push({ id: ctx.store.nextId++, slug, qty })
+    }
     return redirect(res, '/cart')
   }
   if (req.method === 'POST' && path === '/cart/clear') {
-    ctx.cart.clear()
+    ctx.store.cart_items.length = 0
+    if (ctx.clearsSavedCarts) ctx.store.saved_carts.length = 0 // the bug
     return redirect(res, '/cart')
   }
   if (read && path === '/contact') return page(contactPage())
@@ -268,19 +286,21 @@ async function route(ctx, req, res, url) {
     if (!/^[^@\s]+@[^@\s]+$/.test(values.email)) errors.push('Please enter an email address we can reply to.')
     if (!values.message) errors.push('Please write a message.')
     if (errors.length) return page(contactPage(values, errors), 422)
-    ctx.messages.push({ id: ctx.messages.length + 1, ...values })
-    return redirect(res, `/contact/sent?id=${ctx.messages.length}`)
+    const id = ctx.store.nextId++
+    ctx.store.messages.push({ id, ...values })
+    return redirect(res, `/contact/sent?id=${id}`)
   }
-  const sent = read && path === '/contact/sent' && ctx.messages.find(m => m.id === Number(query.get('id')))
+  const sent = read && path === '/contact/sent' && ctx.store.messages.find(m => m.id === Number(query.get('id')))
   if (sent) return page(sentPage(ctx, sent))
   return page({ title: 'Not found', body: '<h2>Page not found</h2>\n<p>Try the <a href="/">home page</a>.</p>' }, 404)
 }
 
-// log(line) receives one access-log line per response.
-export function createPaneApp({ variant = 'base', label = variant, env = {}, log = () => {} } = {}) {
+// log(line) receives one access-log line per response. `store` is the
+// pane's data (createStore()), a fresh one by default.
+export function createPaneApp({ variant = 'base', label = variant, env = {}, log = () => {}, store = createStore(), clearsSavedCarts = false } = {}) {
   const v = VARIANTS[variant]
   if (!v) throw new Error(`unknown pane app variant: ${variant}`)
-  const ctx = { v, label, env, cart: new Map(), messages: [] }
+  const ctx = { v, label, env, store, clearsSavedCarts }
   return async function paneApp(req, res) {
     const url = new URL(req.url ?? '/', 'http://pane.invalid')
     res.on('finish', () => log(`${req.method} ${url.pathname} ${res.statusCode}`))
