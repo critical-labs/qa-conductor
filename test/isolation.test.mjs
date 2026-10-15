@@ -32,6 +32,11 @@ test('floors: macOS, a bind off loopback, and a bind a probe of the IPv4 loopbac
   // where no container runs (shared-host), macOS's VM says nothing
   assert.deepEqual(floors({ host: '127.0.0.1', platform: 'darwin', containers: false }), [])
   assert.equal(floors({ host: '0.0.0.0', platform: 'darwin', containers: false }).length, 1)
+  // the PR pane on an internal network (#32): the probe speaks for the VM's
+  // forwarding, so only the bind's floors remain
+  assert.deepEqual(floors({ host: '127.0.0.1', platform: 'darwin', internal: true }), [])
+  assert.deepEqual(floors({ host: '0.0.0.0', platform: 'darwin', internal: true }), [{ verdict: 'reachable', reason: 'the conductor listens on 0.0.0.0, which containers can reach' }])
+  assert.equal(floors({ host: '127.0.0.1', platform: 'darwin', internal: 'yes' }).length, 1, 'only true')
 })
 
 test('a BuildConvention that runs the PR\'s code on this host to build it declares shared-host', () => {

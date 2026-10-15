@@ -59,6 +59,17 @@ What changed in each release, newest first. A 0.x minor version may break the in
   - **The boot order changed:** `provisionDatabase` now runs for both panes, then the isolation check, then `seedPane` and `reserveServices` for each pane in turn. It was each pane's `provisionDatabase`, `seedPane` and `reserveServices` in turn. A Provisioner or Seed that relied on the base pane being seeded before the PR pane's database existed, or on a pane's reservation following its own database right away, must not. A test that compares the call order must follow the new one.
   - **A test that compares `/api/state` or the `ready` event whole** must add `isolation` and `requireIsolation`. A test that compares `runPg`, `runMigrate` or `runApp`'s argv must add `--cap-drop NET_RAW`. A test that compares the PR pane's teardown must add `qa-probe-pr`.
 
+### The PR pane on an internal network
+
+- **The Docker Provisioner can put the PR pane on an internal network** (`internal`, off by default, #32). The PR pane can then reach neither the host's loopback nor the base pane, on Docker Desktop and Podman machine too, so its isolation probe can find it `isolated` there. README's [The PR pane on an internal network](README.md#the-pr-pane-on-an-internal-network) has the details and a check by hand for each runtime.
+  - **The topology:** `qa-session-pr` is created `--internal`. A forwarder, `qa-fwd-pr`, runs the package's `lib/forwarder.mjs` in `node:22-alpine` with no capabilities, a read-only root and no mounts. It sits on an ordinary network, `qa-session-pr-edge`, and joins the internal one as `qa-egress`. It publishes the PR app on `127.0.0.1:<hostPorts.pr>`, and its HTTP proxy is the PR pane's only way out.
+  - **The allowlist, `internal.egress`:** host names, `*.domains` and public addresses, with an optional port (80 and 443 without one), checked as the Provisioner is made. Empty by default: no egress. A request goes out only to a listed host whose every address is public, and to the address checked. HTTPS is never intercepted.
+  - **The verdict:** the check's result says `internal: true` once the topology is up. Then the probe decides, through the forwarder's proxy too, in place of the macOS floor and the Docker Desktop and Podman reasons.
+  - **It fails closed:** if any of it can't be set up, the PR pane runs as it would without `internal`, the floors apply, and a verdict that isn't `isolated` says why.
+- **New in the seams:** a Provisioner's optional `internal: true`, and a check's result's `internal`. The macOS floor waits for such a Provisioner's check, and is left out only when its result says `internal: true`. `floors` takes `internal`.
+- **New in `createDocker`:** `createNetwork(name, { internal })`, `networkInternal(name)`, `runForwarder(name, image, network, { hostPort, config, source })` and `connectNetwork(network, container, { alias })`. `runApp` publishes nothing when `hostPort` is `null`.
+- **Nothing changes without `internal`.**
+
 ### The Docker Provisioner
 
 - **The PR pane can no longer reach the base pane's database.** Both panes' containers joined one network, and both databases had the same superuser and password, which the PR pane's own `dsn` carried. So PR code, by mistake or on purpose, could change the base pane's data, or call the base app directly, and skew the comparison.
