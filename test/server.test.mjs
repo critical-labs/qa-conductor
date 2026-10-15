@@ -49,7 +49,7 @@ function withCap(port, headers) {
 function makeWorld({
   hang = {}, failAt = null, sweepGate = null, sweepFails = false, provisioner: provisionerOverrides = {},
   cfg: cfgOverrides = {}, readBaseEnv: readBaseEnvOverride = null, exposure = null, logThrowsOn = null, enrolled = true, platform = 'linux',
-  pacing = { retryGapMs: 0, enrolWaitMs: 0 },
+  pacing = { retryGapMs: 0, enrolWaitMs: 0 }, inspector = null,
 } = {}) {
   const calls = []
   const appHits = []
@@ -106,6 +106,7 @@ function makeWorld({
     envTransform: { derivePaneEnv: ({ pane }) => ({ app: { DSN: pane.dsn } }) },
     auth: { requiresDb: false, establishSession: async ({ pane }) => ({ landingUrl: `login-${pane.ref.role}`, cookies: [] }) },
     ...(exposure ? { exposure } : {}),
+    ...(inspector ? { inspector } : {}),
   }
   // Ungated: these https origins would otherwise put it in tailscale mode.
   const cfg = {
@@ -612,6 +613,9 @@ test('/api/state reports the harness origin', async () => {
   }
 })
 
+// The harness's own policy, before its frame-src (#8).
+const HARNESS_CSP_HEAD = "frame-ancestors 'self'; default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'"
+
 // A `::1` bind derives http://[::1]:<port>, and a CSP source can't name an
 // IPv6 literal: no harness could frame the panes.
 test('an IPv6-literal harness origin is logged as an error naming a localhost origin to use', async () => {
@@ -624,12 +628,17 @@ test('an IPv6-literal harness origin is logged as an error naming a localhost or
       errorLines.join('\n'),
     )
     assert.equal((await raw(base, { path: '/x' })).headers['content-security-policy'], "frame-ancestors 'self'")
+    // nor frame-src: the harness's own policy frames any http(s) origin rather than refuse the panes
+    const { harness } = await allPorts(c)
+    assert.equal((await raw(harness, { path: '/qa/' })).headers['content-security-policy'], `${HARNESS_CSP_HEAD}; frame-src http: https:`)
   } finally { c.stop() }
 })
 
 // --- 0.3.0: frame locks ----------------------------------------------------------
 
-const HARNESS_FRAME = { 'content-security-policy': "frame-ancestors 'self'", 'x-frame-options': 'SAMEORIGIN', 'referrer-policy': 'strict-origin-when-cross-origin' }
+// #8: the harness also runs only its own scripts and frames only the panes
+const HARNESS_CSP = `${HARNESS_CSP_HEAD}; frame-src https://h.ts.net:8443 https://h.ts.net:10000`
+const HARNESS_FRAME = { 'content-security-policy': HARNESS_CSP, 'x-frame-options': 'SAMEORIGIN', 'referrer-policy': 'strict-origin-when-cross-origin' }
 const frameHeaders = res => Object.fromEntries(Object.keys(HARNESS_FRAME).map(k => [k, res.headers[k]]))
 
 // The harness starts sessions and posts verdicts in one click, so a page that
@@ -852,6 +861,13 @@ test('startConductor refuses a harness origin, explicit or derived from publicHo
       assert.equal((await api(port, 'GET', '/api/state')).status, 'idle', JSON.stringify(paneOrigins))
     } finally { c.stop() }
   }
+  // and the harness, which can't name an unparseable one in frame-src,
+  // frames any http(s) origin rather than none
+  const { c } = makeWorld({ cfg: { publicHost: null, paneOrigins: { base: 'not a url', pr: 'https://h:10000' } } })
+  try {
+    const port = await harnessPort(c)
+    assert.equal((await raw(port, { path: '/qa/' })).headers['content-security-policy'], `${HARNESS_CSP_HEAD}; frame-src http: https:`)
+  } finally { c.stop() }
 })
 
 // --- 0.3.1: the browser's own cookies ----------------------------------------------
@@ -2221,6 +2237,9 @@ const API_ROUTES = [
   // the action log (#8)
   { path: '/api/actions' }, { path: '/api/actions?after=0' },
   { method: 'POST', path: '/api/actions/mark', body: '{"pane":"base","type":"click"}' },
+  // the data checks (#8)
+  { path: '/api/data' }, { method: 'POST', path: '/api/data/snapshot', body: '{}' },
+  { method: 'POST', path: '/api/data/snapshot', body: '{"rebaseline":true}' },
   // the window is shut while a session runs
   { method: 'POST', path: '/api/enrol', body: '{}' },
   // a CORS preflight, and a HEAD
@@ -3601,7 +3620,7 @@ test('the action log is the running session\'s: empty before ready, gone at a te
   } finally { w.c.stop() }
 })
 
-test('GET /api/actions reads on from `after`, at most `limit` requests at a time', async () => {
+test('GET /api/actions reads on from `after`, at most `limit` requests and marks at a time', async () => {
   const { w, ports } = await readyWorld()
   const actions = async q => JSON.parse((await raw(ports.harness, { path: `/qa/api/actions${q}` })).body)
   try {
@@ -3718,4 +3737,308 @@ test('strict mode says so at startup and in /api/state, and logs an error when e
       assert.ok(w.errorLines.some(l => l.startsWith(`[qa] QA_REQUIRE_ISOLATION=1 refuses every session here (${reason}`)), `${reason}\n${w.errorLines.join('\n')}`)
     } finally { w.c.stop() }
   }
+})
+
+// --- #8: the data checks ----------------------------------------------------------
+// With an inspector, each pane's data is snapshotted right after its seed
+// (S0), at ready (S1) and on demand, and diffed. Values (masked where they
+// may be secret) reach only GET /api/data and the snapshot route's answer:
+// never the event stream, /api/state or a log.
+
+// An inspector over one store per pane, which a test changes as the app
+// would. What it is asked to do goes in the world's calls.
+function storeInspector({ snapshot = null } = {}) {
+  const stores = { base: null, pr: null }
+  const fresh = () => ({ saved_carts: { key: ['id'], fields: ['id', 'owner', 'reset_token'], rows: [1, 2, 3].map(id => ({ id, owner: `owner${id}@example.org`, reset_token: `SECRET-token-${id}` })) } })
+  let world = null
+  const inspector = {
+    rules: { classify: [{ collection: 'saved_carts', fields: ['owner'], as: 'pii' }] },
+    async open({ paneRef, db }) {
+      world?.calls.push(['inspector.open', paneRef.role, db?.dsn])
+      stores[paneRef.role] = fresh()
+      return {
+        snapshot: async () => {
+          if (snapshot) await snapshot(paneRef.role)
+          return { collections: structuredClone(stores[paneRef.role]) }
+        },
+        close: async () => { world?.calls.push(['inspector.close', paneRef.role]) },
+      }
+    },
+  }
+  return { inspector, stores, attach: w => { world = w } }
+}
+
+async function dataWorld({ inspect = storeInspector(), ...opts } = {}) {
+  const w = makeWorld({ ...opts, inspector: inspect.inspector })
+  inspect.attach(w)
+  const ports = await allPorts(w.c)
+  await api(ports.harness, 'POST', '/api/session', { pr: 7 })
+  await waitFor(async () => (await api(ports.harness, 'GET', '/api/state')).status === 'ready')
+  const data = async () => {
+    const res = await raw(ports.harness, { path: '/qa/api/data' })
+    assert.equal(res.headers['cache-control'], 'no-store')
+    return JSON.parse(res.body)
+  }
+  const snapshot = body => raw(ports.harness, { method: 'POST', path: '/qa/api/data/snapshot', headers: JSON_TYPE, body: JSON.stringify(body ?? {}) })
+  return { w, ports, data, snapshot, stores: inspect.stores }
+}
+
+test('with no inspector the data checks are unavailable, and the boot is as it was', async () => {
+  const { w, ports } = await readyWorld()
+  try {
+    assert.deepEqual((await api(ports.harness, 'GET', '/api/state')).data, { available: false })
+    const res = await raw(ports.harness, { path: '/qa/api/data' })
+    assert.deepEqual([res.status, res.headers['cache-control'], JSON.parse(res.body)], [200, 'no-store', { available: false }])
+    const snap = await raw(ports.harness, { method: 'POST', path: '/qa/api/data/snapshot', headers: JSON_TYPE, body: '{}' })
+    assert.deepEqual([snap.status, JSON.parse(snap.body).error], [409, 'the conductor has no inspector'])
+  } finally { w.c.stop() }
+})
+
+test('the data checks: S0 after each seed, S1 at ready, Snapshot now on demand; values masked, and none in the event stream or the state', async () => {
+  const { w, ports, data, snapshot, stores } = await dataWorld()
+  try {
+    assert.deepEqual((await api(ports.harness, 'GET', '/api/state')).data, { available: true })
+    // the probe is opened with the pane's db
+    assert.deepEqual(w.calls.filter(c => c[0] === 'inspector.open'), [['inspector.open', 'base', 'dsn-base'], ['inspector.open', 'pr', 'dsn-pr']])
+    const ready = await data()
+    assert.deepEqual([ready.available, ready.active, ready.trust, ready.session], [true, true, 'advisory', null])
+    assert.equal(ready.boot.divergence.collections.saved_carts.status, 'same')
+    assert.deepEqual(ready.errors, { boot: { base: null, pr: null }, session: { base: null, pr: null } })
+
+    // the PR pane's "Empty cart" also deletes the saved carts
+    stores.pr.saved_carts.rows = []
+    stores.base.saved_carts.rows[0].owner = 'renamed@example.org'
+    const before = (await api(ports.harness, 'GET', '/api/state')).lastActivity
+    await new Promise(r => setTimeout(r, 5))
+    const res = await snapshot()
+    assert.deepEqual([res.status, res.headers['cache-control']], [200, 'no-store'])
+    const after = JSON.parse(res.body)
+    assert.equal(after.session.divergence.collections.saved_carts.status, 'differs')
+    assert.deepEqual(after.session.flags.map(f => [f.collection, f.kind, f.severity, f.pr, f.base]), [['saved_carts', 'delete', 'red', 3, 0], ['saved_carts', 'emptied', 'red', 1, 0]])
+    assert.deepEqual(await data(), after)
+    assert.ok((await api(ports.harness, 'GET', '/api/state')).lastActivity > before, 'Snapshot now is activity')
+    // pii as a fingerprint
+    const updated = after.session.base.collections.saved_carts.updated[0].fields[0]
+    assert.deepEqual([updated.field, updated.before.t, updated.after.t], ['owner', 'pii', 'pii'])
+    const events = await sseEvents(ports.harness, evs => evs.filter(e => e.kind === 'capture').length >= 4)
+    const captures = events.filter(e => e.kind === 'capture')
+    assert.deepEqual(captures.map(e => [e.pane, e.phase, e.ok]), [
+      ['base', 'seeded', true], ['pr', 'seeded', true], ['base', 'ready', true], ['pr', 'ready', true],
+    ])
+    for (const e of captures) assert.deepEqual(Object.keys(e).sort(), ['at', 'kind', 'ok', 'pane', 'phase'])
+    for (const text of [JSON.stringify(after), JSON.stringify(events), JSON.stringify(await api(ports.harness, 'GET', '/api/state')), w.lines.join('\n')]) {
+      assert.doesNotMatch(text, /example\.org|SECRET-token/)
+    }
+    // reading is no activity
+    const active = (await api(ports.harness, 'GET', '/api/state')).lastActivity
+    await new Promise(r => setTimeout(r, 5))
+    await data()
+    assert.equal((await api(ports.harness, 'GET', '/api/state')).lastActivity, active)
+
+    // Re-baseline: now is the baseline
+    const re = JSON.parse((await snapshot({ rebaseline: true })).body)
+    assert.deepEqual([re.rebaselined, re.session], [true, null])
+    for (const bad of [{ rebaseline: 'yes' }, { rebaseline: 1 }]) {
+      const r = await snapshot(bad)
+      assert.deepEqual([r.status, JSON.parse(r.body).error], [400, 'rebaseline must be true or false'])
+    }
+  } finally { w.c.stop() }
+})
+
+test('the base-vs-PR comparison is trusted only when the session is isolated', async () => {
+  const check = async () => ({ verdict: 'isolated', reasons: [] })
+  const { w, data, snapshot, stores } = await dataWorld({ provisioner: { isolation: check } })
+  try {
+    for (const role of ['base', 'pr']) stores[role].saved_carts.rows = []
+    assert.equal(JSON.parse((await snapshot()).body).trust, 'trusted', 'the snapshot\'s answer too')
+    const view = await data()
+    assert.equal(view.trust, 'trusted')
+    assert.deepEqual(view.session.flags.map(f => [f.kind, f.severity]), [['delete', 'amber'], ['emptied', 'amber']])
+  } finally { w.c.stop() }
+  const shared = await dataWorld({ provisioner: { isolation: 'shared-host' } })
+  try {
+    for (const role of ['base', 'pr']) shared.stores[role].saved_carts.rows = []
+    await shared.snapshot()
+    const view = await shared.data()
+    assert.equal(view.trust, 'advisory')
+    assert.deepEqual(view.session.flags.map(f => [f.kind, f.severity]), [['delete', 'red'], ['emptied', 'red']])
+  } finally { shared.w.c.stop() }
+})
+
+test('the data checks are the running session\'s: probes close before the panes go, the next boot starts afresh, and a snapshot racing a teardown answers 409', async () => {
+  let hold = null
+  const inspect = storeInspector({ snapshot: async () => { if (hold) await hold.promise } })
+  const hang = { 8: deferred() }
+  const { w, ports, data, snapshot } = await dataWorld({ inspect, hang })
+  try {
+    await api(ports.harness, 'POST', '/api/teardown')
+    const order = w.calls.filter(c => c[0] === 'inspector.close' || c[0] === 'teardown').map(c => c.join(' '))
+    assert.deepEqual(order, ['inspector.close base', 'inspector.close pr', 'teardown base', 'teardown pr'])
+    assert.deepEqual(await data(), { available: true, active: false })
+    assert.equal((await snapshot()).status, 409)
+
+    // a boot in flight: no data until it is ready
+    await api(ports.harness, 'POST', '/api/session', { pr: 8 })
+    assert.deepEqual(await data(), { available: true, active: false })
+    hang[8].resolve()
+    await waitFor(async () => (await api(ports.harness, 'GET', '/api/state')).status === 'ready')
+    assert.equal((await data()).active, true)
+
+    // the same PR opened again, with no teardown: its probes close as the boot starts
+    const closes = () => w.calls.filter(c => c[0] === 'inspector.close').length
+    const before = closes()
+    hang[8] = deferred()
+    await api(ports.harness, 'POST', '/api/session', { pr: 8 })
+    await waitFor(() => closes() === before + 2)
+    assert.deepEqual(await data(), { available: true, active: false })
+    hang[8].resolve()
+    await waitFor(async () => (await api(ports.harness, 'GET', '/api/state')).status === 'ready')
+
+    // a snapshot still running when the session ends
+    hold = deferred()
+    const racing = snapshot()
+    await new Promise(r => setTimeout(r, 20))
+    await api(ports.harness, 'POST', '/api/teardown')
+    hold.resolve()
+    const res = await racing
+    assert.equal(res.status, 409)
+    assert.match(JSON.parse(res.body).error, /the session ended/)
+  } finally { w.c.stop() }
+})
+
+test('a boot that is superseded or fails closes its probes, and leaves no data', async () => {
+  const hang = { 8: deferred() }
+  const inspect = storeInspector()
+  const w = makeWorld({ hang, inspector: inspect.inspector })
+  inspect.attach(w)
+  try {
+    const port = await harnessPort(w.c)
+    await api(port, 'POST', '/api/session', { pr: 8 })
+    await waitFor(() => w.calls.some(c => c[0] === 'ensureBuilt' && c[1] === 8))
+    await api(port, 'POST', '/api/session', { pr: 7, takeover: true })
+    await waitFor(async () => (await api(port, 'GET', '/api/state')).status === 'ready')
+    hang[8].resolve()
+    assert.equal((await api(port, 'GET', '/api/data')).active, true)
+    assert.deepEqual(w.calls.filter(c => c[0] === 'inspector.open').map(c => c[1]), ['base', 'pr'], 'the superseded boot opened none')
+  } finally { w.c.stop() }
+
+  const failing = storeInspector()
+  const f = makeWorld({ failAt: 'launchServices', inspector: failing.inspector })
+  failing.attach(f)
+  try {
+    const port = await harnessPort(f.c)
+    await api(port, 'POST', '/api/session', { pr: 7 })
+    await waitFor(async () => (await api(port, 'GET', '/api/state')).status === 'error')
+    await waitFor(() => f.calls.filter(c => c[0] === 'inspector.close').length === 2)
+    assert.deepEqual(await api(port, 'GET', '/api/data'), { available: true, active: false })
+  } finally { f.c.stop() }
+})
+
+test('POST /api/data/snapshot sits behind the JSON, same-origin and shutdown checks', async () => {
+  const { w, ports } = await dataWorld()
+  try {
+    const path = '/qa/api/data/snapshot'
+    assert.equal((await raw(ports.harness, { method: 'POST', path, headers: { 'content-type': 'text/plain' }, body: '{}' })).status, 415)
+    assert.equal((await raw(ports.harness, { method: 'POST', path, headers: { ...JSON_TYPE, 'sec-fetch-site': 'cross-site' }, body: '{}' })).status, 403)
+    const closing = w.c.shutdown()
+    const late = await raw(ports.harness, { method: 'POST', path, headers: JSON_TYPE, body: '{}' }).catch(() => ({ status: 'closed' }))
+    assert.ok([503, 'closed'].includes(late.status), String(late.status))
+    await closing
+  } finally { w.c.stop() }
+})
+
+test('startConductor refuses an inspector with no open(), or with rules that aren\'t valid', () => {
+  for (const [inspector, re] of [
+    [{}, /adapters\.inspector must be an object with an open\(\) function/],
+    ['inspector', /adapters\.inspector must be an object with an open\(\) function/],
+    [{ open: () => ({}), rules: { keyOf: 1 } }, /adapters\.inspector\.rules: unknown data rule: keyOf/],
+    [{ open: () => ({}), rules: { classify: [{ collection: 'x', fields: ['a'], as: 'public' }] } }, /adapters\.inspector\.rules: classify\[0\]\.as must be secret or pii/],
+  ]) assert.throws(() => startOnly({}, { inspector }), re, JSON.stringify(inspector))
+  assert.doesNotThrow(() => startOnly({}, { inspector: { open: () => ({}) } }))
+})
+
+// Owner decision C: nothing of the data checks reaches GitHub. The verdict
+// comment says nothing of them, whatever they found.
+test('the verdict comment says nothing of the data checks', async () => {
+  const { w, ports, snapshot, stores } = await dataWorld()
+  try {
+    stores.pr.saved_carts.rows = []
+    assert.equal((await snapshot()).status, 200)
+    const preview = await api(ports.harness, 'GET', '/api/verdict/preview?verdict=reject&notes=x')
+    assert.doesNotMatch(JSON.stringify(preview), /saved_carts|owner|reset_token|delete|emptied|snapshot/i)
+    const posted = []
+    w.github.postComment = async (pr, body) => { posted.push([pr, body]); return 'https://c' }
+    assert.equal((await raw(ports.harness, { method: 'POST', path: '/qa/api/verdict', headers: JSON_TYPE, body: '{"verdict":"reject","notes":"x"}' })).status, 200)
+    assert.equal(posted.length, 1)
+    assert.doesNotMatch(posted[0][1], /saved_carts|owner|reset_token|delete|emptied|snapshot|example\.org/i)
+  } finally { w.c.stop() }
+})
+
+// A boot taken over while its inspector is still reading: what that read
+// reports later is no session's, and stays out of the next boot's stream.
+test('a superseded boot\'s capture events never reach the next boot\'s stream', async () => {
+  let hold = deferred()
+  let first = true
+  const inspect = storeInspector({ snapshot: async () => { if (first) { first = false; await hold.promise } } })
+  const w = makeWorld({ inspector: inspect.inspector })
+  inspect.attach(w)
+  try {
+    const port = await harnessPort(w.c)
+    await api(port, 'POST', '/api/session', { pr: 7 })
+    await waitFor(() => w.calls.some(c => c[0] === 'inspector.open'))
+    // open the same PR again while its first read hangs: a new boot with no
+    // teardown between, which aborts the old one as it starts
+    await api(port, 'POST', '/api/session', { pr: 7 })
+    await waitFor(async () => (await api(port, 'GET', '/api/state')).status === 'ready')
+    hold.resolve() // the old boot's read ends now
+    await new Promise(r => setTimeout(r, 30))
+    const events = await sseEvents(port, evs => evs.some(e => e.kind === 'ready'))
+    assert.deepEqual(events.filter(e => e.kind === 'capture').map(e => [e.pane, e.phase]), [['base', 'seeded'], ['pr', 'seeded'], ['base', 'ready'], ['pr', 'ready']])
+  } finally { w.c.stop() }
+})
+
+// The next boot waits for the last session's probes to close.
+test('a boot of the same PR again waits for the last session\'s probes to close before it builds', async () => {
+  const closing = deferred()
+  const inspect = storeInspector()
+  const original = inspect.inspector.open
+  inspect.inspector.open = async args => {
+    const probe = await original(args)
+    return { ...probe, close: async () => { await closing.promise; return probe.close() } }
+  }
+  const { w, ports } = await dataWorld({ inspect })
+  try {
+    const builds = () => w.calls.filter(c => c[0] === 'ensureBuilt').length
+    const before = builds()
+    await api(ports.harness, 'POST', '/api/session', { pr: 7 })
+    await new Promise(r => setTimeout(r, 50))
+    assert.equal(builds(), before, 'no build while a probe is still closing')
+    closing.resolve()
+    await waitFor(() => builds() === before + 1)
+  } finally { closing.resolve(); w.c.stop() }
+})
+
+// A boot that fails closes its probes; the next boot waits for them too.
+test('a boot after a failed one waits for the failed boot\'s probes to close before it builds', async () => {
+  const closing = deferred()
+  const inspect = storeInspector()
+  const original = inspect.inspector.open
+  inspect.inspector.open = async args => {
+    const probe = await original(args)
+    return { ...probe, close: async () => { await closing.promise; return probe.close() } }
+  }
+  const w = makeWorld({ failAt: 'launchServices', inspector: inspect.inspector })
+  inspect.attach(w)
+  try {
+    const port = await harnessPort(w.c)
+    await api(port, 'POST', '/api/session', { pr: 7 })
+    await waitFor(async () => (await api(port, 'GET', '/api/state')).status === 'error')
+    const builds = () => w.calls.filter(c => c[0] === 'ensureBuilt').length
+    const before = builds()
+    await api(port, 'POST', '/api/session', { pr: 7 })
+    await new Promise(r => setTimeout(r, 50))
+    assert.equal(builds(), before, 'no build while the failed boot\'s probes are still closing')
+    closing.resolve()
+    await waitFor(() => builds() === before + 1)
+  } finally { closing.resolve(); w.c.stop() }
 })

@@ -3,12 +3,16 @@
 //
 // - build: checkout-and-install style progress messages and delays, readiness
 //   from the fixtures, and a trust-gate refusal for the blocked PR.
-// - provisioner: an in-memory "database" per pane, and one pane app per pane
-//   served by an in-process HTTP server on an ephemeral 127.0.0.1 port. The
-//   port is bound in reserveServices, the app starts in launchServices, and
-//   teardown closes it. #104's PR app crashes on start, so waitHealthy fails
-//   and logs() returns the crash.
-// - seed, envTransform, auth: trivial versions (the pane apps have no login).
+// - provisioner: an in-memory "database" per pane (the pane app's store:
+//   its cart, messages and saved carts), and one pane app per pane served by
+//   an in-process HTTP server on an ephemeral 127.0.0.1 port. The port is
+//   bound in reserveServices, the app starts in launchServices, and teardown
+//   closes it. #104's PR app crashes on start, so waitHealthy fails and
+//   logs() returns the crash.
+// - seed: three saved carts in each pane's store.
+// - inspector: reads each pane's store, for the data checks (#8). #106's PR
+//   app empties the saved carts with the cart, which they flag.
+// - envTransform, auth: trivial versions (the pane apps have no login).
 //
 // Every delay goes through `pause`: scaled by the demo speed (0 = none), and
 // cancelled both by the boot's signal and by the demo's lifetime signal, so
@@ -19,7 +23,7 @@ import { once } from 'node:events'
 import { setTimeout as sleep } from 'node:timers/promises'
 
 import { DEMO_BASE, DEMO_PRS, DEMO_REPO, appSpecFor, baseLabel, crashTail, findPr, prLabel } from './fixtures.mjs'
-import { createPaneApp } from './pane-app.mjs'
+import { createPaneApp, createStore } from './pane-app.mjs'
 
 const abortError = () => Object.assign(new Error('demo step aborted'), { name: 'AbortError' })
 
@@ -123,7 +127,7 @@ export function createDemoProvisioner({
   const panes = { base: newPane(), pr: newPane() }
 
   function newPane() {
-    return { apps: new Map(), log: [], generation: 0 }
+    return { apps: new Map(), log: [], generation: 0, store: createStore() }
   }
   function paneOf(role) {
     if (!panes[role]) throw new Error(`unknown pane role: ${role}`)
@@ -150,9 +154,12 @@ export function createDemoProvisioner({
     const pane = paneOf(paneRef.role)
     pane.log = [] // a new boot starts a fresh log
     record(pane, '[db] creating database widgets (in memory)')
+    // a fresh database for each boot, which the pane app keeps its data in
+    pane.store = createStore()
     await pause(500, signal)
-    // `db` is opaque to the core; here it lets the seed write to this pane's log.
-    return { dsn: null, db: { name: 'widgets', note: line => record(pane, `[db] ${line}`) } }
+    // `db` is opaque to the core; here the seed writes to its store and this
+    // pane's log, and the inspector reads the store.
+    return { dsn: null, db: { name: 'widgets', store: pane.store, note: line => record(pane, `[db] ${line}`) } }
   }
 
   async function reserveServices({ paneRef, services, signal }) {
@@ -200,7 +207,9 @@ export function createDemoProvisioner({
       }
       say(`widgets 0.4.0 (${spec.label}) starting`)
       say('migrations: 7 applied, 0 pending (run on boot)')
-      app.handler = createPaneApp({ variant: spec.variant, label: spec.label, env: env?.[name] ?? {}, log: say })
+      app.handler = createPaneApp({
+        variant: spec.variant, label: spec.label, env: env?.[name] ?? {}, log: say, store: pane.store, clearsSavedCarts: spec.clearsSavedCarts,
+      })
       say(`listening on http://${host}:${app.port}`)
     }
   }
@@ -239,12 +248,48 @@ export function createDemoProvisioner({
 
 // --- Seed, EnvTransform, AuthBootstrap ------------------------------------------
 
+// The saved carts each pane starts with.
+export const SAVED_CARTS = [
+  { name: 'Workshop restock', items: 4, owner: 'ada@example.com' },
+  { name: 'Birthday kit', items: 2, owner: 'grace@example.com' },
+  { name: 'Spares', items: 7, owner: 'linus@example.com' },
+]
+
 export function createDemoSeed({ pause = makePause() } = {}) {
   return {
     databases: ['widgets'],
     async seedPane({ db, signal }) {
       await pause(600, signal)
+      if (db?.store) for (const cart of SAVED_CARTS) db.store.saved_carts.push({ id: db.store.nextId++, ...cart })
       db?.note?.('seeded 24 products and 3 saved carts from fixtures')
+    },
+  }
+}
+
+// Reads a pane's store, as an inspector would read its database: each table
+// with its key and columns. Who sent a message, and who owns a saved cart,
+// is personal data.
+export function createDemoInspector() {
+  const table = (rows, fields) => ({ key: ['id'], fields, rows: rows.map(row => ({ ...row })), count: rows.length })
+  return {
+    rules: {
+      classify: [
+        { collection: 'messages', fields: ['name', 'email', 'message'], as: 'pii' },
+        { collection: 'saved_carts', fields: ['owner'], as: 'pii' },
+      ],
+    },
+    open({ db }) {
+      const store = db?.store
+      if (!store) throw new Error('this pane has no demo store')
+      return {
+        snapshot: () => ({
+          collections: {
+            cart_items: table(store.cart_items, ['id', 'slug', 'qty']),
+            messages: table(store.messages, ['id', 'name', 'email', 'topic', 'message', 'newsletter']),
+            saved_carts: table(store.saved_carts, ['id', 'name', 'items', 'owner']),
+          },
+        }),
+      }
     },
   }
 }

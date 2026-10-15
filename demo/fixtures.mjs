@@ -1,8 +1,10 @@
-// Demo fixtures: the pretend repository, its base branch and five open PRs,
-// one per readiness state the harness picker can show. `status` is each PR's
-// starting build state; the demo build moves `none`/`building` to `built`.
-// #104 builds but its app crashes on start (CRASH_TAIL is its log), and #105
-// is refused by the trust gate before anything is built.
+// Demo fixtures: the pretend repository, its base branch and six open PRs,
+// one per readiness state the harness picker can show, and one for the data
+// checks. `status` is each PR's starting build state; the demo build moves
+// `none`/`building` to `built`. #104 builds but its app crashes on start
+// (CRASH_TAIL is its log), and #105 is refused by the trust gate before
+// anything is built. #106's "Empty cart" deletes the saved carts too, which
+// the data checks flag.
 //
 // A service ref is the pane's display label (`main@demo123`, `#101@abc1234`),
 // so appSpecFor(ref) tells the demo provisioner which pane app to run.
@@ -36,6 +38,11 @@ export const DEMO_PRS = [
     headRepo: 'mallory/widgets', headOwner: 'mallory',
     reason: "head branch is in @mallory's fork (mallory/widgets), not the author's",
   },
+  {
+    number: 106, title: 'Make "Empty cart" start afresh', headRef: 'empty-cart-afresh',
+    author: 'linus', authorAssociation: 'MEMBER', headSha: '7c3e9a5b1d2f4e6a8c0b9d7f5e3a1c2b4d6f8e0a', status: 'built',
+    clearsSavedCarts: true,
+  },
 ]
 
 export const baseLabel = () => `${DEMO_BASE.ref}@${DEMO_BASE.sha7}`
@@ -61,11 +68,11 @@ export function crashTail(label) {
   ]
 }
 
-// ref -> { variant: 'base'|'pr', label, crashes }
+// ref -> { variant: 'base'|'pr', label, crashes, clearsSavedCarts }
 export function appSpecFor(ref, prs = DEMO_PRS) {
-  if (ref === baseLabel()) return { variant: 'base', label: ref, crashes: false }
+  if (ref === baseLabel()) return { variant: 'base', label: ref, crashes: false, clearsSavedCarts: false }
   const m = /^#(\d+)@/.exec(String(ref))
   const pr = m && findPr(m[1], prs)
   if (!pr || prLabel(pr) !== ref) throw new Error(`unknown demo app ref: ${ref}`)
-  return { variant: 'pr', label: ref, crashes: pr.failsAt === 'starting' }
+  return { variant: 'pr', label: ref, crashes: pr.failsAt === 'starting', clearsSavedCarts: pr.clearsSavedCarts === true }
 }

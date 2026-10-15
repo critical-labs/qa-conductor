@@ -124,6 +124,34 @@
     @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .4 } }
   }
 
+  /* the Data and Actions panels (#8) */
+  header button { white-space: nowrap }
+  .badged { position: relative }
+  .badged .tabBadge { position: absolute; top: -6px; right: -6px; background: var(--danger); color: #fff; border-radius: 999px; font-size: 10px; padding: 0 5px }
+  /* the panes keep at least 30% of the height; open panels share the rest */
+  #paneRow { min-height: 30vh }
+  .drawer { flex: 0 1 auto; min-height: 0; max-height: 40vh; overflow: auto; background: var(--surface); border-top: 1px solid var(--line); padding: 8px 14px }
+  /* names and values PR code controls: a long one wraps rather than scroll the drawer sideways */
+  #dataBody, #actionsBody, .dataTable td { overflow-wrap: anywhere }
+  .drawerHead { display: flex; align-items: center; gap: 10px; position: sticky; top: -8px; background: var(--surface); padding: 2px 0 6px }
+  .drawerHead h2 { font-size: 14px; margin: 0 }
+  .dataHead, .dataToggles { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px }
+  .dataToggles .on { background: var(--accent-soft); border-color: var(--accent) }
+  .dataErr { color: var(--danger); margin: 4px 0 }
+  .flags { list-style: none; padding: 0; margin: 6px 0 }
+  .flag { font: var(--mono); padding: 2px 0 }
+  .flag::before { content: '⚠ ' }
+  .flag.red { color: var(--danger) } .flag.amber { color: var(--warn) }
+  .dataTable { border-collapse: collapse; font: var(--mono); margin: 6px 0 }
+  .dataTable th, .dataTable td { text-align: left; padding: 3px 14px 3px 0; border-bottom: 1px solid var(--line) }
+  .dataTable tr[data-act] { cursor: pointer } .dataTable tr.on { background: var(--accent-soft) }
+  .dataName { font: var(--mono); font-size: 13px; margin: 10px 0 4px }
+  .drawer h3 { font-size: 12px; color: var(--text-dim); margin: 8px 0 2px }
+  .changes { font: var(--mono); margin: 0; padding-left: 18px; white-space: pre-wrap; word-break: break-all }
+  .action { border-left: 2px solid var(--line-strong); padding: 2px 0 2px 8px; margin: 6px 0 }
+  .actionHead { color: var(--text-dim); font-size: 12px }
+  .request { font: var(--mono); white-space: pre-wrap; word-break: break-all }
+
   /* verdict drawer */
   #verdictBar { border-top: 1px solid var(--line); background: var(--surface) }
   #verdictToggle { width: 100%; text-align: center; color: var(--text-dim); background: var(--surface); border: 0; border-bottom: 1px solid var(--line); border-radius: 0; padding: 4px }
@@ -174,6 +202,8 @@
       <button class="secondary" data-width="768">768</button>
       <button class="secondary on" data-width="0">Full</button>
     </div>
+    <button id="dataBtn" class="secondary badged" title="Data checks (d)" hidden>Data<span id="dataBadge" class="tabBadge" hidden></span></button>
+    <button id="actionsBtn" class="secondary" title="Action log (a)">Actions</button>
     <span id="idleChip" class="chip" title="Auto-end when idle">auto-end —</span>
     <button id="teardownBtn" class="danger-ghost" title="End session (e)">End session</button>
   </div>
@@ -243,6 +273,14 @@
         <div class="paneWrap"><iframe id="prFrame" title="pr pane"></iframe></div>
       </div>
     </div>
+    <section id="dataPanel" class="drawer" aria-labelledby="dataHeading" hidden>
+      <div class="drawerHead"><h2 id="dataHeading">Data</h2><span id="dataStatus" class="stepSub" role="status"></span><span class="spacer"></span><button id="dataClose" class="ghost" title="Close (Esc)">✕</button></div>
+      <div id="dataBody"></div>
+    </section>
+    <section id="actionsPanel" class="drawer" aria-labelledby="actionsHeading" hidden>
+      <div class="drawerHead"><h2 id="actionsHeading">Actions</h2><span id="actionsStatus" class="stepSub" role="status"></span><span class="spacer"></span><button id="actionsClose" class="ghost" title="Close (Esc)">✕</button></div>
+      <div id="actionsBody"></div>
+    </section>
   </div>
 
   <section id="verdictDone" class="view" hidden>
@@ -293,9 +331,11 @@
     <kbd>r</kbd><span>Re-sync right pane to left</span>
     <kbd>1 / 2 / 3</kbd><span>Pane width 375 / 768 / full</span>
     <kbd>v</kbd><span>Toggle verdict drawer</span>
+    <kbd>d</kbd><span>Toggle the Data panel (with an inspector)</span>
+    <kbd>a</kbd><span>Toggle the Actions panel</span>
     <kbd>e</kbd><span>End session (starts confirm)</span>
     <kbd>?</kbd><span>This overlay</span>
-    <kbd>Esc</kbd><span>Close drawer / overlay / cancel confirm</span>
+    <kbd>Esc</kbd><span>Close drawer / panels / overlay / cancel confirm</span>
   </div>
   <p class="stepSub" style="margin-top:14px">Shortcuts work when the harness chrome has focus. Click outside a pane to return focus from an iframe.</p>
   <button id="shortcutsClose" class="secondary" style="margin-top:8px">Close</button>

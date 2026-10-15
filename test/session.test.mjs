@@ -135,6 +135,55 @@ test('bootSession calls checkIsolation at the start, before the build, and once 
   }
 })
 
+// The data checks (#8): the capture opens each pane's probe right after its
+// seed, with the same db, before anything of the PR's runs on it, and takes
+// the ready baseline once both panes are signed in, before the boot returns.
+// It never fails the boot, and an aborted boot calls it no more.
+test('bootSession hands the capture each pane right after its seed, and calls ready after the sign-ins', async () => {
+  const { deps, calls } = makeDeps()
+  deps.signal = new AbortController().signal
+  deps.capture = {
+    seeded: async args => { calls.push(['capture.seeded', args]) },
+    ready: async args => { calls.push(['capture.ready', args]) },
+  }
+  await bootSession(deps, 7)
+  const seq = calls.map(c => c[0]).filter(n => n !== 'progress')
+  const at = name => seq.indexOf(name)
+  assert.deepEqual(seq.slice(at('seedPane'), at('seedPane') + 6), ['seedPane', 'capture.seeded', 'reserveServices', 'seedPane', 'capture.seeded', 'reserveServices'])
+  assert.ok(seq.lastIndexOf('establishSession') < at('capture.ready'), seq.join(' '))
+  assert.equal(at('capture.ready'), seq.length - 1)
+  const seeded = calls.filter(c => c[0] === 'capture.seeded').map(c => c[1])
+  assert.deepEqual(seeded.map(a => [a.paneRef.role, a.db.dsn, a.databases, a.signal === deps.signal]), [
+    ['base', 'dsn-base', ['idp', 'userdb'], true], ['pr', 'dsn-pr', ['idp', 'userdb'], true],
+  ])
+  assert.equal(calls.find(c => c[0] === 'capture.ready')[1].signal, deps.signal)
+
+  // a capture that throws fails nothing
+  const throwing = makeDeps()
+  throwing.deps.capture = { seeded: async () => { throw new Error('boom') }, ready: () => { throw new Error('boom') } }
+  const out = await bootSession(throwing.deps, 7)
+  assert.deepEqual(out.upstreams, { base: 3111, pr: 3112 })
+
+  // aborted after the base pane's seed: no more capture calls
+  const ac = new AbortController()
+  const stopping = makeDeps()
+  stopping.deps.signal = ac.signal
+  stopping.deps.capture = { seeded: async () => { stopping.calls.push(['capture.seeded']); ac.abort() }, ready: async () => { stopping.calls.push(['capture.ready']) } }
+  await assert.rejects(() => bootSession(stopping.deps, 7), { name: 'AbortError' })
+  assert.deepEqual(stopping.calls.filter(c => c[0].startsWith('capture')).map(c => c[0]), ['capture.seeded'])
+  assert.equal(stopping.calls.some(c => c[0] === 'reserveServices'), false, 'nothing more of the pane after the abort')
+
+  // aborted during the last sign-in: no ready snapshot
+  const late = new AbortController()
+  const signing = makeDeps()
+  signing.deps.signal = late.signal
+  const sign = signing.deps.adapters.auth.establishSession
+  signing.deps.adapters.auth.establishSession = async args => { const out = await sign(args); if (args.pane.ref.role === 'pr') late.abort(); return out }
+  signing.deps.capture = { seeded: async () => {}, ready: async () => { signing.calls.push(['capture.ready']) } }
+  await bootSession(signing.deps, 7).catch(() => {})
+  assert.equal(signing.calls.some(c => c[0] === 'capture.ready'), false)
+})
+
 test('bootSession happy path: seam order, tags, loginUrls, upstreams', async () => {
   const { deps, calls } = makeDeps()
   const out = await bootSession(deps, 7)
