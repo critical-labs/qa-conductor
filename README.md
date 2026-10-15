@@ -175,6 +175,7 @@ It serves the harness on `cfg.ports.harness` and one proxy per pane on `cfg.port
 | `@critical-labs/qa-conductor/exposure` | `mountsFor`, `reconcileExposure`, `runExpose` | one [exposure](#exposure-optional) pass, outside a conductor |
 | `@critical-labs/qa-conductor/proxy` | `createPaneProxy`, `panePolicy`, `parseSetCookie`, `isAllowedHost`, `requestHostname`, `misdirected` | the pane proxy, and the [Host allowlist](#security) check every server runs |
 | `@critical-labs/qa-conductor/verdict` | `formatVerdict`, `postVerdict` | the verdict comment and label |
+| `@critical-labs/qa-conductor/data-diff` | `validateRules`, `createMasker`, `sanitizeSnapshot`, `diffSnapshots`, `divergence`, `flagChanges`, `trustOf`, `LIMITS`, `SECRET_NAME` | the [data checks](#data-checks)' engine, with no I/O: what a snapshot keeps and masks, what changed, where the panes differ, and what is destructive. For checking an inspector's snapshots |
 | `@critical-labs/qa-conductor/adapters/provisioner-docker` | `createDockerProvisioner` | a Provisioner that runs each pane as containers on the host's Docker daemon |
 | `@critical-labs/qa-conductor/adapters/provisioner-process` | `createProcessProvisioner` | a Provisioner for local process groups |
 | `@critical-labs/qa-conductor/adapters/build-worktree` | `createWorktreeBuild`, `trustDecision` | a BuildConvention that runs PRs from git worktrees, behind a trust gate |
@@ -375,6 +376,66 @@ What the seams pass each other. Any method above may return its result or a prom
 - **Sessions live in the jar (AuthBootstrap).** The pane app gets the cookies its own responses set this session, which the proxy keeps, and not the browser's. So the session must reach the jar in a `Set-Cookie`: have the `landingUrl`, or a redirect it makes, set it server-side. A session cookie the app's scripts write can't be kept apart for two panes on one hostname, `QA_FORWARD_CLIENT_COOKIES` or not. Cookies ignore ports, so both panes' pages write the same browser cookie, whichever pane signs in last overwrites it, and both proxies would pass that one value on: one pane's app would get the other pane's session (see [Security](#security)).
 
 **Reference consumers:** this repository's self-QA ([`qa/self.mjs`](qa/self.mjs): `build-worktree` and `provisioner-process`, described in [CONTRIBUTING.md](CONTRIBUTING.md#qa-this-repos-own-pull-requests)), the demo's fake adapters ([`demo/fake-adapters.mjs`](demo/fake-adapters.mjs)), and agent-identity's [`packages/qa`](https://github.com/critical-labs/agent-identity/tree/main/packages/qa), a 0.2-era consumer that seeds each pane's DynamoDB Local from a redacted snapshot.
+
+### Data checks
+
+The data checks compare snapshots of each pane's data. They show what a pane's data did between two snapshots, and where the PR pane's changes depart from the base pane's. They also flag the destructive ones. Both panes start from one seed and get the same mirrored actions, so a PR-only change is the PR's. The engine is [`@critical-labs/qa-conductor/data-diff`](#entry-points): pure functions with no I/O.
+
+- **A snapshot** is `{ collections: { name: Collection } }`. A **Collection** is `{ key, rows, count?, truncated?, fields? }`:
+  - `rows` are plain JSON objects;
+  - `key` names the identity fields from the store's own schema (a primary key, a `KeySchema`), or is `null`, and the rows are then compared as a multiset;
+  - `count` is the true row count. A truncated collection shows only a net change in it: a fall reads as deletes, a rise as inserts, and what happened past the cut can't be seen. A collection with fewer rows than its `count` is truncated, and one marked `truncated` with no `count` is a problem;
+  - `fields` are its declared columns, so a dropped column shows. Leave it out for a schemaless store.
+- **Rules** (`validateRules(rules)`) are plain data. Every list is optional, and a collection name in a rule matches exactly or with `*` globs:
+  - `exclude: [name]`: never kept or shown, such as migration history or sessions;
+  - `volatile: [{collection, fields, mode?}]`: fields such as timestamps that change on their own. `ignore` (the default) drops them; `presence` keeps only whether each is set;
+  - `classify: [{collection, fields, as}]`: `as` is `secret` or `pii`. It names top-level fields only. A value inside JSON is masked when its key looks secret, but `classify` doesn't reach it;
+  - `softDelete: [{collection, field}]`: a field whose being set counts as a delete. It is never masked, and `null`, `false`, `0` and `''` count as not set;
+  - `destructive: [{collection, maxChanged?, allowDeletes?}]`: a collection's own mass-change threshold, or deletes it expects. A rule that names the collection exactly wins over a glob.
+
+  An entry with a field no rule has, such as `allowDelete`, is refused.
+- **What a snapshot keeps** (`sanitizeSnapshot(raw, {masker, rules, limits})`, with `createMasker({key, rules})`):
+  - at most `LIMITS.maxRows` (10,000) rows a collection, `LIMITS.maxBytes` (32 MB) in all and `LIMITS.maxCollections` (1,000) collections. The bytes are shared fairly: the collections with the fewest rows go first, each with at most an equal share of what is left, so one big collection, a PR's padding say, can't starve the others. A collection cut short is `truncated`, and only its count is compared;
+  - past `maxCollections`, the collections with the most rows are kept, so many small ones can't push a real one out. The rest are kept as their counts alone (`truncated`, with no rows), up to ten times as many, and only past those is one left out. `problems` names both;
+  - each value as it is, except:
+    - **a secret** is `{t: 'secret', d}`: only whether it changed shows. That is a field whose name matches `SECRET_NAME`, or one `classify` marks `secret`. `SECRET_NAME` matches, in any case:
+      - `pass`, `pwd`, `secret`, `token`, `salt`, `hash`, `otp`, `private`, `session`, `card`, `cvv`, `cvc`, `ssn`, `iban`, `authorization`, `bearer`, `jwt`, `cookie`, `credential`, `signature`, `dsn`, `mnemonic`, anywhere in the name;
+      - `api_key`, `access_key`, `signing_key`, `client_key`, `encryption_key`, `master_key`, `ssh_key`, `database_url`, `mongo_url`, `redis_url`, `amqp_url`, `postgres_url`, `mysql_url`, `connection_string`, `seed_phrase`, `recovery_code`, `backup_code` and `pin_code`, with `_`, `-` or nothing between the words (`apiKey`, `api-key`), and `uri` for `url`;
+      - `pin` as a word of its own (`pin`, `user_pin`).
+
+      A secret-looking name stays secret whatever `classify` says;
+    - **personal data** that `classify` marks `pii` is `{t: 'pii', fp, type, len}`: an 8-hex fingerprint, the type and the length;
+    - `d` and `fp` are HMACs under `key`, which the conductor makes for each session and never sends anywhere. So equal values match across the panes, and say nothing past the session. A secret's digest is its field's, so equal secrets in two fields don't match;
+    - an object or array is `{t: 'json', s}`, its JSON, and so is a string that holds one;
+    - a value under a secret-looking key inside JSON is masked too, with a digest of its collection's and field's. So is the value of a name and value pair whose name looks secret (`{name: 'Authorization', value}`, or `key` for `name`), and the string after a secret-looking one in a list of strings (Node's `rawHeaders`). JSON held in a string inside JSON is read too, up to three deep, and so is JSON encoded twice, and NDJSON line by line. Bytes inside JSON show only their length, and a `Set` or `Map` its entries;
+    - text that isn't JSON, or is over 256 KB, but shows a secret-looking key is masked whole: `[text with a secret-looking key, <length>, <digest>]`. A key counts at a word's start, quoted or not (an escaped quote too), or in brackets, then `:` or `=` (`"password": …`, `\"password\": …`, `api_key=…`, `user[password]=…`), and as a tag (`<password>`). The first 256 KB are read: a cell shows at most its first 200 characters;
+    - in text, a URL's password (`postgres://app:<secret>@db`) and the value after `Bearer`, `Basic` or `Token` are replaced by a digest, the rest kept;
+    - a string or JSON over 200 characters is `{t: 'long', s, len, d}`, cut;
+    - bytes are `{t: 'blob', len, d}`;
+    - a value that isn't set (`null`, `''`, `[]`, `{}`, or an empty `Set` or `Map`) is kept as it is, whatever its field, so clearing a secret shows. A `Set` or `Map` with entries is masked like any other value.
+  - Anything malformed, or that throws as it is read, is listed in `problems`, never thrown. A key that a row lacks, or that two rows share, is dropped.
+  - Collection and field names are the store's, any string: `__proto__` and `constructor` are names like any other.
+- **`diffSnapshots(before, after)`**: per collection, `{status, key, inserted, updated, deleted, fieldsDropped, fieldsAdded, countBefore, countAfter, truncated, keyLost}`. `keyLost` says the after snapshot no longer bears out the key the before one had, for example because two rows share it.
+  - `status` is `same`, `changed`, `added` or `dropped`, or `unknown` for a truncated collection whose count didn't change: it never claims nothing changed.
+  - `inserted` and `deleted` are `[{key, row}]`, and `updated` is `[{key, fields: [{field, before, after}]}]`. A `key` is the JSON of the row's key values. The collection's `key` is the one the diff used: `null` when the rows were compared as a multiset, as they are when either snapshot has no key, or a different one.
+  - A field that the declared `fields` gained or lost is named once, not as an update to every row, with a key or without.
+- **`divergence(baseDiff, prDiff)`**: per collection, `{status, truncated, changes, counts}`.
+  - Each change, by key, is `{kind, key, status, base, pr}`, plus `field` for a schema change. Its `status` is `both`, `pr-only`, `base-only` or `differs`.
+  - Without a key both panes share, and for a truncated collection, only the schema's changes and the `counts` of inserted, updated and deleted rows are compared.
+  - The collection's `status` sums its changes up: `same` when there are none, or `unknown` for a truncated collection whose counts show nothing, one truncated in one pane only, whose count can't be set beside the other's rows, or one the PR pane's diff lacks while the base pane's has it.
+  - A collection one pane dropped or added while the other changed it `differs`.
+- **`flagChanges(baseDiff, prDiff, rules, {trusted})`**: the PR pane's destructive changes, each `{collection, kind, severity, shared, pr, base, field?}`. `pr` and `base` are how many of that kind each pane made, on any rows. `shared` says the base made the same change.
+  - **The kinds:**
+    - `delete`: rows gone, or a `softDelete` field newly set;
+    - `emptied`: a collection whose count fell to 0;
+    - `dropped`: a collection gone;
+    - `column-dropped`: a declared field gone, one flag per field;
+    - `mass-change`: more than 20 rows updated or deleted, or more than 20% of a collection of at least 5 rows, or past a rule's `maxChanged`;
+    - `key-lost`: a collection whose key the PR's rows no longer bear out, so its rows were compared without one, and updates read as deletes and inserts;
+    - `unverified`: a collection the PR pane's snapshot cut short where the base pane's didn't, a cut-short one whose count changed, or one the base pane's diff has and the PR pane's lacks. What happened past the cut can't be seen, so it is never taken for nothing. One cut short in both panes with no change in count is listed too, `amber`;
+    - `cleared`: a value set before, now `null`, `''`, `[]` or `{}`.
+  - **Severity:** `amber` when the base made the same change (`shared`) and `trusted` is `true`, else `red`. The same change means the same rows (by key, or as a multiset without one), with the same fields changed to the same values, the same field, or for two cut-short collections the same change in count. A count stands for rows only when both panes have only counts. Unless `trusted` is `true`, the base's changes excuse nothing, and every flag but `cleared` is `red`. A `cleared` field is `amber` at most. `allowDeletes` turns off a collection's `delete` flags, but not `emptied` or `key-lost`.
+- **`trustOf(isolation)`**: `trusted` only when the session's [isolation verdict](#isolation-verdicts) is `isolated`, else `advisory`. While the PR pane may reach the base pane, what the base pane did can't excuse what the PR pane did. Pass it on as `flagChanges(…, {trusted: trustOf(isolation) === 'trusted'})`.
 
 ### Built in: `adapters/build-worktree` (git-worktree BuildConvention)
 

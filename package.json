@@ -49,6 +49,7 @@
     "./exec": "./lib/exec.mjs",
     "./proxy": "./lib/proxy.mjs",
     "./verdict": "./lib/verdict.mjs",
+    "./data-diff": "./lib/data-diff.mjs",
     "./adapters/provisioner-docker": "./lib/adapters/provisioner-docker.mjs",
     "./adapters/build-worktree": "./lib/adapters/build-worktree.mjs",
     "./adapters/provisioner-process": "./lib/adapters/provisioner-process.mjs",
