@@ -138,7 +138,7 @@ test('/api/prs returns the fixtures with their statuses', async () => {
     const { status, body } = await api(demo.ports.harness, 'GET', '/api/prs')
     assert.equal(status, 200)
     assert.deepEqual(body.prs.map(p => [p.number, p.imageStatus]), [
-      [101, 'built'], [102, 'built'], [103, 'building'], [104, 'none'], [105, 'blocked'],
+      [101, 'built'], [102, 'built'], [103, 'building'], [104, 'none'], [105, 'blocked'], [106, 'built'],
     ])
     assert.deepEqual(body.prs.map(p => [p.title, p.headRef, p.author]), DEMO_PRS.map(p => [p.title, p.headRef, p.author]))
     // cores that pass `reason` through (0.2.0) show why #105 can't boot
@@ -206,6 +206,41 @@ test('a good PR reaches ready, and both pane proxies serve distinguishable pages
   } finally { await demo.stop() }
 })
 
+// #8's data checks end to end: #106's "Empty cart" also deletes the saved
+// carts, which the base's doesn't. The demo's panes share one host, so the
+// comparison is advisory: every destructive change is red, and divergence
+// shows which was the PR's alone.
+test('#106: "Empty cart" deletes the saved carts too, which the data checks flag red as the PR\'s alone', async () => {
+  const { log } = captureLog()
+  const demo = await startDemo({ port: 0, speed: 0, log })
+  try {
+    assert.deepEqual((await state(demo.ports.harness)).data, { available: true })
+    await bootToReady(demo.ports.harness, 106)
+    const cookie = await paneCookie(demo)
+    const post = (role, path, form) => fetch(`http://127.0.0.1:${demo.ports[role]}${path}`, {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', cookie }, body: new URLSearchParams(form), redirect: 'manual',
+    })
+    for (const role of ['base', 'pr']) {
+      const cart = await (await fetch(`http://127.0.0.1:${demo.ports[role]}/cart`, { headers: { cookie } })).text()
+      assert.match(cart, /Saved for later/, `${role}: the seeded saved carts show`)
+      assert.equal((await post(role, '/cart', { slug: 'gizmo-pro', qty: '2' })).status, 303)
+      assert.equal((await post(role, '/cart/clear', {})).status, 303)
+    }
+    const { status, body } = await api(demo.ports.harness, 'POST', '/api/data/snapshot', {})
+    assert.equal(status, 200, JSON.stringify(body))
+    assert.equal(body.trust, 'advisory')
+    assert.deepEqual(body.boot.flags, [], 'the boot changed nothing')
+    const v = body.session.divergence.collections
+    // the cart was filled and emptied in both: no net change
+    assert.deepEqual([v.saved_carts.status, v.cart_items.status, v.messages.status], ['pr-only', 'same', 'same'])
+    assert.deepEqual(body.session.flags.map(f => [f.collection, f.kind, f.severity, f.pr, f.base]), [['saved_carts', 'delete', 'red', 3, 0], ['saved_carts', 'emptied', 'red', 1, 0]])
+    // the saved carts' owners are fingerprints
+    const owner = body.session.pr.collections.saved_carts.deleted[0].row.owner
+    assert.equal(owner.t, 'pii')
+    assert.doesNotMatch(JSON.stringify(body), /@example\.com/)
+  } finally { await demo.stop() }
+})
+
 // A GET with full control over the headers (fetch won't send a Referer).
 function get(port, path, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -226,7 +261,8 @@ test('pane responses let only the demo harness frame them', async () => {
     const harness = `http://127.0.0.1:${demo.ports.harness}`
     assert.equal((await state(demo.ports.harness)).harnessOrigin, harness, 'derived from the bound port')
     const page = await get(demo.ports.harness, '/')
-    assert.deepEqual([page.headers['content-security-policy'], page.headers['x-frame-options']], ["frame-ancestors 'self'", 'SAMEORIGIN'])
+    const panes = `http://127.0.0.1:${demo.ports.base} http://127.0.0.1:${demo.ports.pr}`
+    assert.deepEqual([page.headers['content-security-policy'], page.headers['x-frame-options']], [`frame-ancestors 'self'; default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src ${panes}`, 'SAMEORIGIN'])
     await bootToReady(demo.ports.harness, 101)
     const cookie = await paneCookie(demo)
     for (const role of ['base', 'pr']) {
@@ -392,7 +428,7 @@ test('demo github: PR fields, trust data, and in-memory comments and labels', as
   const { lines, log } = captureLog()
   const gh = createDemoGithub({ log })
   const prs = await gh.listOpenPrs()
-  assert.equal(prs.length, 5)
+  assert.equal(prs.length, 6)
   for (const pr of prs) {
     assert.match(pr.headSha, /^[0-9a-f]{40}$/)
     for (const key of ['number', 'title', 'headRef', 'author', 'authorAssociation', 'headRepo', 'headOwner']) assert.ok(key in pr, key)
@@ -422,7 +458,7 @@ test('demo build: progress messages, labels, readiness, the trust block and abor
   build.subscribeBuild(p => messages.push(p.message))
 
   const statuses = async () => (await build.describePrs(DEMO_PRS)).map(d => [d.number, d.status])
-  assert.deepEqual(await statuses(), [[101, 'built'], [102, 'built'], [103, 'building'], [104, 'none'], [105, 'blocked']])
+  assert.deepEqual(await statuses(), [[101, 'built'], [102, 'built'], [103, 'building'], [104, 'none'], [105, 'blocked'], [106, 'built']])
   const blocked = (await build.describePrs([{ number: 105 }]))[0]
   assert.deepEqual(blocked, { number: 105, status: 'blocked', reason: "head branch is in @mallory's fork (mallory/widgets), not the author's", runUrl: null })
 

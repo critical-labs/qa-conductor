@@ -73,13 +73,16 @@ test('sanitizePath keeps the shape of a path and drops every value in it', () =>
     ['/reset/xkcdcorrecthorsebatterystaple', '/reset/:token'],
     ['/api/keys/key_abcdefghijklmnopqrstuvwx', '/api/keys/:token'],
     ['/k/ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEF', '/k/:token'],
-    // up to three separators between digits
+    // up to four separators between digits
     ['/phone/555%20-%20123%20-%204567', '/phone/:number'],
     ['/card/4111 - 1111 - 1111 - 1111', '/card/:number'],
     ['/ssn/123 - 45 - 6789', '/ssn/:number'],
     ['/phone/555..123..4567', '/phone/:number'],
     ['/phone/555--123--4567', '/phone/:number'],
     ['/phone/(555)%20%20123%20%204567', '/phone/:number'],
+    ['/phone/555 -- 123 -- 4567', '/phone/:number'],
+    ['/phone/555....123....4567', '/phone/:number'],
+    ['/v/1.....2.....3.....4.....5.....6.....7', '/v/1.....2.....3.....4.....5.....6.....7'], // five: kept
     // one escape that doesn't decode stops only itself
     ['/u/a%EF%BC%A0b.co%', '/u/:email'],
     ['/u/a%EF%B9%ABb.co%', '/u/:email'],
@@ -87,6 +90,12 @@ test('sanitizePath keeps the shape of a path and drops every value in it', () =>
     ['/x/token%3Dabc%25', '/x/token=…'],
     ['/u/bob%2540gmail.com%', '/u/:email'],
     ['/x/a%3D%E0', '/x/…=…'],
+    // the raw checks, where a bad escape in the run stops it decoding
+    ['/u/jos%E9%40x.io', '/u/:email'],
+    ['/u/jos%E9%2540x.io', '/u/:email'],
+    ['/x/a%253D%E0', '/x/…=…'],
+    ['/x/k%3d%E0', '/x/…=…'],
+    ['/u/a%ef%bc%a0b', '/u/:email'],
     // a key=value segment keeps the key
     ['/x/token=abc', '/x/token=…'],
     ['/x/apikey=sk_live_short;v=2', '/x/apikey=…'],
@@ -226,6 +235,8 @@ test('a read gives the requests and marks after a sequence number, in order, at 
   for (let i = 0; i < 2_500; i++) log.record('pr', { at: 10, method: 'GET', path: '/x', status: 200 })
   assert.equal(log.read(0).requests.length + log.read(0).marks.length, 2_000)
   assert.equal(log.read(0, { limit: 9_999 }).requests.length + log.read(0, { limit: 9_999 }).marks.length, 2_000)
+  // a limit that isn't one is the most
+  for (const limit of [0, -1]) assert.equal(log.read(0, { limit }).requests.length + log.read(0, { limit }).marks.length, 2_000, String(limit))
 })
 
 // The review's case: 2 × limit + 1 requests in one mark's window, the mark

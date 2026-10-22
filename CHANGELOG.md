@@ -69,6 +69,40 @@ What changed in each release, newest first. A 0.x minor version may break the in
     - the harness posts a mark for the clicks, submits, changes and Enters a pane reports, mirrored or not, at most one of each kind a pane every 100 ms, from a budget per pane that refills;
     - `createPaneProxy` takes `recorder` and `onRefused`.
 
+### The data checks' engine
+
+- **A new entry point, `@critical-labs/qa-conductor/data-diff`:** the pure engine of #8's data checks, with no I/O. README's [Data checks](README.md#data-checks) has the details.
+  - **What a snapshot keeps:** each collection's rows, key and true count, at most 10,000 rows a collection, 32 MB in all, shared fairly, and 1,000 collections, those with the most rows. Up to ten times as many more are kept as their counts alone, flagged `unverified`, and only past those is one left out, by name in `problems`. A snapshot says how many it left out, and a collection missing from one that left some out is `unknown`, never added or dropped. A collection's key and declared fields count against its bytes, and are capped: a name over 200 characters is left out, a key of more than 32 fields is dropped, and a collection with more than 2,000 declared fields is kept as its count.
+  - **Masking:** a secret-looking or `secret` field keeps only a digest, and a `pii` one a fingerprint, its type and its length, as HMACs under a key made for the session; a `Set` or `Map` too. JSON keeps no value under a secret-looking key, nor in a name and value pair (`name`, `Name`, `key`, `k` and the like) or a header list, in JSON held in strings (three deep), JSON encoded twice and NDJSON too. JSON text encoded twice says so, so re-encoding a column shows. Text that shows a secret-looking key, quoted, escaped (HTML-escaped too), in brackets or as a tag (with a namespace or attributes), is masked whole. In text, a URL's password or token, and a `Bearer`, `Basic` or `Token` value that looks like a token, in any case, are replaced by a digest. The text scan is linear, runs of backslashes included.
+  - **Comparing:**
+    - what changed between two snapshots of a pane, by key;
+    - where the PR pane's changes depart from the base pane's;
+    - which of the PR's changes are destructive: red unless the base made the same change (the same rows, the same fields, to the same values), then amber. A collection a PR cut short where the base's wasn't, or that the PR's snapshots don't show while the base's do, is flagged `unverified`. Those only the PR pane has are one flag, with their number. Red flags come first, and among them the base pane's collections, and the destructive kinds before `unverified`.
+  - **Advisory unless isolated:** unless the session's isolation verdict is `isolated`, the base's changes excuse nothing.
+
+### The data checks
+
+- **A new optional seam, `adapters.inspector`, lets the data checks read each pane's data.** Each session snapshots each pane right after its seed (`seeded`), once both panes are signed in (`ready`), and on demand (`now`), in memory only. README's [Data checks](README.md#data-checks) and [The seams](README.md#the-seams) have the details.
+  - **What it shows:** the boot span and the session span, each pane's diff, their divergence, and the PR's destructive flags, trusted only when the session's isolation verdict is `isolated`.
+  - **It never fails a boot:** an inspector that throws, hangs past 30 s or returns nonsense leaves its pane without data and says why, and a call that times out is told to stop. A pane whose ready read failed keeps its seeded snapshot until a later one gives it a baseline; its spans then say their windows differ, and nothing in the base excuses a PR change there. A boot span is aligned only when both baselines came from the ready read. A span whose PR pane couldn't be read, or neither pane after a snapshot, has a red `unreadable` flag, which says why.
+  - **No values leave the harness:** they reach only `GET /api/data`, behind the capability. The event stream gets `{kind: 'capture', pane, phase, ok}` for the boot's two phases, and nothing reaches a log or GitHub.
+  - **One answer stays small, about 4 MB at most:** 1,000 collections a diff, red-flagged and changed ones first, 50 rows, changes and fields of each kind a collection, 500 flags a span, red first, with `unverified` ones past 20 folded into one, and 50 problems a pane, within 2 MB a span that each collection's own entry counts against too, with whole counts. One still too big to build is built without its lists, keeping its counts and first red flags. It is built once for each state.
+  - **New:**
+    - routes: `GET /api/data` and `POST /api/data/snapshot` (`{rebaseline: true}` to re-baseline);
+    - `bootSession` takes `deps.capture`;
+    - the demo has an inspector, and **#106**, whose *Empty cart* deletes the saved carts too.
+  - **The harness shows them:**
+    - **Data** (`d`): the trust chip, Snapshot now and Re-baseline, both spans, divergence and each pane's changes, and a badge counting the red flags. A PR pane that couldn't be read is red and counted, and so is a span neither pane could be read for after a snapshot: its changes are unknown, never "no destructive change" or "nothing to compare". Flagged and changed collections are drawn first;
+    - **Actions** (`a`): each reported action with the requests it most likely set off, grouped by the documented rule, read on from its cursor while open and in view, and from 0 again for another session.
+
+    Both draw what PR code controls as text only, set apart, with its control, format and separator characters shown as codes. Data draws at most 300 collections, 100 flags and 50 rows of each kind; Actions the newest 100 actions, with the requests grouped under them, of the newest 4,000 it keeps.
+  - **What breaks:** `/api/state` has `data: {available}`, so a test that compares it whole must add it.
+- **The harness's Content-Security-Policy is tighter:** `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src <pane origins>`, beside `frame-ancestors 'self'`. With a pane origin that can't be named (an IPv6 literal), `frame-src` is `http: https:`.
+  - **What breaks:**
+    - a harness page changed to load a script, or anything else, from elsewhere, or a script inline, no longer gets it;
+    - a pane's navigation to another origin inside its frame (an SSO or OAuth hop, a hosted payment page, a redirect to another host) shows the browser's error page: open the pane in a new tab for such a flow;
+    - a test that compares the harness's `Content-Security-Policy` must expect the new one.
+
 ### The Docker Provisioner
 
 - **The PR pane can no longer reach the base pane's database.** Both panes' containers joined one network, and both databases had the same superuser and password, which the PR pane's own `dsn` carried. So PR code, by mistake or on purpose, could change the base pane's data, or call the base app directly, and skew the comparison.

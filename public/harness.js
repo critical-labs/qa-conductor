@@ -77,6 +77,423 @@ function markType(event) {
   return null
 }
 
+// --- #8: the Data and Actions panels -----------------------------------------
+// What they show comes from the panes' data and requests, which PR code
+// controls: collection and field names, values, paths. So it is built here as
+// plain nodes, { tag, cls, text, title, act, children }, which the page draws
+// with textContent only (drawNodes). `act` names what a click on the node does.
+
+// The most rows a list shows, collections and flags the Data panel shows,
+// actions the Actions panel shows, and requests and marks it keeps.
+const SHOWN_ROWS = 50
+const SHOWN_COLLECTIONS = 300
+const SHOWN_FLAGS = 100
+const SHOWN_PROBLEMS = 20
+const SHOWN_ACTIONS = 100
+const KEPT_REQUESTS = 4_000
+const KEPT_MARKS = 2_000
+const PANE_NAMES = { base: 'BASE', pr: 'PR' }
+const paneName = pane => PANE_NAMES[pane] || '?'
+const node = (tag, cls, text, extra = {}) => ({ tag, cls, text, ...extra })
+
+// Text PR code controls, as the panels draw it: each control, format or
+// separator character (a newline, a bidi override, a zero-width space, a
+// line or paragraph separator) shown as its code, so it can't break a line,
+// end an isolate, reorder the text around it or hide; then
+// set apart (U+2068 … U+2069), so its direction can't spill over the
+// conductor's own words beside it.
+const CONTROLS = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu
+const codeOf = c => `\\u{${c.codePointAt(0).toString(16).toUpperCase()}}`
+const isolated = s => `\u2068${String(s).replace(CONTROLS, codeOf)}\u2069`
+// What drawNodes does to every text and title: the same, but for the
+// isolates above, so text that missed them can't break a line or reorder.
+const OTHER_CONTROLS = /(?![\u2068\u2069])[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu
+const drawnText = s => String(s).replace(OTHER_CONTROLS, codeOf)
+
+// A local time of day, HH:MM:SS.
+function clockTime(at) {
+  const d = new Date(at)
+  return Number.isNaN(d.getTime()) ? '—' : d.toTimeString().slice(0, 8)
+}
+// When the baseline was taken: one time, or each pane's when they differ.
+function baselineText(data) {
+  const b = data.baselines
+  if (b && b.base && b.pr && b.base !== b.pr) return `baselines BASE ${clockTime(b.base)}, PR ${clockTime(b.pr)}`
+  return `baseline ${data.baselineAt ? clockTime(data.baselineAt) : '—'}`
+}
+
+// The digests the data checks keep inside text (a value under a
+// secret-looking key in JSON, text that shows such a key): they say only
+// that a secret was there.
+const hideDigests = s => s
+  .replace(/\[secret [0-9a-f]{8}\]/g, '[secret]')
+  .replace(/(\[text with a secret-looking key, \d+ characters), [0-9a-f]{8}\]/g, '$1]')
+// A value the engine cut at MAX_TEXT may end in part of one.
+const hideCutDigests = s => hideDigests(s)
+  .replace(/\[secret [0-9a-f]{0,8}$/, '[secret')
+  .replace(/(\[text with a secret-looking key, \d+ characters), [0-9a-f]{0,8}$/, '$1')
+
+// A value as the data checks keep it (lib/data-diff.mjs's cells), as text. A
+// secret shows only that it is one; personal data its fingerprint.
+function cellText(cell) {
+  if (cell === null || cell === undefined) return 'null'
+  if (typeof cell === 'string') return isolated(hideDigests(JSON.stringify(cell)))
+  if (typeof cell === 'number' || typeof cell === 'boolean') return String(cell)
+  if (typeof cell !== 'object') return '?'
+  if (cell.t === 'json') return isolated(hideDigests(String(cell.s)))
+  if (cell.t === 'long') return `${isolated(hideCutDigests(String(cell.s)))}… (${cell.len} characters)`
+  if (cell.t === 'blob') return `(${cell.len} bytes)`
+  if (cell.t === 'secret') return '(secret)'
+  if (cell.t === 'pii') return `(personal data ${isolated(cell.fp)}, ${isolated(cell.type)}, ${isolated(cell.len)})`
+  return '?'
+}
+
+// A row's key as the data checks give it (its cells as JSON), each cell as
+// cellText shows it: a secret or personal key part never shows its value.
+function keyText(key) {
+  if (key === null || key === undefined) return ''
+  let parts
+  try { parts = JSON.parse(key) } catch { return isolated(key) }
+  return Array.isArray(parts) ? `[${parts.map(cellText).join(', ')}]` : cellText(parts)
+}
+const keyed = (key, text) => (key === null || key === undefined ? text : `${keyText(key)}: ${text}`)
+
+const rowText = row => (row && typeof row === 'object' ? Object.keys(row).map(k => `${isolated(k)}: ${cellText(row[k])}`).join(', ') : '—')
+const isSecret = cell => cell !== null && typeof cell === 'object' && cell.t === 'secret'
+const fieldsText = fields => (Array.isArray(fields) ? fields : [])
+  .map(f => (isSecret(f.before) || isSecret(f.after) ? `${isolated(f.field)}: (secret, changed)` : `${isolated(f.field)}: ${cellText(f.before)} → ${cellText(f.after)}`))
+  .join(', ')
+const deltaText = c => (c ? `+${c.inserted} ~${c.updated} −${c.deleted}` : '—')
+
+// What the trust chip says: whether what the base pane did can excuse a PR
+// change, by the session's isolation verdict.
+function trustLabel(trust) {
+  return trust === 'trusted'
+    ? { text: 'trusted', warn: false, title: 'The PR pane is isolated from the base pane: a change the base made too is amber' }
+    : { text: 'advisory', warn: true, title: 'The PR pane may reach the base pane: what the base did excuses nothing, so every destructive change is red' }
+}
+
+const KIND_LABELS = new Map([
+  ['delete', 'rows deleted'], ['emptied', 'emptied'], ['dropped', 'dropped'], ['column-dropped', 'column dropped'],
+  ['mass-change', 'mass change'], ['key-lost', 'key lost'], ['unverified', 'unverified (cut short or not shown)'], ['cleared', 'value cleared'],
+])
+const STATUS_LABELS = new Map([
+  ['same', 'same'], ['both', 'both'], ['pr-only', 'PR only'], ['base-only', 'base only'], ['differs', 'differs'],
+  ['unknown', 'unknown (truncated)'], ['changed', 'changed'], ['added', 'added'], ['dropped', 'dropped'],
+])
+const label = (map, key) => map.get(key) || isolated(key)
+// A collection a pane's snapshot may have left out says so.
+const statusText = c => (c && c.omitted ? 'unknown (left out of a snapshot)' : label(STATUS_LABELS, c && c.status))
+const countText = n => (Number.isSafeInteger(n) ? String(n) : '?')
+
+// Why a span's PR pane has no diff (the unreadable flag's reason).
+const UNREADABLE = {
+  failed: 'The PR pane couldn\'t be read for this span, so its changes are unknown.',
+  neither: 'Neither pane could be read for this span, so the PR pane\'s changes are unknown.',
+  baseline: 'The PR pane\'s baseline is this snapshot: take another to see its changes.',
+}
+const namesText = f => (Array.isArray(f.names) && f.names.length ? `, such as ${f.names.map(isolated).join(', ')}` : '')
+
+function flagText(f) {
+  if (f.kind === 'unreadable') return UNREADABLE[f.reason] || UNREADABLE.failed
+  if (f.kind === 'unlisted') return 'This span\'s details were too big to list: only its counts and first red flags are shown.'
+  // one flag for many collections: those only the PR pane has, or those
+  // past the ones listed one by one
+  if (f.collection === null && f.kind === 'unverified') {
+    const n = Number.isSafeInteger(f.collections) ? f.collections : '?'
+    return f.folded
+      ? `${n} more collections: ${label(KIND_LABELS, f.kind)}${namesText(f)}`
+      : `${n} collections only the PR pane has: ${label(KIND_LABELS, f.kind)}${namesText(f)}`
+  }
+  const field = f.field === undefined ? '' : ` (${isolated(f.field)})`
+  return `${isolated(f.collection)}: ${label(KIND_LABELS, f.kind)}${field}, PR ${f.pr}, base ${f.base}${f.shared ? ', the base\'s too' : ''}`
+}
+
+// The Data button's badge: the red flags, both spans, those the answer
+// lists and the rest (flagsCount). Red is a change the base didn't make too
+// in a trusted session, any destructive change in an advisory one, where
+// what the base did excuses nothing, and a PR pane that couldn't be read.
+function dataBadge(data) {
+  if (!data || !data.active || data.closed) return 0
+  const redOf = (span, name) => {
+    // after a snapshot, a span with nothing at all: unknown, red
+    if (!span) return name === 'session' && data.comparedAt ? 1 : 0
+    if (span.flagsCount && Number.isSafeInteger(span.flagsCount.red)) return span.flagsCount.red
+    return (span.flags || []).filter(f => f.severity === 'red').length
+  }
+  return redOf(data.boot, 'boot') + redOf(data.session, 'session')
+}
+// How many flags a span has in all.
+const flagTotal = span => (span.flagsCount && Number.isSafeInteger(span.flagsCount.red) && Number.isSafeInteger(span.flagsCount.amber)
+  ? span.flagsCount.red + span.flagsCount.amber
+  : span.flags.length)
+
+// The collections a span's view lists: those with a red flag first, then
+// any that changed or are unknown, then the rest, each in name order. So
+// padding a PR names to sort first can't push a changed one out of those
+// drawn.
+function spanCollections(span, view) {
+  const d = view === 'divergence' ? span.divergence : span[view]
+  const collections = d && d.collections ? d.collections : {}
+  const red = new Set((span.flags || []).filter(f => f.severity === 'red' && f.collection !== null).map(f => f.collection))
+  const rank = name => (red.has(name) ? 0 : collections[name] && collections[name].status !== 'same' ? 1 : 2)
+  return Object.keys(collections).sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0))
+}
+// How many collections a span's view has in all: its own count, or those
+// it lists.
+function collectionsTotal(span, view) {
+  const d = view === 'divergence' ? span.divergence : span[view]
+  const listed = d && d.collections ? Object.keys(d.collections).length : 0
+  return d && Number.isSafeInteger(d.collectionsCount) ? Math.max(d.collectionsCount, listed) : listed
+}
+
+// Why a pane has no data, for the span shown: the boot span's reasons, and
+// for the session span its latest read's too, since a pane that never
+// opened has none of either.
+function errorNodes(data, spanName) {
+  const out = []
+  const errors = data.errors || {}
+  for (const pane of ['base', 'pr']) {
+    const boot = errors.boot && errors.boot[pane]
+    const session = errors.session && errors.session[pane]
+    if (boot) out.push(node('p', 'dataErr', `${paneName(pane)}${spanName === 'session' ? ', at boot' : ''}: ${isolated(boot)}`))
+    if (session && spanName === 'session') out.push(node('p', 'dataErr', `${paneName(pane)}: ${isolated(session)}`))
+    const problems = (data.problems && data.problems[pane]) || []
+    for (const problem of problems.slice(0, SHOWN_PROBLEMS)) out.push(node('p', 'stepSub', `${paneName(pane)}: ${isolated(problem)}`))
+    const counted = data.problemsCount && Number.isSafeInteger(data.problemsCount[pane]) ? data.problemsCount[pane] : problems.length
+    const more = Math.max(counted, problems.length) - Math.min(problems.length, SHOWN_PROBLEMS)
+    if (more > 0) out.push(node('p', 'stepSub', `${paneName(pane)}: and ${more} more problems`))
+  }
+  return out
+}
+
+// The Data panel. ui: { span: 'session'|'boot', view: 'divergence'|'base'|'pr',
+// open: the index of the collection shown in full, or null }. data: the last
+// answer of GET /api/data, or null before one came (failed: the read failed).
+function dataNodes(data, ui, failed = false) {
+  if (!data) return [node('p', 'stepSub', failed ? 'The data checks couldn\'t be read yet.' : 'Reading the data checks…')]
+  if (data.available === false) return [node('p', 'stepSub', 'There is no inspector, so there are no data checks.')]
+  if (!data.active) return [node('p', 'stepSub', 'No session is ready.')]
+  if (data.closed) return [node('p', 'stepSub', 'The session ended.')]
+  const trust = trustLabel(data.trust)
+  const out = [node('div', 'dataHead', undefined, {
+    children: [
+      node('span', `chip${trust.warn ? ' warn' : ''}`, trust.text, { title: trust.title }),
+      node('span', 'stepSub', `${baselineText(data)}${data.rebaselined ? ' (re-baselined)' : ''} · compared ${data.comparedAt ? clockTime(data.comparedAt) : '—'}`),
+      node('button', 'secondary', 'Snapshot now', { act: 'snapshot' }),
+      node('button', 'ghost', 'Re-baseline', { act: 'rebaseline' }),
+    ],
+  })]
+  const toggle = (group, value, text) => node('button', `secondary${ui[group] === value ? ' on' : ''}`, text, { act: `${group}:${value}` })
+  out.push(node('div', 'dataToggles', undefined, {
+    children: [
+      toggle('span', 'session', 'Session'), toggle('span', 'boot', 'Boot'),
+      toggle('view', 'divergence', 'Divergence'), toggle('view', 'base', 'Base'), toggle('view', 'pr', 'PR'),
+    ],
+  }))
+  out.push(...errorNodes(data, ui.span))
+  const span = data[ui.span]
+  if (!span) {
+    // before any snapshot; after one, a span with nothing at all is unknown
+    if (ui.span === 'session' && data.comparedAt) {
+      out.push(node('ul', 'flags', undefined, { children: [node('li', 'flag red', UNREADABLE.neither)] }))
+      return out
+    }
+    out.push(node('p', 'stepSub', ui.span === 'session' ? 'Nothing to compare yet: take a snapshot with Snapshot now.' : 'No boot span yet: the panes\' ready snapshots haven\'t been taken.'))
+    return out
+  }
+  const flagsOf = span.flags || []
+  const reason = (flagsOf.find(f => f.kind === 'unreadable') || {}).reason
+  // why a span is incomplete, per pane: a base pane missing excuses
+  // nothing; a PR pane missing leaves its changes unknown; windows that
+  // differ excuse nothing; an answer too big lists nothing
+  const missing = ['base', 'pr'].filter(pane => !span[pane])
+  if (span.unlisted) {
+    out.push(node('p', 'dataErr', 'This span\'s details were too big to list: its counts and first red flags are below, and nothing else.'))
+  } else {
+    if (!span.base) out.push(node('p', 'dataErr', 'Incomplete: the BASE pane has no data for this span, so nothing it did can excuse a change.'))
+    if (!span.pr) {
+      out.push(node('p', 'dataErr', reason === 'baseline'
+        ? 'Incomplete: the PR pane\'s baseline is this snapshot, so it has no changes to show yet.'
+        : 'Incomplete: the PR pane has no data for this span, so its changes are unknown.'))
+    }
+  }
+  if (span.aligned === false) {
+    out.push(node('p', 'dataErr', `Incomplete: the panes' windows differ (a pane's ready read failed, and a later snapshot is its baseline), so nothing in the base pane can excuse a change. ${ui.span === 'session' ? 'Re-baseline to compare both from one moment.' : 'The boot span stays as it was: a Re-baseline aligns only the session span.'}`))
+  }
+  // the flags, red first, at most SHOWN_FLAGS, and how many more there are
+  const flags = [...flagsOf].sort((a, b) => (a.severity === 'red' ? 0 : 1) - (b.severity === 'red' ? 0 : 1))
+  const total = Math.max(flagTotal({ ...span, flags }), flags.length)
+  if (total || !span.pr) {
+    const items = flags.slice(0, SHOWN_FLAGS).map(f => node('li', `flag ${f.severity === 'red' ? 'red' : 'amber'}`, flagText(f)))
+    if (!span.pr && !span.unlisted && !flags.some(f => f.kind === 'unreadable')) items.unshift(node('li', 'flag red', flagText({ kind: 'unreadable' })))
+    const shownFlags = items.length
+    if (total > shownFlags) items.push(node('li', 'stepSub', `and ${total - shownFlags} more flags`))
+    out.push(node('ul', 'flags', undefined, { children: items }))
+  } else out.push(node('p', 'stepSub', 'No destructive change.'))
+  if (span.unlisted) return out
+  if (ui.view === 'divergence' && !span.divergence) {
+    out.push(node('p', 'stepSub', `No divergence: it needs both panes' data, and the ${missing.map(paneName).join(' and ')} pane has none for this span.`))
+    return out
+  }
+  const pane = ui.view === 'divergence' ? null : span[ui.view]
+  if (ui.view !== 'divergence' && !pane) {
+    out.push(node('p', 'stepSub', `The ${paneName(ui.view)} pane has no data for this span.`))
+    return out
+  }
+  const names = spanCollections(span, ui.view)
+  const rowsOf = name => {
+    if (ui.view === 'divergence') {
+      const c = span.divergence.collections[name]
+      return [isolated(name), deltaText(c.counts.base), deltaText(c.counts.pr), statusText(c)]
+    }
+    const c = pane.collections[name]
+    const counts = c.counts || { inserted: c.inserted.length, updated: c.updated.length, deleted: c.deleted.length }
+    return [isolated(name), statusText(c), deltaText(counts), `${countText(c.countBefore)} → ${countText(c.countAfter)}`]
+  }
+  const head = ui.view === 'divergence' ? ['collection', 'base', 'PR', 'status'] : ['collection', 'status', 'rows', 'count']
+  const shown = names.slice(0, SHOWN_COLLECTIONS)
+  out.push(node('table', 'dataTable', undefined, {
+    children: [
+      node('tr', undefined, undefined, { children: head.map(h => node('th', undefined, h)) }),
+      ...shown.map((name, i) => node('tr', ui.open === i ? 'on' : undefined, undefined, {
+        act: `open:${i}`, children: rowsOf(name).map(text => node('td', undefined, text)),
+      })),
+    ],
+  }))
+  const all = collectionsTotal(span, ui.view)
+  if (all > shown.length) out.push(node('p', 'stepSub', `and ${all - shown.length} more collections`))
+  if (ui.open !== null && ui.open !== undefined && shown[ui.open] !== undefined) out.push(...collectionNodes(span, ui.view, shown[ui.open]))
+  return out
+}
+
+// A collection in full: its changes, at most SHOWN_ROWS a list, and how
+// many more there are of each.
+function collectionNodes(span, view, name) {
+  const list = (title, items, total, text) => {
+    if (!total) return []
+    const shown = items.slice(0, SHOWN_ROWS).map(item => node('li', undefined, text(item)))
+    if (total > shown.length) shown.push(node('li', 'stepSub', `and ${total - shown.length} more`))
+    return [node('h3', undefined, title), node('ul', 'changes', undefined, { children: shown })]
+  }
+  const out = [node('h3', 'dataName', isolated(name))]
+  if (view === 'divergence') {
+    const c = span.divergence.collections[name]
+    const valueOf = (kind, value) => (value === null ? '—' : kind === 'update' ? fieldsText(value) : rowText(value))
+    const total = c.changesCount ?? c.changes.length
+    out.push(...list('Changes', c.changes, total, ch => (ch.key === null
+      ? `${label(KIND_LABELS, ch.kind)} ${isolated(ch.field)}: ${label(STATUS_LABELS, ch.status)}`
+      : `${isolated(ch.kind)} ${keyText(ch.key)}: ${label(STATUS_LABELS, ch.status)} · base ${valueOf(ch.kind, ch.base)} · PR ${valueOf(ch.kind, ch.pr)}`)))
+    if (!total) out.push(node('p', 'stepSub', c.status === 'unknown' ? 'Truncated: only its counts are compared.' : 'No change by key to show.'))
+    return out
+  }
+  const c = span[view].collections[name]
+  const counts = c.counts || { inserted: c.inserted.length, updated: c.updated.length, deleted: c.deleted.length }
+  out.push(...list('Inserted', c.inserted, counts.inserted, r => keyed(r.key, rowText(r.row))))
+  out.push(...list('Updated', c.updated, counts.updated, u => keyed(u.key, fieldsText(u.fields))))
+  out.push(...list('Deleted', c.deleted, counts.deleted, r => keyed(r.key, rowText(r.row))))
+  for (const [title, fields, total] of [['Fields dropped', c.fieldsDropped, counts.fieldsDropped], ['Fields added', c.fieldsAdded, counts.fieldsAdded]]) {
+    if (!fields || !fields.length) continue
+    const more = Number.isSafeInteger(total) ? total - fields.length : 0
+    out.push(node('p', 'stepSub', `${title}: ${fields.map(isolated).join(', ')}${more > 0 ? `, and ${more} more` : ''}`))
+  }
+  if (c.truncated) out.push(node('p', 'stepSub', 'Truncated: only its count is compared.'))
+  return out
+}
+
+// The Actions panel's state, from GET /api/actions answers: a fresh one, and
+// one with an answer read in. An answer from another log (a new session)
+// starts over, and `again` says to read from 0 now; none active empties it.
+function actionsFresh() {
+  return { log: null, seq: 0, requests: new Map(), marks: new Map(), counts: null, active: false, again: false }
+}
+function mergeActions(state, answer) {
+  if (!answer || !answer.active) return actionsFresh()
+  if (state.log !== null && answer.log !== state.log) return { ...actionsFresh(), again: true }
+  const requests = new Map(state.requests)
+  for (const r of answer.requests || []) requests.set(r.seq, r)
+  const marks = new Map(state.marks)
+  for (const m of answer.marks || []) marks.set(m.seq, m)
+  const trim = (map, most) => { if (map.size > most) for (const seq of [...map.keys()].sort((a, b) => a - b).slice(0, map.size - most)) map.delete(seq) }
+  trim(requests, KEPT_REQUESTS)
+  trim(marks, KEPT_MARKS)
+  return {
+    log: answer.log, seq: answer.seq, requests, marks, active: true, again: false, more: answer.more === true,
+    counts: { dropped: answer.dropped, refused: answer.refused, marksDropped: answer.marksDropped },
+  }
+}
+
+// Which mark a request most likely came from, as README's GET /api/actions
+// says: of the marks no more than GROUP_MS after it started, its own pane's
+// nearest within GROUP_MS either side, else the nearest; the earlier (then
+// the lower seq) on a tie; null when no mark is that early (the landing).
+// marks: in time order, then seq order.
+const GROUP_MS = 300
+function firstAfter(marks, t) { // the first mark later than t
+  let lo = 0
+  let hi = marks.length
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (marks[mid].at <= t) lo = mid + 1; else hi = mid }
+  return lo
+}
+function firstFrom(marks, t) { // the first mark at t or later
+  let lo = 0
+  let hi = marks.length
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (marks[mid].at < t) lo = mid + 1; else hi = mid }
+  return lo
+}
+function markOf(request, marks) {
+  const t = request.at
+  const end = firstAfter(marks, t + GROUP_MS) // marks[0, end) are early enough
+  if (end === 0) return null
+  let own = null
+  for (let i = firstFrom(marks, t - GROUP_MS); i < end; i++) {
+    const m = marks[i]
+    if (m.pane === request.pane && (own === null || Math.abs(m.at - t) < Math.abs(own.at - t))) own = m
+  }
+  if (own) return own.seq
+  const p = firstAfter(marks, t)
+  const before = p > 0 ? marks[firstFrom(marks, marks[p - 1].at)] : null // the latest at or before t, the first of its time
+  const after = p < end ? marks[p] : null
+  if (!after) return before.seq
+  if (!before) return after.seq
+  return t - before.at <= after.at - t ? before.seq : after.seq
+}
+
+// The Actions panel: each action the panes reported, newest last, with the
+// requests it most likely set off, after the landing's. Grouped afresh each
+// time, since a mark can come after the requests it set off.
+function actionsNodes(state) {
+  if (!state.active) return [node('p', 'stepSub', 'No session is ready.')]
+  const marks = [...state.marks.values()].sort((a, b) => a.at - b.at || a.seq - b.seq)
+  const groups = new Map()
+  for (const r of [...state.requests.values()].sort((a, b) => a.seq - b.seq)) {
+    const key = markOf(r, marks)
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(r)
+  }
+  const shown = marks.slice(-SHOWN_ACTIONS)
+  const out = []
+  if (groups.has(null) && shown.length === marks.length) out.push(groupNode('Landing, before any action', groups.get(null)))
+  if (marks.length > shown.length) out.push(node('p', 'stepSub', `${marks.length - shown.length} earlier actions not shown`))
+  for (const m of shown) out.push(groupNode(`${clockTime(m.at)} ${isolated(m.type)}, reported by the ${paneName(m.pane)} pane`, groups.get(m.seq) || []))
+  if (!out.length) out.push(node('p', 'stepSub', 'Nothing yet: the panes\' requests show here.'))
+  const c = state.counts
+  if (c) {
+    const refused = pane => Object.entries((c.refused && c.refused[pane]) || {}).map(([reason, n]) => `${isolated(reason)} ${n}`).join(', ') || 'none'
+    out.push(node('p', 'stepSub', `dropped: BASE ${c.dropped.base}, PR ${c.dropped.pr} · refused: BASE ${refused('base')}; PR ${refused('pr')} · marks dropped: BASE ${c.marksDropped.base}, PR ${c.marksDropped.pr}`))
+  }
+  return out
+}
+
+function groupNode(title, requests) {
+  return node('div', 'action', undefined, {
+    children: [
+      node('div', 'actionHead', title),
+      ...requests.map(r => node('div', 'request', `${paneName(r.pane)} ${isolated(r.method)} ${isolated(r.path)} ${r.status || '—'} ${r.ms} ms${r.aborted ? ' (aborted)' : ''}`)),
+    ],
+  })
+}
+
 // The ticket an invite link carries in its fragment (#enrol=<ticket>), else
 // null. The fragment never reaches a server or a Referer.
 function inviteFromHash(hash) {
@@ -130,6 +547,7 @@ function inviteFromHash(hash) {
     path: { base: '', pr: '' }, lastMsg: { base: 0, pr: 0 }, hasNav: { base: false, pr: false },
     unmatched: { base: 0, pr: 0 },
     es: null, idlePoll: null, dotPoll: null, notesTimer: null, confirmTimer: null, pendingVerdict: null, strict: false,
+    dataAvailable: false,
   }
 
   // --- router --------------------------------------------------------------
@@ -145,6 +563,7 @@ function inviteFromHash(hash) {
 
   function showView(id) {
     for (const v of ['enrol', 'picker', 'boot', 'session', 'verdictDone']) $(v).hidden = v !== id
+    pollActions()
     $('sessionControls').hidden = id !== 'session'
     $('verdictBar').hidden = id !== 'session'
     $('inviteBtn').hidden = id === 'enrol'
@@ -244,7 +663,10 @@ function inviteFromHash(hash) {
   async function render() {
     const route = parseHash()
     let s
-    try { s = await api('/state'); showOriginNotice(s.harnessOrigin); S.strict = s.requireIsolation === true; showIsolation(s.status === 'idle' ? null : s.isolation) } catch (e) {
+    try {
+      s = await api('/state'); showOriginNotice(s.harnessOrigin); S.strict = s.requireIsolation === true; showIsolation(s.status === 'idle' ? null : s.isolation)
+      S.dataAvailable = Boolean(s.data && s.data.available === true)
+    } catch (e) {
       if (e && e.capability) return // enrolment takes over
       // At another host or port than the harness origin's, the API refuses a
       // browser (403 not the harness origin) and names the origin instead.
@@ -509,6 +931,7 @@ function inviteFromHash(hash) {
       $('baseUrl').textContent = 'signing in…'; $('prUrl').textContent = 'signing in…'
       restoreDraft(pr)
       startIdlePoll(); startDotPoll()
+      mountPanels()
       announce('QA session ready')
     }
     $('sessionMeta').innerHTML = meta.baseTag ? `#${pr} · <span class="tag">${esc(tagOf(meta.baseTag))}</span> vs <span class="tag">${esc(tagOf(meta.prTag))}</span>` : `#${pr}`
@@ -521,6 +944,7 @@ function inviteFromHash(hash) {
     if (S.dotPoll) { clearInterval(S.dotPoll); S.dotPoll = null }
     $('baseFrame').removeAttribute('src'); $('prFrame').removeAttribute('src')
     hideVerdictBody()
+    unmountPanels()
   }
 
   const paneOf = origin => origin === S.paneOrigins[0] ? 'base' : origin === S.paneOrigins[1] ? 'pr' : null
@@ -596,6 +1020,126 @@ function inviteFromHash(hash) {
     if (now - (lastMark.get(kind) ?? -Infinity) < 100) return
     lastMark.set(kind, now)
     postJson('/actions/mark', { pane, type }).catch(() => {})
+  }
+
+  // --- #8: the Data and Actions panels ---------------------------------------
+  // Drawn from plain nodes (dataNodes, actionsNodes) with textContent only:
+  // what they show comes from the panes, which PR code controls.
+  function buildNode(n) {
+    const el = document.createElement(n.tag)
+    if (n.cls) el.className = n.cls
+    if (n.text !== undefined) el.textContent = drawnText(n.text)
+    if (n.title) el.title = drawnText(n.title)
+    if (n.act) el.dataset.act = n.act
+    for (const child of n.children || []) el.append(buildNode(child))
+    return el
+  }
+  function drawNodes(id, nodes) {
+    const el = $(id); el.textContent = ''
+    for (const n of nodes) el.append(buildNode(n))
+  }
+
+  const DATA_UI = () => ({ span: 'session', view: 'divergence', open: null })
+  const D = { open: false, data: null, ui: DATA_UI(), busy: false, failed: false }
+  const A = { open: false, state: actionsFresh(), timer: null, reading: false }
+
+  function showDataBadge() {
+    const n = dataBadge(D.data); const b = $('dataBadge')
+    b.hidden = n === 0; b.textContent = String(n)
+    $('dataBtn').title = n ? `Data checks (d): ${n} red flag${n === 1 ? '' : 's'}` : 'Data checks (d)'
+  }
+  function drawData() { drawNodes('dataBody', dataNodes(D.data, D.ui, D.failed)); showDataBadge() }
+  async function loadData() {
+    const mounted = S.mounted
+    let data
+    try {
+      data = await api('/data')
+    } catch (err) {
+      if (S.mounted !== mounted) return
+      if (!err.capability) $('dataStatus').textContent = `Couldn't read the data checks: ${err.message}`
+      D.failed = true; drawData()
+      return
+    }
+    if (S.mounted !== mounted) return // another session's view now
+    D.data = data; D.failed = false; $('dataStatus').textContent = ''
+    drawData()
+  }
+  // Snapshot now, or Re-baseline: the answer is the data checks as they now stand.
+  async function takeSnapshot(rebaseline) {
+    if (D.busy) return
+    const mounted = S.mounted
+    D.busy = true; $('dataStatus').textContent = rebaseline ? 'Re-baselining…' : 'Taking a snapshot…'
+    try {
+      const data = await postJson('/data/snapshot', { rebaseline })
+      if (S.mounted !== mounted) return // another session's view now
+      D.data = data; D.failed = false
+      $('dataStatus').textContent = ''
+      drawData()
+      const n = dataBadge(D.data)
+      announce(rebaseline ? 'Re-baselined: now is the baseline' : `Snapshot taken: ${n} red flag${n === 1 ? '' : 's'}`)
+    } catch (err) {
+      if (S.mounted === mounted && !err.capability) $('dataStatus').textContent = `${rebaseline ? 'Re-baseline' : 'Snapshot'} failed: ${err.message}`
+    } finally { D.busy = false }
+  }
+  function setDataPanel(open) {
+    D.open = open; $('dataPanel').hidden = !open; $('dataBtn').classList.toggle('on', open)
+    if (open) { drawData(); loadData() }
+  }
+  $('dataBtn').onclick = () => setDataPanel(!D.open)
+  $('dataClose').onclick = () => setDataPanel(false)
+  $('dataBody').addEventListener('click', e => {
+    const el = e.target.closest('[data-act]'); if (!el) return
+    const act = el.dataset.act
+    if (act === 'snapshot' || act === 'rebaseline') return takeSnapshot(act === 'rebaseline')
+    const [group, value] = act.split(':')
+    if (group === 'span' || group === 'view') { D.ui[group] = value; D.ui.open = null }
+    else if (group === 'open') D.ui.open = D.ui.open === +value ? null : +value
+    drawData()
+  })
+
+  // The action log, read on from where the last read ended, a few pages at a
+  // time: another session's log starts it over from 0.
+  async function readActions() {
+    if (A.reading) return
+    A.reading = true
+    const mounted = S.mounted
+    try {
+      for (let pages = 0; pages < 5; pages++) {
+        const answer = await api(`/actions?after=${A.state.seq}&limit=500`)
+        if (S.mounted !== mounted) return
+        A.state = mergeActions(A.state, answer)
+        if (!A.state.again && !A.state.more) break
+      }
+      $('actionsStatus').textContent = ''
+    } catch (err) {
+      if (!err.capability) $('actionsStatus').textContent = `Couldn't read the action log: ${err.message}`
+    } finally { A.reading = false }
+    if (S.mounted === mounted) drawNodes('actionsBody', actionsNodes(A.state))
+  }
+  function setActionsPanel(open) {
+    A.open = open; $('actionsPanel').hidden = !open; $('actionsBtn').classList.toggle('on', open)
+    pollActions()
+  }
+  // Read while the panel is open and in view: not on the verdict-done view,
+  // say, where it can't be seen.
+  function pollActions() {
+    const want = A.open && !$('session').hidden
+    if (want && !A.timer) { readActions(); A.timer = setInterval(readActions, 2000) }
+    if (!want && A.timer) { clearInterval(A.timer); A.timer = null }
+  }
+  $('actionsBtn').onclick = () => setActionsPanel(!A.open)
+  $('actionsClose').onclick = () => setActionsPanel(false)
+
+  // A newly mounted session starts both panels afresh.
+  function mountPanels() {
+    D.data = null; D.failed = false; D.ui = DATA_UI(); A.state = actionsFresh()
+    $('dataBtn').hidden = !S.dataAvailable
+    showDataBadge()
+    if (S.dataAvailable) loadData()
+  }
+  function unmountPanels() {
+    setActionsPanel(false); setDataPanel(false)
+    D.data = null; D.failed = false; A.state = actionsFresh()
   }
 
   function startDotPoll() {
@@ -722,9 +1266,11 @@ function inviteFromHash(hash) {
     const t = e.target
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return
     if ($('session').hidden) return
-    const keys = ['m', 's', 'r', '1', '2', '3', 'v', 'e']
+    const keys = ['m', 's', 'r', '1', '2', '3', 'v', 'e', 'd', 'a']
     if (keys.includes(e.key)) e.preventDefault()
     switch (e.key) {
+      case 'd': if (S.dataAvailable) setDataPanel(!D.open); break
+      case 'a': setActionsPanel(!A.open); break
       case 'm': setMirror(!S.mirror); break
       case 's': $('scrollMirror').checked = !$('scrollMirror').checked; S.scrollMirror = $('scrollMirror').checked; break
       case 'r': $('resyncBtn').click(); break
@@ -733,7 +1279,11 @@ function inviteFromHash(hash) {
       case '3': setWidth(0); break
       case 'v': toggleVerdict(); break
       case 'e': $('teardownBtn').click(); break
-      case 'Escape': $('teardownBtn')._disarm && $('teardownBtn')._disarm(); if (!$('verdictBody').hidden) hideVerdictBody(); break
+      case 'Escape':
+        $('teardownBtn')._disarm && $('teardownBtn')._disarm()
+        if (!$('verdictBody').hidden) hideVerdictBody()
+        else if (D.open || A.open) { setDataPanel(false); setActionsPanel(false) }
+        break
     }
   })
   $('shortcutsClose').onclick = () => $('shortcuts').close()
@@ -775,5 +1325,8 @@ function inviteFromHash(hash) {
 // --- test exports (node --test evaluates this file through a CJS wrapper) ---
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { esc, isHttpsUrl, LABELS, harnessOriginNotice, buildSummary, buildFromEvent, inviteFromHash, isCapabilityRefusal, isolationLabel }
+  module.exports = {
+    esc, isHttpsUrl, LABELS, harnessOriginNotice, buildSummary, buildFromEvent, inviteFromHash, isCapabilityRefusal, isolationLabel,
+    cellText, keyText, trustLabel, flagText, dataBadge, dataNodes, actionsFresh, mergeActions, markOf, actionsNodes, drawnText,
+  }
 }
