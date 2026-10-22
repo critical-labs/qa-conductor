@@ -6,8 +6,9 @@
 // daemon runs.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { createDocker } from '../lib/docker.mjs'
-import { createDockerProvisioner } from '../lib/adapters/provisioner-docker.mjs'
+import { dockerEngineMajor, createDockerProvisioner } from '../lib/adapters/provisioner-docker.mjs'
 import { bootSession, migrateImageFor, teardownSession } from '../lib/session.mjs'
 
 const BASE_IMG = 'ghcr.io/x/app:1.0.0-rc.38'
@@ -33,10 +34,12 @@ function recordingExec({ answer = () => null } = {}) {
 function recordingFs() {
   const files = new Map()
   const removed = []
+  const writes = [] // [path, text], every write in order
   return {
     files,
     removed,
-    writeFile: async (path, text, opts) => { files.set(path, { text, mode: opts?.mode }) },
+    writes,
+    writeFile: async (path, text, opts) => { files.set(path, { text, mode: opts?.mode }); writes.push([path, text]) },
     unlink: async path => { removed.push(path) },
   }
 }
@@ -54,8 +57,21 @@ function makeDocker(exec) {
   })
 }
 
-function makeSession({ provisionerOptions = {}, answer } = {}) {
-  const exec = recordingExec({ answer })
+// What a healthy internal topology answers when read back: the network is
+// internal, the forwarder runs and says it is ready. A test's own answer wins.
+function topologyAnswers(args) {
+  const c = args.join(' ')
+  if (c === 'network inspect --format {{.Internal}} qa-session-pr') return 'true\n'
+  if (c === 'inspect --format {{.State.Running}} qa-fwd-pr') return 'true\n'
+  if (args[0] === 'logs' && args.at(-1) === 'qa-fwd-pr') return 'qa-forwarder ready\n'
+  // on Podman, the addresses the PR pane's hosts file gets
+  if (c === 'inspect --format {{with index .NetworkSettings.Networks "qa-session-pr"}}{{.IPAddress}}{{end}} qa-pg-pr') return '172.20.0.3\n'
+  if (c === 'inspect --format {{with index .NetworkSettings.Networks "qa-session-pr"}}{{.IPAddress}}{{end}} qa-fwd-pr') return '172.20.0.2\n'
+  return null
+}
+
+function makeSession({ provisionerOptions = {}, answer = () => null } = {}) {
+  const exec = recordingExec({ answer: async (args, opts) => (await answer(args, opts)) ?? topologyAnswers(args) })
   const fsx = recordingFs()
   const provisioner = createDockerProvisioner({ docker: makeDocker(exec), fsx, workDir: WORK, ...provisionerOptions })
   const dsns = {}
@@ -188,9 +204,9 @@ test('teardown removes each pane\'s own network, and sweep removes both and the 
   // and with it the last endpoint that would keep the network alive.
   assert.deepEqual(runs(s.exec).filter(c => c.args.includes('--rm')).map(c => valueOf(c.args, '--name')), ['qa-migrate-base', 'qa-migrate-pr'])
   assert.deepEqual(teardown, [
-    'rm -f -v qa-app-base qa-migrate-base qa-pg-base',
+    'rm -f -v qa-app-base', 'rm -f -v qa-migrate-base', 'rm -f -v qa-pg-base',
     'network rm qa-session-base',
-    'rm -f -v qa-app-pr qa-migrate-pr qa-probe-pr qa-pg-pr',
+    'rm -f -v qa-app-pr', 'rm -f -v qa-migrate-pr', 'rm -f -v qa-probe-pr', 'rm -f -v qa-pg-pr',
     'network rm qa-session-pr',
   ])
   assert.deepEqual(s.fsx.removed, [`${WORK}/.env.qa-base`, `${WORK}/.env.qa-pr`])
@@ -254,8 +270,8 @@ test('teardown and sweep reject when docker can\'t remove a container or network
   assert.match(out.failed[1].message, /could not kill/)
   // every step was still tried: the network, and the env file with its password
   assert.deepEqual(docker(s.exec).map(c => c.args.join(' ')), [
-    'rm -f -v qa-app-base qa-migrate-base qa-pg-base', 'network rm qa-session-base',
-    'rm -f -v qa-app-pr qa-migrate-pr qa-probe-pr qa-pg-pr', 'network rm qa-session-pr',
+    'rm -f -v qa-app-base', 'rm -f -v qa-migrate-base', 'rm -f -v qa-pg-base', 'network rm qa-session-base',
+    'rm -f -v qa-app-pr', 'rm -f -v qa-migrate-pr', 'rm -f -v qa-probe-pr', 'rm -f -v qa-pg-pr', 'network rm qa-session-pr',
   ])
   assert.deepEqual(s.fsx.removed, [`${WORK}/.env.qa-base`, `${WORK}/.env.qa-pr`])
 
@@ -568,9 +584,9 @@ function probeDocker({
     if (args[0] === 'version') return version
     if (args[0] === 'info') return os
     if (args[0] === 'context' && args[1] === 'inspect') return endpoint
-    if (args[0] === 'network' && args[1] === 'inspect') return gateway
-    if (args[0] === 'inspect') return args.at(-1) === 'qa-pg-pr' ? pr : base
-    if (args[0] === 'run' && args.includes('qa-probe-pr')) return typeof probe === 'function' ? probe(opts) : probe
+    if (args[0] === 'network' && args[1] === 'inspect' && args.includes('{{range .IPAM.Config}}{{.Gateway}} {{end}}')) return gateway
+    if (args[0] === 'inspect' && /^qa-pg-/.test(args.at(-1))) return args.at(-1) === 'qa-pg-pr' ? pr : base
+    if (args[0] === 'run' && args.includes('qa-probe-pr')) return typeof probe === 'function' ? probe(opts, args) : probe
     return null
   }
 }
@@ -580,6 +596,16 @@ const probeRun = exec => runs(exec).find(c => valueOf(c.args, '--name') === 'qa-
 // `--`, the addresses it only connects to, `--`, then its own pane's
 // database, which it must reach.
 const probeArgs = call => call.args.slice(call.args.indexOf('probe') + 1)
+// The targets the probe asks the forwarder's proxy for: past the third `--`,
+// after the proxy itself.
+const proxyTargets = args => {
+  const own = args.slice(args.indexOf('probe') + 1)
+  const parts = own.join('\u0000').split('\u0000--\u0000').map(part => part.split('\u0000'))
+  return parts.length > 3 ? parts[3].slice(1) : []
+}
+// A clean probe with the topology up: its own database, and every target
+// refused by the proxy.
+const refusedAll = (lines = 'self 172.20.0.3:5432\n') => (opts, args) => `${lines}${proxyTargets(args).map(t => `refused ${t}\n`).join('')}probe done\n`
 
 test('the probe runs on the PR network once both databases exist and before any migrate, gone when done, with no ports, mounts or capabilities', async () => {
   const s = makeSession({ answer: probeDocker() })
@@ -715,7 +741,7 @@ test('the probe doesn\'t run once the boot is aborted, and a teardown removes on
   await assert.rejects(t.provisioner.isolation({ signal: late.signal, canary: CANARY }), err => err.name === 'AbortError')
   assert.equal(probeRun(t.exec), undefined)
   await s.provisioner.teardown({ paneRef: { role: 'pr' } })
-  assert.deepEqual(docker(s.exec).map(c => c.args.join(' ')).at(-2), 'rm -f -v qa-app-pr qa-migrate-pr qa-probe-pr qa-pg-pr')
+  assert.deepEqual(docker(s.exec).map(c => c.args.join(' ')).slice(-5, -1), ['rm -f -v qa-app-pr', 'rm -f -v qa-migrate-pr', 'rm -f -v qa-probe-pr', 'rm -f -v qa-pg-pr'])
 })
 
 // The probe's script, run here with bash against loopback listeners: one that
@@ -883,4 +909,589 @@ test('a probe aborted mid-run rejects as aborted', async () => {
   const running = s.provisioner.isolation({ signal: ac.signal, canary: CANARY })
   setTimeout(() => ac.abort(), 20)
   await assert.rejects(running, err => err.name === 'AbortError')
+})
+
+// --- #32: the PR pane on an internal network -------------------------------------
+// With `internal`, the PR pane's containers join a network with no route off
+// itself. A forwarder (lib/forwarder.mjs), on an ordinary network and joined
+// to the internal one as `qa-egress`, publishes the PR app on the host's
+// loopback and is its only way out: an HTTP proxy that lets it out only to
+// hosts on the allowlist. If any of that can't be set up, the PR pane runs as
+// it would without `internal`.
+
+const FORWARDER_SOURCE = readFileSync(new URL('../lib/forwarder.mjs', import.meta.url), 'utf8')
+const INTERNAL = { internal: { egress: ['api.example.com', '*.stripe.com'] } }
+const PROXY_ENV = {
+  HTTP_PROXY: 'http://qa-egress:3128', HTTPS_PROXY: 'http://qa-egress:3128', http_proxy: 'http://qa-egress:3128', https_proxy: 'http://qa-egress:3128',
+  NO_PROXY: 'localhost,127.0.0.1,::1,qa-pg-pr,qa-app-pr', no_proxy: 'localhost,127.0.0.1,::1,qa-pg-pr,qa-app-pr', NODE_USE_ENV_PROXY: '1',
+}
+const envOf = text => Object.fromEntries(text.trim().split('\n').map(line => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]))
+const argvOf = exec => docker(exec).map(c => c.args.join(' '))
+const fwdRun = exec => runs(exec).find(c => valueOf(c.args, '--name') === 'qa-fwd-pr')
+// a docker failure, as the CLI reports it; and a log to read back
+const failWith = text => Object.assign(new Error('docker: Command failed'), { stderr: `${text}\n` })
+const logged = () => {
+  const lines = []
+  // only error: the README promises the fallback goes through log.error
+  return { lines, log: { log() {}, error: line => lines.push(line), warn() {} } }
+}
+
+test('with internal, the PR pane joins an internal network, and a forwarder on an ordinary one publishes its app and is its only way out', async () => {
+  const s = makeSession({ provisionerOptions: INTERNAL })
+  // the EnvTransform's own proxy: the forwarder's wins in the PR pane alone
+  const derive = s.deps.adapters.envTransform.derivePaneEnv
+  s.deps.adapters.envTransform.derivePaneEnv = args => ({ app: { ...derive(args).app, HTTPS_PROXY: 'http://corp-proxy:8080' } })
+  assert.equal(s.provisioner.internal, true)
+  await bootSession(s.deps, 7)
+  const calls = argvOf(s.exec)
+  const at = start => {
+    const i = calls.findIndex(c => c.startsWith(start))
+    assert.ok(i !== -1, `${start}\n${calls.join('\n')}`)
+    return i
+  }
+  // the edge network, the internal one, the forwarder's image, the forwarder,
+  // then the forwarder joins the internal network: all before the PR pane's
+  // database
+  const order = [
+    'network create --label qa-conductor-session qa-session-pr-edge',
+    'network create --label qa-conductor-session --internal qa-session-pr',
+    'image inspect node:22-alpine',
+    'run -d --name qa-fwd-pr',
+    'network connect --alias qa-egress qa-session-pr qa-fwd-pr',
+    'run -d --name qa-pg-pr',
+  ].map(at)
+  assert.deepEqual(order, [...order].sort((a, b) => a - b), 'in that order')
+  assert.equal(calls.filter(c => c.startsWith('network create')).length, 3, 'the base pane\'s, the edge and the internal one')
+
+  const fwd = fwdRun(s.exec)
+  assert.equal(valueOf(fwd.args, '--network'), 'qa-session-pr-edge')
+  assert.equal(valueOf(fwd.args, '-p'), '127.0.0.1:3112:3000')
+  assert.deepEqual(JSON.parse(valueOf(fwd.args, '-e').replace(/^PANE_FORWARDER=/, '')), {
+    host: '0.0.0.0', forward: { listen: 3000, to: 'qa-app-pr:3000' }, proxy: { listen: 3128, allow: ['api.example.com', '*.stripe.com'] },
+  })
+  assert.equal(fwd.args.at(-1), FORWARDER_SOURCE, 'the forwarder\'s file, as it is')
+  for (const flag of ['--env-file', '-v', '--volume', '--mount', '--privileged']) assert.equal(fwd.args.includes(flag), false, flag)
+
+  // every other container of the PR pane is on the internal network alone,
+  // and its app publishes nothing: the forwarder publishes its port
+  for (const { args } of runs(s.exec).filter(c => roleOf(c.args) === 'pr' && valueOf(c.args, '--name') !== 'qa-fwd-pr')) {
+    assert.equal(valueOf(args, '--network'), 'qa-session-pr', args.join(' '))
+  }
+  const app = role => runs(s.exec).find(c => valueOf(c.args, '--name') === `qa-app-${role}`).args
+  assert.equal(app('pr').includes('-p'), false)
+  assert.equal(valueOf(app('base'), '-p'), '127.0.0.1:3111:3000')
+
+  // the proxy's settings, in the PR pane's env for its migrate run and its app
+  const writes = s.fsx.writes.filter(([path]) => path.endsWith('.env.qa-pr'))
+  assert.equal(writes.length, 2)
+  for (const [, text] of writes) {
+    const env = envOf(text)
+    for (const [key, value] of Object.entries(PROXY_ENV)) assert.equal(env[key], value, key)
+    assert.match(env.DATABASE_URL, /^postgresql:\/\/qa:[0-9a-f]{48}@qa-pg-pr:5432$/)
+  }
+  const base = envOf(s.fsx.files.get(`${WORK}/.env.qa-base`).text)
+  assert.equal(base.HTTPS_PROXY, 'http://corp-proxy:8080')
+  for (const key of ['HTTP_PROXY', 'NO_PROXY', 'NODE_USE_ENV_PROXY']) assert.equal(base[key], undefined, key)
+
+  // the base pane is as it was
+  assert.deepEqual(runs(s.exec).filter(c => roleOf(c.args) === 'base').map(c => valueOf(c.args, '--network')), ['qa-session-base', 'qa-session-base', 'qa-session-base'])
+})
+
+test('without internal nothing changes, and internal: true means no egress at all', async () => {
+  const off = makeSession()
+  assert.equal(off.provisioner.internal, false)
+  await bootSession(off.deps, 7)
+  assert.equal(argvOf(off.exec).some(c => /qa-fwd-pr|--internal|-edge|network connect/.test(c)), false)
+  assert.equal(envOf(off.fsx.files.get(`${WORK}/.env.qa-pr`).text).HTTPS_PROXY, undefined)
+  const empty = makeSession({ provisionerOptions: { internal: true } })
+  await bootSession(empty.deps, 7)
+  assert.deepEqual(JSON.parse(valueOf(fwdRun(empty.exec).args, '-e').replace(/^PANE_FORWARDER=/, '')).proxy, { listen: 3128, allow: [] })
+  // another image for the forwarder
+  const own = makeSession({ provisionerOptions: { internal: { image: 'registry.example.com/node:22-alpine' } } })
+  await bootSession(own.deps, 7)
+  assert.equal(fwdRun(own.exec).args.at(-4), 'registry.example.com/node:22-alpine')
+})
+
+test('internal\'s options are checked as the Provisioner is made, so a typo never opens more than meant', () => {
+  const make = internal => createDockerProvisioner({ docker: makeDocker(recordingExec()), fsx: recordingFs(), workDir: WORK, internal })
+  for (const off of [undefined, null, false]) assert.equal(make(off).internal, false)
+  for (const [internal, re] of [
+    [{ egress: 'api.example.com' }, /^internal: the egress allowlist must be an array of hosts$/],
+    [{ egress: ['127.0.0.1'] }, /^internal: egress\[0\]: 127\.0\.0\.1 is loopback, which is always refused$/],
+    [{ egress: ['localhost'] }, /^internal: egress\[0\] must be a host name/],
+    [{ egress: ['api.example.com:http'] }, /^internal: egress\[0\] has a bad port/],
+    [{ image: '' }, /^internal\.image must be an image name/],
+    [{ image: 'node 22' }, /^internal\.image must be an image name/],
+    [{ egres: [] }, /^internal has no option "egres": egress or image$/],
+    ['yes', /^internal must be true, or \{ egress, image \}$/],
+    [['api.example.com'], /^internal must be true, or \{ egress, image \}$/],
+  ]) assert.throws(() => make(internal), { message: re }, JSON.stringify(internal))
+  // its edge network can't be the base pane's
+  assert.throws(() => createDockerProvisioner({ docker: makeDocker(recordingExec()), fsx: recordingFs(), workDir: WORK, network: { base: 'n-pr-edge', pr: 'n-pr' }, internal: true }), /the PR pane's edge network, n-pr-edge, is the base pane's/)
+})
+
+// If the internal network or the forwarder can't be set up, the PR pane runs
+// as it would without `internal`: on an ordinary network, its app published,
+// no proxy. Its isolation result says why, and carries no `internal`.
+test('a step of the internal topology that fails leaves the PR pane on an ordinary network, as without internal, and the verdict says why', async () => {
+  const fail = (match, text) => args => (match(args.join(' ')) ? Object.assign(new Error(`docker ${args[0]}: Command failed`), { stderr: `${text}\n` }) : null)
+  const steps = [
+    ['the edge network', fail(c => c === 'network create --label qa-conductor-session qa-session-pr-edge', 'Error response from daemon: could not find an available, non-overlapping IPv4 address pool')],
+    ['the internal network', fail(c => c.includes('--internal'), 'Error response from daemon: internal networks are not supported')],
+    ['the forwarder\'s image', fail(c => c.endsWith('node:22-alpine') && /^(image inspect|pull)/.test(c), 'Error response from daemon: pull access denied')],
+    ['the forwarder', fail(c => c.startsWith('run -d --name qa-fwd-pr'), 'Error response from daemon: port is already allocated')],
+    ['joining the networks', fail(c => c.startsWith('network connect'), 'Error response from daemon: network qa-session-pr not found')],
+  ]
+  for (const [step, answer] of steps) {
+    const probe = probeDocker({ os: 'Docker Desktop\n' })
+    const s = makeSession({ provisionerOptions: { ...INTERNAL, log: logged().log }, answer: (args, opts) => answer(args) ?? probe(args, opts) })
+    await bootSession(s.deps, 7)
+    const calls = argvOf(s.exec)
+    const ordinary = calls.lastIndexOf('network create --label qa-conductor-session qa-session-pr')
+    assert.ok(ordinary !== -1, `${step}: an ordinary network\n${calls.join('\n')}`)
+    assert.deepEqual(calls.slice(ordinary - 3, ordinary), ['rm -f -v qa-fwd-pr', 'network rm qa-session-pr', 'network rm qa-session-pr-edge'], `${step}: undone first`)
+    assert.ok(ordinary < calls.findIndex(c => c.startsWith('run -d --name qa-pg-pr')), step)
+    const app = runs(s.exec).find(c => valueOf(c.args, '--name') === 'qa-app-pr').args
+    assert.equal(valueOf(app, '-p'), '127.0.0.1:3112:3000', step)
+    assert.equal(envOf(s.fsx.files.get(`${WORK}/.env.qa-pr`).text).HTTPS_PROXY, undefined, step)
+    const out = await s.provisioner.isolation({ canary: CANARY })
+    assert.equal(out.internal, undefined, step)
+    assert.equal(out.verdict, 'reachable', step)
+    assert.match(out.reasons[0], /^Docker Desktop forwards/, step)
+    assert.match(out.reasons.at(-1), /^egress isn't restricted: the PR pane's internal network couldn't be set up \((Error response from daemon: |pull node:22-alpine failed after 3 attempts).+\)$/, step)
+    // and the probe went without the proxy's part
+    assert.equal(probeArgs(probeRun(s.exec)).filter(a => a === '--').length, 2, step)
+  }
+})
+
+// A network of that name left over: reused only when it is internal.
+test('an internal network left over is reused only when it is internal', async () => {
+  for (const [internal, up] of [['true\n', true], ['false\n', false]]) {
+    const s = makeSession({
+      provisionerOptions: INTERNAL,
+      answer: args => {
+        const c = args.join(' ')
+        if (c.startsWith('network create') && c.includes('--internal')) return Object.assign(new Error('docker network: Command failed'), { stderr: 'Error response from daemon: network with name qa-session-pr already exists\n' })
+        if (c === 'network inspect --format {{.Name}} qa-session-pr') return 'qa-session-pr\n'
+        if (c === 'network inspect --format {{.Internal}} qa-session-pr') return internal
+        return null
+      },
+    })
+    await bootSession(s.deps, 7)
+    const app = runs(s.exec).find(c => valueOf(c.args, '--name') === 'qa-app-pr').args
+    assert.equal(app.includes('-p'), !up, internal)
+    assert.equal(argvOf(s.exec).includes('network connect --alias qa-egress qa-session-pr qa-fwd-pr'), up, internal)
+  }
+})
+
+test('a boot aborted while the internal topology is set up stops there, and makes no ordinary network after it', async () => {
+  const ac = new AbortController()
+  const s = makeSession({ provisionerOptions: INTERNAL, answer: args => { if (args[0] === 'run' && args.includes('qa-fwd-pr')) ac.abort(); return null } })
+  await assert.rejects(s.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: ['app'], signal: ac.signal }), err => err.name === 'AbortError')
+  const calls = argvOf(s.exec)
+  assert.equal(calls.at(-1).startsWith('run -d --name qa-fwd-pr'), true, calls.join('\n'))
+  assert.equal(calls.some(c => c === 'network create --label qa-conductor-session qa-session-pr'), false)
+})
+
+test('with internal, teardown and sweep remove the forwarder and the edge network too', async () => {
+  const s = makeSession({ provisionerOptions: INTERNAL })
+  await bootSession(s.deps, 7)
+  const before = docker(s.exec).length
+  await s.provisioner.teardown({ paneRef: { role: 'pr' } })
+  assert.deepEqual(argvOf(s.exec).slice(before), [
+    'rm -f -v qa-app-pr', 'rm -f -v qa-migrate-pr', 'rm -f -v qa-probe-pr', 'rm -f -v qa-fwd-pr', 'rm -f -v qa-pg-pr',
+    'network rm qa-session-pr',
+    'network rm qa-session-pr-edge',
+  ])
+  const swept = recordingExec()
+  await createDockerProvisioner({ docker: makeDocker(swept), fsx: recordingFs(), workDir: WORK, ...INTERNAL }).sweep()
+  assert.deepEqual(argvOf(swept), [
+    'ps -aq --filter label=qa-conductor-session',
+    'network rm qa-session-base',
+    'network rm qa-session-pr',
+    'network rm qa-session-pr-edge',
+    'network ls --filter label=qa-conductor-session --format {{.Name}}',
+  ])
+  // a failure removing the edge network fails the teardown, after every step
+  const stuck = makeSession({ provisionerOptions: INTERNAL, answer: args => (args.join(' ') === 'network rm qa-session-pr-edge' ? Object.assign(new Error('docker network: Command failed'), { stderr: 'Error response from daemon: error while removing network: network qa-session-pr-edge has active endpoints\n' }) : null) })
+  await assert.rejects(stuck.provisioner.teardown({ paneRef: { role: 'pr' } }), /docker network/)
+  assert.ok(stuck.fsx.removed.includes(`${WORK}/.env.qa-pr`))
+})
+
+// With the topology up, the verdict is the probe's: the runtime's own
+// reasons, Docker Desktop's forwarding and Podman's networks, are what the
+// internal network is for, and the probe checks them. It also asks the
+// forwarder's proxy for every address it tries directly.
+test('with internal up, the probe also tries every address through the forwarder\'s proxy, and the verdict is the probe\'s, marked internal', async () => {
+  const s = makeSession({ provisionerOptions: INTERNAL, answer: probeDocker({ base: '172.19.0.2 fd00:19::2 \n', pr: '172.20.0.3 fd00:20::3 \n', probe: refusedAll('self 172.20.0.3:5432\nself fd00:20::3:5432\n') }) })
+  await s.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [] })
+  const out = await s.provisioner.isolation({ canary: CANARY })
+  assert.deepEqual(out, { verdict: 'isolated', reasons: [], internal: true })
+  const args = probeArgs(probeRun(s.exec))
+  const parts = args.join('\u0000').split('\u0000--\u0000').map(part => part.split('\u0000'))
+  assert.equal(parts.length, 4)
+  const [proxy, ...vias] = parts[3]
+  assert.equal(proxy, 'qa-egress:3128')
+  for (const via of ['host.docker.internal:3100', '192.168.65.254:3100', '172.20.0.1:3100', '172.19.0.2:5432', '[fd00:19::2]:5432']) assert.ok(vias.includes(via), via)
+  assert.equal(vias.length, parts[0].length - 3 + 2, 'every host at the harness port, and every base database address')
+
+  const verdict = async (opts, probe) => {
+    const t = makeSession({ provisionerOptions: INTERNAL, answer: probeDocker({ ...opts, probe }) })
+    await t.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [] })
+    return t.provisioner.isolation({ canary: CANARY })
+  }
+  const clean = refusedAll()
+  // Docker Desktop and Podman: the probe decides
+  assert.deepEqual(await verdict({ os: 'Docker Desktop\n' }, clean), { verdict: 'isolated', reasons: [], internal: true })
+  assert.deepEqual(await verdict({ version: 'Client: Podman Engine\nServer: Podman Engine\n' }, clean), { verdict: 'isolated', reasons: [], internal: true })
+  // a CONNECT the proxy let through is a hit
+  assert.deepEqual(await verdict({}, (opts, args) => refusedAll()(opts, args).replace('refused 172.19.0.2:5432', 'proxied 172.19.0.2:5432')), {
+    verdict: 'reachable', reasons: ['the PR pane got through the forwarder\'s proxy to 172.19.0.2:5432'], internal: true,
+  })
+  // no answer from the proxy at all: its misses prove nothing
+  assert.deepEqual(await verdict({}, 'self 172.20.0.3:5432\nprobe done\n'), {
+    verdict: 'unknown', reasons: ['the probe got no answer from the forwarder\'s proxy at qa-egress:3128, so it can\'t say what the proxy lets through'], internal: true,
+  })
+  // a direct hit still counts
+  assert.equal((await verdict({}, refusedAll('listener host.docker.internal\nself 172.20.0.3:5432\n'))).verdict, 'reachable')
+})
+
+// The script's proxy part, run with bash against a loopback stand-in for the
+// forwarder: it lets one target through and refuses the rest.
+test('the probe script asks the proxy for each address, and says which it let through and which it refused', async () => {
+  const net = await import('node:net')
+  const { execFile } = await import('node:child_process')
+  const { mkdtempSync, writeFileSync, chmodSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const s = makeSession({ provisionerOptions: INTERNAL, answer: probeDocker({ probe: 'self 172.20.0.3:5432\nrefused x\nprobe done\n' }) })
+  await s.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [] })
+  await s.provisioner.isolation({ canary: CANARY })
+  const script = valueOf(probeRun(s.exec).args, '-c')
+  const asked = []
+  const proxy = net.createServer(socket => {
+    let buf = ''
+    socket.on('data', chunk => {
+      buf += chunk
+      if (!buf.includes('\r\n\r\n')) return
+      const target = buf.split(' ')[1]
+      asked.push(target)
+      // a tunnel stays open; a refusal closes
+      if (target === 'through.example:443') socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      else socket.end('HTTP/1.1 403 Forbidden\r\nX-QA-Egress: refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+    })
+    socket.on('error', () => {})
+  })
+  const open = net.createServer(socket => socket.end())
+  const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(server.address().port)))
+  const [proxyPort, openPort] = [await listen(proxy), await listen(open)]
+  const shim = mkdtempSync(join(tmpdir(), 'qa-probe-'))
+  writeFileSync(join(shim, 'timeout'), '#!/bin/sh\nshift\nexec "$@"\n')
+  chmodSync(join(shim, 'timeout'), 0o755)
+  const runScript = proxyAt => new Promise((resolve, reject) => {
+    execFile('bash', ['-c', script, 'probe', '1', CANARY.path, CANARY.expect, '--', '--', `127.0.0.1:${openPort}`, '--', proxyAt, 'through.example:443', '10.0.0.5:3100', '[fd00::1]:5432'], {
+      env: { ...process.env, PATH: `${shim}:${process.env.PATH}` }, timeout: 20_000,
+    }, (err, stdout) => (err ? reject(err) : resolve(stdout.split('\n').filter(Boolean))))
+  })
+  try {
+    const lines = await runScript(`127.0.0.1:${proxyPort}`)
+    assert.equal(lines.at(-1), 'probe done')
+    assert.deepEqual(lines.sort(), ['probe done', 'proxied through.example:443', 'refused 10.0.0.5:3100', 'refused [fd00::1]:5432', `self 127.0.0.1:${openPort}`])
+    assert.deepEqual(asked.sort(), ['10.0.0.5:3100', '[fd00::1]:5432', 'through.example:443'])
+    // no proxy there: no line for it at all
+    const gone = net.createServer()
+    const gonePort = await listen(gone)
+    await new Promise(resolve => gone.close(resolve))
+    assert.deepEqual((await runScript(`127.0.0.1:${gonePort}`)).sort(), ['probe done', `self 127.0.0.1:${openPort}`])
+  } finally {
+    proxy.close()
+    open.close()
+    rmSync(shim, { recursive: true, force: true })
+  }
+})
+
+// --- #40's review ------------------------------------------------------------------------
+
+
+// The review's first medium: on Linux, a topology that fell back left the
+// verdict isolated, with no reason and no log, and the allowlist silently
+// dropped. Now the verdict is never better than unknown, says why, and the
+// fallback is logged.
+test('with internal set, a topology that falls back is never isolated: the verdict says egress isn\'t restricted, and it is logged', async () => {
+  const pullFails = args => (args.join(' ').endsWith('node:22-alpine') && /^(image inspect|pull)/.test(args.join(' ')) ? failWith('Error response from daemon: toomanyrequests: You have reached your pull rate limit') : null)
+  for (const [probe, verdict] of [['self 172.20.0.3:5432\nprobe done\n', 'unknown'], ['open 172.19.0.2:5432\nself 172.20.0.3:5432\nprobe done\n', 'reachable']]) {
+    const { lines, log } = logged()
+    const answers = probeDocker({ probe })
+    const s = makeSession({ provisionerOptions: { ...INTERNAL, log }, answer: (args, opts) => pullFails(args) ?? answers(args, opts) })
+    await bootSession(s.deps, 7)
+    const out = await s.provisioner.isolation({ canary: CANARY })
+    assert.equal(out.verdict, verdict)
+    assert.equal(out.internal, undefined)
+    assert.match(out.reasons.at(-1), /^egress isn't restricted: the PR pane's internal network couldn't be set up \(pull node:22-alpine failed after 3 attempts.*\)$/)
+    assert.ok(lines.some(line => /^\[qa\] the PR pane's internal network couldn't be set up \(.+\): it runs on an ordinary network, and its egress isn't restricted$/.test(line)), lines.join('\n'))
+  }
+})
+
+// The review's second medium: on some Docker Engines, DNS from an internal
+// network reaches the host's resolver (CVE-2024-29018). The PR pane's
+// containers get an unroutable DNS server instead, so no name outside the
+// network resolves; names on it still do, through the runtime's own DNS.
+test('with the topology up, the PR pane\'s containers get an unroutable DNS server, and on Podman its names in their hosts file; not the base pane\'s, not after a fallback', async () => {
+  const dnsOf = (exec, name) => valueOf(runs(exec).find(c => (valueOf(c.args, '--name') ?? valueOf(c.args, '--env-file')).endsWith(name)).args, '--dns')
+  const s = makeSession({ provisionerOptions: INTERNAL, answer: probeDocker({ probe: refusedAll() }) })
+  s.deps.checkIsolation = async ({ stage, signal }) => { if (stage === 'panes') await s.provisioner.isolation({ signal, canary: CANARY }) }
+  await bootSession(s.deps, 7)
+  for (const name of ['qa-pg-pr', 'qa-migrate-pr', 'qa-app-pr', 'qa-probe-pr']) assert.equal(dnsOf(s.exec, name), '192.0.2.1', name)
+  for (const name of ['qa-pg-base', 'qa-migrate-base', 'qa-app-base', 'qa-fwd-pr']) assert.equal(dnsOf(s.exec, name), null, name)
+  assert.equal(runs(s.exec).some(c => c.args.includes('--add-host')), false, 'Docker\'s own DNS serves the network\'s names')
+  // Podman: its DNS forwards outside names too (CI found it), and a --dns
+  // replaces it, so the names the pane needs are in its hosts file
+  const podman = makeSession({ provisionerOptions: INTERNAL, answer: probeDocker({ version: 'Client: Podman Engine\nServer: Podman Engine\n', probe: refusedAll() }) })
+  podman.deps.checkIsolation = async ({ stage, signal }) => { if (stage === 'panes') await podman.provisioner.isolation({ signal, canary: CANARY }) }
+  await bootSession(podman.deps, 7)
+  const hostsOf = (exec, name) => {
+    const call = runs(exec).find(c => (valueOf(c.args, '--name') ?? valueOf(c.args, '--env-file')).endsWith(name)).args
+    return call.flatMap((a, i) => (a === '--add-host' ? [call[i + 1]] : []))
+  }
+  for (const name of ['qa-pg-pr', 'qa-migrate-pr', 'qa-app-pr', 'qa-probe-pr']) assert.equal(dnsOf(podman.exec, name), '192.0.2.1', name)
+  for (const name of ['qa-migrate-pr', 'qa-app-pr', 'qa-probe-pr']) assert.deepEqual(hostsOf(podman.exec, name), ['qa-pg-pr:172.20.0.3', 'qa-egress:172.20.0.2'], name)
+  for (const name of ['qa-pg-base', 'qa-app-base']) assert.deepEqual([dnsOf(podman.exec, name), hostsOf(podman.exec, name)], [null, []], name)
+  // a PR database with no address on its network fails the boot, rather
+  // than leave the pane unable to reach it
+  const lost = makeSession({ provisionerOptions: INTERNAL, answer: (args, opts) => (args.join(' ').endsWith('qa-pg-pr') && args[0] === 'inspect' && args[2].startsWith('{{with') ? '\n' : probeDocker({ version: 'Client: Podman Engine\n' })(args, opts)) })
+  await assert.rejects(lost.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [] }), /the PR pane's database or forwarder has no address on qa-session-pr/)
+  // fallen back: no --dns either
+  const down = makeSession({ provisionerOptions: { ...INTERNAL, log: logged().log }, answer: args => (args.join(' ').startsWith('run -d --name qa-fwd-pr') ? failWith('port is already allocated') : null) })
+  await bootSession(down.deps, 7)
+  assert.equal(runs(down.exec).some(c => c.args.includes('--dns')), false)
+})
+
+// The review's lows: "up" was decided from exit codes alone.
+test('the topology is up only when the new network reads back internal and the forwarder runs and says it is ready; else it falls back', async () => {
+  const cases = [
+    ['the network isn\'t internal', args => (args.join(' ') === 'network inspect --format {{.Internal}} qa-session-pr' ? 'false\n' : null), /qa-session-pr was created but isn't internal/],
+    ['the forwarder exited', args => (args.join(' ') === 'inspect --format {{.State.Running}} qa-fwd-pr' ? 'false\n' : null), /the forwarder qa-fwd-pr isn't running/],
+    ['the forwarder never says ready', args => (args[0] === 'logs' && args.at(-1) === 'qa-fwd-pr' ? 'starting\n' : null), /the forwarder qa-fwd-pr wasn't ready within 150 ms/],
+  ]
+  for (const [name, answer, re] of cases) {
+    const s = makeSession({ provisionerOptions: { ...INTERNAL, forwarderReadyMs: 150, log: logged().log }, answer: (args, opts) => answer(args) ?? probeDocker()(args, opts) })
+    await bootSession(s.deps, 7)
+    const app = runs(s.exec).find(c => valueOf(c.args, '--name') === 'qa-app-pr').args
+    assert.equal(valueOf(app, '-p'), '127.0.0.1:3112:3000', `${name}: fell back`)
+    const out = await s.provisioner.isolation({ canary: CANARY })
+    assert.match(out.reasons.at(-1), re, name)
+  }
+})
+
+test('triage with the topology up adds the forwarder\'s log tail to the PR app\'s', async () => {
+  const s = makeSession({ provisionerOptions: INTERNAL, answer: args => (args[0] === 'logs' ? (args.at(-1) === 'qa-fwd-pr' ? 'qa-forwarder ready\nqa-egress refused evil.example:443: not on the allowlist\n' : 'app says hi\n') : null) })
+  await bootSession(s.deps, 7)
+  assert.equal(await s.provisioner.logs({ paneRef: { role: 'pr' }, stage: 'starting', lines: 40 }), 'app says hi\n[qa-fwd-pr]\nqa-forwarder ready\nqa-egress refused evil.example:443: not on the allowlist\n')
+  assert.equal(await s.provisioner.logs({ paneRef: { role: 'base' }, stage: 'starting', lines: 40 }), 'app says hi\n')
+})
+
+// Under the podman-docker shim, `docker info` fails, and `docker context
+// inspect` is Podman's, which has no Docker context: it prints nothing, or
+// fails on the template. With the topology up the probe still decides,
+// where Podman's own connection is this host.
+test('under the podman-docker shim, whose info and context fail, the topology up still lets the probe decide where Podman runs here', async () => {
+  const shimInfo = Object.assign(new Error('docker info: Command failed'), { stderr: 'Emulate Docker CLI using podman. Create /etc/containers/nodocker to quiet msg.\nError: template: info:1:2: executing "info" at <.OperatingSystem>: can\'t evaluate field OperatingSystem in type *define.Info\n' })
+  const shimContext = Object.assign(new Error('docker context: Command failed'), { stderr: 'Emulate Docker CLI using podman. Create /etc/containers/nodocker to quiet msg.\nError: template: inspect:1:12: executing "inspect" at <.Endpoints.docker.Host>: can\'t evaluate field Endpoints in type config.Connection\n' })
+  const machine = JSON.stringify([{ Name: 'podman-machine-default', URI: 'ssh://core@127.0.0.1:50000/run/user/1000/podman/podman.sock', Identity: '/x', Default: true }])
+  for (const [context, connections, want] of [
+    [shimContext, '[]\n', { verdict: 'isolated', reasons: [], internal: true }],
+    ['\n', '[]\n', { verdict: 'isolated', reasons: [], internal: true }],
+    // a default connection that isn't this host: the probe can't speak for it
+    [shimContext, machine, { verdict: 'unknown', reasons: ['the Docker daemon is at ssh://127.0.0.1, which may not be this host, so the probe can\'t speak for this host\'s loopback'], internal: true }],
+  ]) {
+    const answers = probeDocker({ version: 'Client: Podman Engine\nVersion: 5.2.0\n', os: shimInfo, endpoint: context, probe: refusedAll() })
+    const s = makeSession({ provisionerOptions: INTERNAL, answer: (args, opts) => (args.join(' ') === 'system connection list --format json' ? connections : answers(args, opts)) })
+    await s.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [] })
+    assert.deepEqual(await s.provisioner.isolation({ canary: CANARY }), want, connections)
+  }
+})
+
+// --- Round 2 of #40's review ---------------------------------------------------------
+
+// The forwarder's readiness is polled: one still starting at the first look
+// is up once it says so, and an abort while it is polled stops the boot.
+test('the forwarder\'s readiness is polled until it says so, and an abort while polling stops the boot with no fallback', async () => {
+  let looks = 0
+  const later = makeSession({ provisionerOptions: INTERNAL, answer: (args, opts) => (args[0] === 'logs' && args.at(-1) === 'qa-fwd-pr' ? (++looks < 3 ? 'starting\n' : 'qa-forwarder ready\n') : probeDocker({ probe: refusedAll() })(args, opts)) })
+  await later.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [] })
+  assert.equal(looks, 3)
+  assert.deepEqual(await later.provisioner.isolation({ canary: CANARY }), { verdict: 'isolated', reasons: [], internal: true })
+
+  const { lines, log } = logged()
+  const ac = new AbortController()
+  const stopped = makeSession({ provisionerOptions: { ...INTERNAL, log }, answer: args => {
+    if (args[0] === 'logs' && args.at(-1) === 'qa-fwd-pr') { ac.abort(); return 'starting\n' }
+    return null
+  } })
+  await assert.rejects(stopped.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [], signal: ac.signal }), { name: 'AbortError' })
+  const calls = argvOf(stopped.exec)
+  const at = calls.findIndex(c => c.startsWith('logs') && c.endsWith('qa-fwd-pr'))
+  // nothing undone, nothing made after the abort, nothing logged
+  assert.deepEqual(calls.slice(at + 1).filter(c => !c.startsWith('inspect --format {{.State.Running}}')), [])
+  assert.deepEqual(lines, [])
+})
+
+// The DNS server is the PR pane's whatever `docker version` says at the end
+// of the setup: one that fails there is taken for Docker, whose own DNS
+// still serves the network's names, so no hosts entries.
+test('a docker version that fails once the forwarder is ready still gives the PR pane\'s containers --dns 192.0.2.1, and no hosts entries', async () => {
+  let ready = false
+  const s = makeSession({ provisionerOptions: INTERNAL, answer: args => {
+    if (args[0] === 'logs' && args.at(-1) === 'qa-fwd-pr') { ready = true; return 'qa-forwarder ready\n' }
+    if (args[0] === 'version' && ready) return failWith('Cannot connect to the Docker daemon')
+    return null
+  } })
+  await bootSession(s.deps, 7)
+  const dnsOf = (exec, name) => valueOf(runs(exec).find(c => (valueOf(c.args, '--name') ?? valueOf(c.args, '--env-file')).endsWith(name)).args, '--dns')
+  for (const name of ['qa-pg-pr', 'qa-migrate-pr', 'qa-app-pr']) assert.equal(dnsOf(s.exec, name), '192.0.2.1', name)
+  assert.equal(runs(s.exec).some(c => c.args.includes('--add-host')), false)
+})
+
+// A boot aborted while its topology was being set up must leave the next
+// boot's alone: it never assigns the shared topology, and never undoes
+// names the next session may own by now.
+test('an aborted boot\'s topology setup neither overwrites the next boot\'s topology nor undoes its names', async () => {
+  // Boot A is held in its last docker call, the `docker version` after
+  // readiness; it is aborted, and boot B falls back (its forwarder's name
+  // is taken); then A's call answers
+  let phase = 'A'
+  let release = null
+  let held = null
+  const holding = new Promise(resolve => { held = resolve })
+  const { lines, log } = logged()
+  const answers = probeDocker({ probe: 'self 172.20.0.3:5432\nprobe done\n' })
+  const s = makeSession({ provisionerOptions: { ...INTERNAL, log }, answer: async (args, opts) => {
+    if (phase === 'A' && args[0] === 'version' && !release) { held(); await new Promise(resolve => { release = resolve }) }
+    if (phase === 'B' && args.join(' ').startsWith('run -d --name qa-fwd-pr')) return failWith('Error response from daemon: Conflict. The container name "/qa-fwd-pr" is already in use')
+    return answers(args, opts)
+  } })
+  const a = new AbortController()
+  const bootA = s.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [], signal: a.signal }).then(() => 'resolved', err => err.name)
+  await holding
+  a.abort()
+  phase = 'B'
+  await s.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [], signal: new AbortController().signal })
+  assert.equal(lines.length, 1, 'B fell back, and said so')
+  release()
+  assert.equal(await bootA, 'AbortError')
+  const out = await s.provisioner.isolation({ canary: CANARY })
+  assert.equal(out.internal, undefined)
+  assert.match(out.reasons.at(-1), /^egress isn't restricted: the PR pane's internal network couldn't be set up \(.*already in use.*\)$/)
+
+  // Boot C is held in joining the forwarder to the internal network, and
+  // aborted; then the join fails. C undoes nothing: no forwarder or network
+  // is removed after the abort
+  let joined = null
+  let fail = null
+  const joining = new Promise(resolve => { joined = resolve })
+  const c = makeSession({ provisionerOptions: { ...INTERNAL, log: logged().log }, answer: async (args, opts) => {
+    if (args[0] === 'network' && args[1] === 'connect') { joined(); await new Promise(resolve => { fail = resolve }); return failWith('Error response from daemon: network qa-session-pr not found') }
+    return answers(args, opts)
+  } })
+  const ac = new AbortController()
+  const bootC = c.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [], signal: ac.signal }).then(() => 'resolved', err => err.name)
+  await joining
+  ac.abort()
+  const before = argvOf(c.exec).length
+  fail()
+  assert.equal(await bootC, 'AbortError')
+  assert.deepEqual(argvOf(c.exec).slice(before), [])
+})
+
+// The proxy's control: an answer for every target it was asked, or its
+// silence there proves nothing.
+test('with the topology up, the proxy must answer for every target the probe asked it, else the verdict is unknown, naming the silent ones', async () => {
+  const s = makeSession({ provisionerOptions: INTERNAL, answer: probeDocker({ probe: 'self 172.20.0.3:5432\nrefused host.docker.internal:3100\nprobe done\n' }) })
+  await s.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [] })
+  const out = await s.provisioner.isolation({ canary: CANARY })
+  assert.equal(out.verdict, 'unknown')
+  assert.match(out.reasons[0], /^the forwarder's proxy at qa-egress:3128 didn't answer the probe for \d+ of \d+ targets \(gateway\.docker\.internal:3100, .+ and \d+ more\), so it can't say what the proxy lets through there$/)
+})
+
+// The fallback's undo: an internal network that can't be removed, or one that
+// is still there, fails the boot rather than pass for an ordinary one.
+test('a fallback that can\'t remove the internal network, or finds one still there, fails the boot', async () => {
+  const forwarderFails = c => (c.startsWith('run -d --name qa-fwd-pr') ? failWith('port is already allocated') : null)
+  const stuck = makeSession({ provisionerOptions: { ...INTERNAL, log: logged().log }, answer: args => forwarderFails(args.join(' ')) ?? (args.join(' ') === 'network rm qa-session-pr' ? failWith('Error response from daemon: error while removing network: network qa-session-pr has active endpoints') : null) })
+  await assert.rejects(stuck.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [] }), /the PR pane's internal network couldn't be set up \(port is already allocated\), nor removed: Error response from daemon: error while removing network/)
+  let created = 0
+  const still = makeSession({
+    provisionerOptions: { ...INTERNAL, log: logged().log },
+    answer: args => {
+      const c = args.join(' ')
+      if (forwarderFails(c)) return forwarderFails(c)
+      if (c === 'network create --label qa-conductor-session qa-session-pr' && ++created) return failWith('Error response from daemon: network with name qa-session-pr already exists')
+      if (c === 'network inspect --format {{.Name}} qa-session-pr') return 'qa-session-pr\n'
+      return null
+    },
+  })
+  await assert.rejects(still.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [] }), /a network qa-session-pr is still there, and internal/)
+})
+
+test('the base pane\'s teardown leaves the PR pane\'s forwarder and edge network alone', async () => {
+  const s = makeSession({ provisionerOptions: INTERNAL })
+  await bootSession(s.deps, 7)
+  const before = docker(s.exec).length
+  await s.provisioner.teardown({ paneRef: { role: 'base' } })
+  assert.deepEqual(argvOf(s.exec).slice(before), ['rm -f -v qa-app-base', 'rm -f -v qa-migrate-base', 'rm -f -v qa-pg-base', 'network rm qa-session-base'])
+})
+
+// --- Round 3 of #40's review ---------------------------------------------------------
+
+const ENGINE = major => `Client: Docker Engine - Community\n Version:           ${major}.0.4\n\nServer: Docker Engine - Community\n Engine:\n  Version:          ${major}.0.4\n`
+
+test('dockerEngineMajor reads the server\'s Engine version, and none for Podman or no server', () => {
+  assert.equal(dockerEngineMajor(ENGINE(28)), 28)
+  assert.equal(dockerEngineMajor(ENGINE(27)), 27)
+  assert.equal(dockerEngineMajor(`Client: Docker Engine - Community\n Version:           28.0.4\n`), null, 'no server')
+  assert.equal(dockerEngineMajor('Client: Podman Engine\nVersion: 5.2.0\nServer: Podman Engine\nVersion: 5.2.0\n'), null)
+  assert.equal(dockerEngineMajor(undefined), null)
+})
+
+// On Docker Engine 28 and later, the PR pane's internal network gets no
+// address of the host's on its bridge (gateway mode isolated), so a host
+// service on 0.0.0.0 isn't reachable from it either.
+test('on Docker Engine 28 and later the internal network\'s gateway is isolated; on older Engines and Podman, or where refused, it is a plain internal network, never the fallback', async () => {
+  const createOf = exec => argvOf(exec).find(c => c.startsWith('network create') && c.endsWith(' qa-session-pr') && c.includes('--internal'))
+  const gw = '-o com.docker.network.bridge.gateway_mode_ipv4=isolated -o com.docker.network.bridge.gateway_mode_ipv6=isolated'
+  for (const [version, isolated] of [[ENGINE(28), true], [ENGINE(29), true], [ENGINE(27), false], ['Client: Podman Engine\nServer: Podman Engine\n', false]]) {
+    const { lines, log } = logged()
+    const s = makeSession({ provisionerOptions: { ...INTERNAL, log }, answer: probeDocker({ version, probe: refusedAll() }) })
+    await s.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [] })
+    assert.equal(createOf(s.exec), `network create --label qa-conductor-session --internal ${isolated ? `${gw} ` : ''}qa-session-pr`, version)
+    assert.deepEqual(lines, [], 'no fallback')
+  }
+  // an Engine that refuses the option: a plain internal network, up
+  const { lines, log } = logged()
+  const answers = probeDocker({ version: ENGINE(28), probe: refusedAll() })
+  const refused = makeSession({ provisionerOptions: { ...INTERNAL, log }, answer: (args, opts) => (args.join(' ').includes('gateway_mode_ipv4=isolated') ? failWith('Error response from daemon: invalid option') : answers(args, opts)) })
+  await refused.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [] })
+  const creates = argvOf(refused.exec).filter(c => c.startsWith('network create') && c.endsWith(' qa-session-pr'))
+  assert.deepEqual(creates, [`network create --label qa-conductor-session --internal ${gw} qa-session-pr`, 'network create --label qa-conductor-session --internal qa-session-pr'])
+  assert.deepEqual(lines, [])
+  assert.deepEqual(await refused.provisioner.isolation({ canary: CANARY }), { verdict: 'isolated', reasons: [], internal: true })
+})
+
+test('a left-over internal network without an isolated gateway is made again on Engine 28 and later; one with it is reused', async () => {
+  const exists = failWith('Error response from daemon: network with name qa-session-pr already exists')
+  for (const [mode, remade] of [['\n', true], ['isolated\n', false]]) {
+    let made = false
+    const answers = probeDocker({ version: ENGINE(28), probe: refusedAll() })
+    const s = makeSession({ provisionerOptions: INTERNAL, answer: (args, opts) => {
+      const c = args.join(' ')
+      if (c.startsWith('network create') && c.endsWith(' qa-session-pr') && c.includes('--internal')) { if (made) return ''; made = true; return exists }
+      if (c === 'network inspect --format {{.Name}} qa-session-pr') return 'qa-session-pr\n'
+      if (c.startsWith('network inspect --format {{index .Options')) return mode
+      return answers(args, opts)
+    } })
+    await s.provisioner.provisionDatabase({ paneRef: { role: 'pr' }, databases: [] })
+    const calls = argvOf(s.exec)
+    assert.equal(calls.includes('network rm qa-session-pr'), remade, mode)
+    assert.equal(calls.filter(c => c.startsWith('network create') && c.endsWith(' qa-session-pr')).length, remade ? 2 : 1, mode)
+  }
 })

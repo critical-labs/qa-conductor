@@ -970,7 +970,8 @@ test('the publish job\'s publishConfig check stages only a tarball whose publish
 })
 
 // CI's Node 22 leg runs the suite as publish.yml's test job does, with Node
-// 22's own npm, which packs the release. Then it runs this file again with
+// 22's own npm, which packs the release. (The docker-integration job, pinned
+// with it, runs the internal network's test on a real runtime.) Then it runs this file again with
 // NPM_UPGRADE's npm, the one the publish job reads and stages tarballs with,
 // so the publishConfig check's test runs against that npm on every pull
 // request. The whole job is pinned, and on that second run the npm beside
@@ -1009,6 +1010,36 @@ test('CI\'s Node 22 leg runs the package tests again with the npm the publish jo
     '        run: node --test test/package.test.mjs',
     '        env:',
     '          CI_EXPECTS_PUBLISH_NPM: "true"',
+    '  docker-integration:',
+    '    runs-on: ubuntu-24.04',
+    '    timeout-minutes: 30',
+    '    strategy:',
+    '      fail-fast: false',
+    '      matrix:',
+    '        runtime: [docker, podman]',
+    '    steps:',
+    '      - uses: actions/checkout@<sha> # v7.0.1',
+    '        with:',
+    '          persist-credentials: false',
+    '      - uses: actions/setup-node@<sha> # v7.0.0',
+    '        with:',
+    '          node-version: 22',
+    "      - if: matrix.runtime == 'podman'",
+    '        run: |',
+    '          sudo systemctl stop docker.socket docker.service',
+    '          sudo systemctl start podman.socket',
+    '          sudo chmod a+x /run/podman',
+    '          sudo chmod a+rw /run/podman/podman.sock',
+    '      - run: docker version',
+    '        env:',
+    "          DOCKER_HOST: ${{ matrix.runtime == 'podman' && 'unix:///run/podman/podman.sock' || '' }}",
+    '      - run: node --test --test-force-exit --test-reporter=spec test/integration/docker-internal.test.mjs | tee it.log',
+    '        shell: bash',
+    '        env:',
+    '          QA_DOCKER_IT: "1"',
+    "          DOCKER_HOST: ${{ matrix.runtime == 'podman' && 'unix:///run/podman/podman.sock' || '' }}",
+    "          DOCKER_BUILDKIT: ${{ matrix.runtime == 'podman' && '0' || '1' }}",
+    "      - run: grep -qx 'ℹ skipped 0' it.log && grep -qx 'ℹ todo 0' it.log",
   ])
   assert.ok(readFileSync(WORKFLOW, 'utf8').includes(`      - run: ${NPM_UPGRADE}\n`), 'the publish job installs the same npm')
   if (process.env.CI_EXPECTS_PUBLISH_NPM === 'true') {

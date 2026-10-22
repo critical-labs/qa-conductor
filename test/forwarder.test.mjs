@@ -7,12 +7,12 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import net from 'node:net'
 import http from 'node:http'
-import { once } from 'node:events'
+import { EventEmitter, once } from 'node:events'
 import { readFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
-import { blockedAddress, checkTarget, createForwarder, parseAllowlist } from '../lib/forwarder.mjs'
+import { blockedAddress, checkTarget, createForwarder, idleTimer, parseAllowlist } from '../lib/forwarder.mjs'
 
 const SOURCE = fileURLToPath(new URL('../lib/forwarder.mjs', import.meta.url))
 // What a test on sockets or a child may take before it fails, rather than
@@ -126,7 +126,8 @@ const free = async () => { const s = net.createServer(); const p = await listeni
 // `connect` says otherwise. It records the address each was meant for.
 // Everything closes with the test, even one that timed out (t.after).
 async function world(t, { allow = [], lookup = lookupOf({ 'api.example.com': ['93.184.216.34'] }), connect = null, timeouts, app: appHandler = null } = {}) {
-  const echo = net.createServer(socket => socket.pipe(socket))
+  // a reset from the forwarder is expected of some tests
+  const echo = net.createServer(socket => { socket.on('error', () => {}); socket.pipe(socket) })
   const app = http.createServer(appHandler ?? ((req, res) => res.end(JSON.stringify({ url: req.url, host: req.headers.host, auth: req.headers['proxy-authorization'] ?? null, conn: req.headers['proxy-connection'] ?? null, headers: req.headers }))))
   const [echoPort, appPort] = [await listening(echo), await listening(app)]
   const connects = []
@@ -144,7 +145,7 @@ async function world(t, { allow = [], lookup = lookupOf({ 'api.example.com': ['9
   })
   const close = async () => { await fwd.close(); echo.close(); app.closeAllConnections?.(); app.close() }
   t?.after(close)
-  return { forwardPort, proxyPort, appPort, echoPort, connects, logged, fwd, close }
+  return { forwardPort, proxyPort, appPort, echoPort, connects, logged, fwd, close, appServer: app }
 }
 
 // A raw CONNECT: the status line, and the socket once it answered.
@@ -241,21 +242,29 @@ function exited(child, ms = 5_000) {
 
 // As the container runs it: the file as given to node -e, its config in
 // PANE_FORWARDER. A bad config exits 1, so the Provisioner finds no forwarder.
-test('run as the container runs it: ready from its config, and a bad config exits 1', BOUNDED, async () => {
+// Every line goes to stdout, a refusal's too: triage's tail (`docker logs`
+// through logsTail) reads stdout only.
+test('run as the container runs it: ready from its config, its refusals and a bad config\'s error on stdout, and a bad config exits 1', BOUNDED, async () => {
   const source = readFileSync(SOURCE, 'utf8')
   const run = env => spawn(process.execPath, ['--input-type=module', '-e', source], { env: { PATH: process.env.PATH, ...env }, stdio: ['ignore', 'pipe', 'pipe'] })
   const app = http.createServer((req, res) => res.end('pr app'))
   const appPort = await listening(app)
-  const s = net.createServer()
-  const port = await listening(s)
-  s.close()
-  const child = run({ PANE_FORWARDER: JSON.stringify({ host: '127.0.0.1', forward: { listen: port, to: `127.0.0.1:${appPort}` }, proxy: null }) })
+  const [port, proxyPort] = [await free(), await free()]
+  const child = run({ PANE_FORWARDER: JSON.stringify({ host: '127.0.0.1', forward: { listen: port, to: `127.0.0.1:${appPort}` }, proxy: { listen: proxyPort, allow: [] } }) })
   try {
     let out = ''
+    let err = ''
     child.stdout.on('data', c => { out += c })
+    child.stderr.on('data', c => { err += c })
     for (let i = 0; i < 200 && !out.includes('qa-forwarder ready'); i++) await new Promise(r => setTimeout(r, 25))
     assert.match(out, /qa-forwarder ready/)
     assert.equal(await (await fetch(`http://127.0.0.1:${port}/`)).text(), 'pr app')
+    const refused = await connectVia(proxyPort, 'evil.example:443')
+    refused.socket.destroy()
+    assert.equal(refused.status, 403)
+    for (let i = 0; i < 200 && !out.includes('qa-egress refused'); i++) await new Promise(r => setTimeout(r, 25))
+    assert.match(out, /^qa-egress refused evil\.example:443: evil\.example:443 is not on the allowlist$/m)
+    assert.equal(err, '')
   } finally { child.kill(); app.close() }
   // a free port each bad config would listen on, were it taken as good
   const spare = net.createServer()
@@ -267,14 +276,31 @@ test('run as the container runs it: ready from its config, and a bad config exit
     [{ PANE_FORWARDER: JSON.stringify({ host: '127.0.0.1', forward: { listen: sparePort, to: 'nowhere' } }) }, /forward needs listen/],
   ]) {
     const bad = run(env)
-    let err = ''
-    bad.stderr.on('data', c => { err += c })
+    let out = ''
+    bad.stdout.on('data', c => { out += c })
     const code = await exited(bad)
-    assert.equal(code, 1, err)
-    assert.match(err, re)
+    assert.equal(code, 1, out)
+    assert.match(out, re)
   }
   // imported, as by these tests, it starts nothing
   assert.equal(process.env.PANE_FORWARDER, undefined)
+})
+
+// The conductor imports the file too (the Docker Provisioner checks the
+// allowlist with it): a PANE_FORWARDER in the conductor's own env must not
+// start a forwarder there. Only the file run as given to node -e runs.
+test('imported, it runs nothing, even with PANE_FORWARDER set', BOUNDED, async () => {
+  const child = spawn(process.execPath, ['--input-type=module', '-e', 'await import(process.env.FORWARDER_URL); console.log("imported")'], {
+    env: { PATH: process.env.PATH, FORWARDER_URL: new URL('../lib/forwarder.mjs', import.meta.url).href, PANE_FORWARDER: JSON.stringify({ proxy: { listen: 3128, allow: ['127.0.0.1'] } }) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let out = ''
+  let err = ''
+  child.stdout.on('data', c => { out += c })
+  child.stderr.on('data', c => { err += c })
+  assert.equal(await exited(child), 0, err)
+  assert.equal(out.trim(), 'imported')
+  assert.doesNotMatch(err, /qa-forwarder/)
 })
 
 // --- The review of #39 ---------------------------------------------------------------
@@ -358,7 +384,11 @@ test('a CONNECT tunnel that goes idle is closed on both sides, and no connection
   for (let i = 0; i < 3; i++) {
     const ok = await connectVia(w.proxyPort, 'api.example.com:443')
     assert.equal(ok.status, 200)
-    await once(ok.socket, 'close')
+    // an idle cut is a reset, never a clean end
+    let code = null
+    ok.socket.on('error', err => { code = err.code })
+    await new Promise(resolve => ok.socket.once('close', resolve))
+    assert.equal(code, 'ECONNRESET')
   }
   await waitUntil(async () => (await new Promise(resolve => proxy.getConnections((_, n) => resolve(n)))) === 0)
   // and closed from either side: the client's end ends the upstream
@@ -470,8 +500,10 @@ test('CONNECT: the bytes sent with it go through, a failure before the 200 is a 
   let after = ''
   withHead.socket.on('data', c => { after += c })
   upstreamOf.destroy(new Error('gone'))
-  await once(withHead.socket, 'close')
-  assert.equal(after, '')
+  let code = null
+  withHead.socket.on('error', err => { code = err.code })
+  await new Promise(resolve => withHead.socket.once('close', resolve))
+  assert.deepEqual([after, code], ['', 'ECONNRESET'], 'no 502 written into the tunnel: a reset')
   const down = await connectVia(w.proxyPort, 'down.example.com:443')
   assert.equal(down.status, 502)
   assert.match(down.head, /X-QA-Egress: failed/)
@@ -835,4 +867,390 @@ test('a PR gone during the lookup, a reset with bytes queued for the host, and a
   gone.destroy()
   await sleep(400) // the host's connect has come and gone
   await waitUntil(async () => (await new Promise(resolve => echo.getConnections((_, n) => resolve(n)))) === 0, 1_000)
+})
+
+// --- Carried from #39's round 3 ----------------------------------------------------------
+
+// Reads a socket slowly: a chunk, then `gapMs` paused; resolves to the bytes
+// read past any head, at its end.
+function readSlowly(socket, { gapMs = 100, skipHeader = false } = {}) {
+  return new Promise((resolve, reject) => {
+    let total = 0
+    let header = skipHeader ? '' : null
+    socket.on('data', chunk => {
+      if (header !== null) {
+        header += chunk.toString('latin1')
+        const end = header.indexOf('\r\n\r\n')
+        if (end !== -1) { total += Buffer.byteLength(header.slice(end + 4), 'latin1'); header = null }
+      } else total += chunk.length
+      socket.pause()
+      setTimeout(() => socket.resume(), gapMs)
+    })
+    socket.on('end', () => resolve(total))
+    socket.on('error', reject)
+  })
+}
+
+// Backpressure from a slow reader is no idleness: a tunnel that keeps
+// moving, however slowly, isn't cut by the idle timer. Its idle period is a
+// second: the kernel's buffers can hold a steady reader's bytes out of the
+// forwarder's sight for longer than 300 ms. The reader takes a chunk every
+// 300 ms, slow enough that a timer which ignores backpressure (as main's
+// did) cuts it, or ends it short. The timer's own rules are tested with
+// stand-ins, below.
+test('a slow but steady reader isn\'t cut by the idle timer: a tunnel and a plain-HTTP answer deliver every byte', { timeout: 60_000 }, async (t) => {
+  const MiB2 = 2 * 1024 * 1024
+  const upstream = await sender(t, MiB2)
+  const w = await world(t, {
+    allow: ['api.example.com'],
+    timeouts: { idleMs: 1000 },
+    connect: (port, address, { appPort }) => net.connect({ port: port === 80 ? appPort : upstream.port, host: '127.0.0.1' }),
+    app: (req, res) => { res.writeHead(200, { 'content-length': String(MiB2) }); res.end(Buffer.alloc(MiB2, 0x63)) },
+  })
+  const socket = net.connect(w.proxyPort, '127.0.0.1', () => socket.write('CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n'))
+  assert.equal(await readSlowly(socket, { skipHeader: true, gapMs: 300 }), MiB2, 'the tunnel')
+  const plain = net.connect(w.proxyPort, '127.0.0.1', () => plain.write('GET http://api.example.com/big HTTP/1.1\r\nHost: api.example.com\r\nConnection: close\r\n\r\n'))
+  assert.equal(await readSlowly(plain, { skipHeader: true, gapMs: 300 }), MiB2, 'the plain-HTTP answer')
+})
+
+// A reset on one side reaches the other as a reset, never a clean end: a
+// close-delimited stream would read as complete.
+test('a host or an app that resets mid-stream gives the PR ECONNRESET, through a tunnel and through the forward', BOUNDED, async (t) => {
+  const resetter = net.createServer(socket => {
+    socket.on('error', () => {})
+    socket.write(Buffer.alloc(64 * 1024, 0x64), () => setTimeout(() => socket.resetAndDestroy(), 50))
+  })
+  const resetterPort = await listening(resetter)
+  t.after(() => resetter.close())
+  const errorOf = socket => new Promise(resolve => {
+    socket.on('data', () => {})
+    socket.on('error', err => resolve(err.code))
+    socket.on('end', () => resolve('a clean end'))
+  })
+  const w = await world(t, { allow: ['api.example.com'], connect: () => net.connect({ port: resetterPort, host: '127.0.0.1' }) })
+  const tunnel = net.connect(w.proxyPort, '127.0.0.1', () => tunnel.write('CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n'))
+  assert.equal(await errorOf(tunnel), 'ECONNRESET')
+  const fwd = await createForwarder({ host: '127.0.0.1', forward: { listen: await free(), to: `127.0.0.1:${resetterPort}` } })
+  t.after(() => fwd.close())
+  const client = net.connect(fwd.servers[0].address().port, '127.0.0.1')
+  assert.equal(await errorOf(client), 'ECONNRESET')
+})
+
+// A host that closes cleanly ends the PR's side of the tunnel too, even a PR
+// that keeps its own side open: the forwarder holds nothing for it. (The
+// inbound forward is half-open both ways by design: an app's FIN reaches the
+// client as a FIN, and the client may still send.)
+test('a host that closes cleanly ends the forwarder\'s side of the tunnel, even when the PR keeps its own side open', BOUNDED, async (t) => {
+  const upstream = await sender(t, 1024)
+  const connections = server => new Promise(resolve => server.getConnections((_, n) => resolve(n)))
+  const w = await world(t, { allow: ['api.example.com'], connect: () => net.connect({ port: upstream.port, host: '127.0.0.1' }) })
+  const tunnel = net.connect({ port: w.proxyPort, host: '127.0.0.1', allowHalfOpen: true }, () => tunnel.write('CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n'))
+  tunnel.on('data', () => {})
+  await once(tunnel, 'end')
+  await waitUntil(async () => (await connections(w.fwd.servers[1])) === 0)
+  tunnel.destroy()
+})
+
+// A PR that leaves partway through a plain-HTTP answer frees the upstream.
+test('a PR that leaves partway through a plain-HTTP answer frees its upstream', BOUNDED, async (t) => {
+  let appSockets = 0
+  const w = await world(t, {
+    allow: ['api.example.com'],
+    app: (req, res) => { appSockets++; res.writeHead(200, { 'content-length': '100000' }); res.write('x'.repeat(1000)) }, // and never more
+  })
+  const connections = () => new Promise(resolve => w.fwd.servers[1].getConnections((_, n) => resolve(n)))
+  const socket = net.connect(w.proxyPort, '127.0.0.1', () => socket.write('GET http://api.example.com/part HTTP/1.1\r\nHost: api.example.com\r\n\r\n'))
+  await once(socket, 'data')
+  socket.destroy()
+  await waitUntil(async () => (await connections()) === 0)
+  // the app's side of it is gone too
+  const appConnections = () => new Promise(resolve => w.appServer.getConnections((_, n) => resolve(n)))
+  await waitUntil(async () => (await appConnections()) === 0)
+  assert.equal(appSockets, 1)
+})
+
+test('more entries and targets that must be refused: a bare userinfo, slashes, an escape, a newline, lookalike slashes; and forward.to with whitespace', BOUNDED, async () => {
+  for (const entry of ['@evil.org', '/evil.org', '//evil.org', '\\evil.org', 'api.example.com%2e', 'api.exa\nmple.com', 'github.com⁄myorg', 'github.com∕myorg', 'github.com⧵myorg']) {
+    assert.throws(() => parseAllowlist([entry]), /must be a host name/, JSON.stringify(entry))
+  }
+  const rules = parseAllowlist(['api.example.com'])
+  assert.deepEqual(await checkTarget(rules, '@api.example.com', 443, async () => [{ address: '93.184.216.34', family: 4 }]), { refused: 'not a host name' })
+  for (const to of [' 127.0.0.1:3000', '127.0.0.1:3000 ', '127.0.0.1 :3000']) {
+    await assert.rejects(createForwarder({ host: '127.0.0.1', forward: { listen: await free(), to } }), /forward needs listen/, JSON.stringify(to))
+  }
+})
+
+// A plain-HTTP answer cut partway through: a client whose answer is
+// close-delimited (HTTP/1.0, so no chunks) would read a clean end as the
+// whole answer, so it gets a reset.
+test('a plain-HTTP answer cut partway reaches an HTTP/1.0 client as ECONNRESET, never a clean end', BOUNDED, async (t) => {
+  const w = await world(t, {
+    allow: ['api.example.com'],
+    app: (req, res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.write('x'.repeat(1000)); setTimeout(() => res.socket.destroy(), 50) },
+  })
+  const client = net.connect(w.proxyPort, '127.0.0.1', () => client.write('GET http://api.example.com/cut HTTP/1.0\r\nHost: api.example.com\r\n\r\n'))
+  let got = ''
+  const outcome = await new Promise(resolve => {
+    client.on('data', chunk => { got += chunk })
+    client.on('error', err => resolve(err.code))
+    client.on('end', () => resolve('a clean end'))
+  })
+  assert.doesNotMatch(got, /transfer-encoding|content-length/i, 'close-delimited')
+  assert.equal(outcome, 'ECONNRESET')
+})
+
+// The other way: a PR that resets its side of a tunnel reaches the host as a
+// reset too, never as a clean end of what it sent.
+test('a PR that resets mid-tunnel reaches the host as ECONNRESET, never a clean end', BOUNDED, async (t) => {
+  let settle
+  const outcome = new Promise(resolve => { settle = resolve })
+  const host = net.createServer(socket => {
+    socket.on('data', () => {})
+    socket.on('error', err => settle(err.code))
+    socket.on('end', () => settle('a clean end'))
+  })
+  const hostPort = await listening(host)
+  t.after(() => host.close())
+  const w = await world(t, { allow: ['api.example.com'], connect: () => net.connect({ port: hostPort, host: '127.0.0.1' }) })
+  const ok = await connectVia(w.proxyPort, 'api.example.com:443')
+  assert.equal(ok.status, 200)
+  ok.socket.write('partway')
+  await new Promise(resolve => setTimeout(resolve, 50))
+  ok.socket.resetAndDestroy()
+  assert.equal(await outcome, 'ECONNRESET')
+})
+
+// The other way: a PR uploading to a slow host is waiting on the host's
+// backpressure, not idle, so its side of the tunnel isn't cut either. The
+// host reads slowly for two seconds, then all it can: the upload is far more
+// than the kernel's buffers hold, so the forwarder is still handing bytes
+// over when the host speeds up. (Bytes already in those buffers move where
+// no timer sees them: a host that reads them slower than one idle period
+// can still be cut.)
+test('a PR uploading to a slow but steady host isn\'t cut by the idle timer: every byte arrives', { timeout: 30_000 }, async (t) => {
+  const BIG = 16 * 1024 * 1024
+  let received
+  const got = new Promise(resolve => { received = resolve })
+  const host = net.createServer({ allowHalfOpen: true }, socket => {
+    socket.on('error', () => {})
+    // one chunk every 100 ms for two seconds, then all it can
+    const start = Date.now()
+    let total = 0
+    socket.on('data', chunk => {
+      total += chunk.length
+      if (total >= BIG) return received(total)
+      if (Date.now() - start > 2000) return
+      socket.pause()
+      setTimeout(() => socket.resume(), 100)
+    })
+    socket.on('close', () => received(total))
+  })
+  const hostPort = await listening(host)
+  t.after(() => host.close())
+  const w = await world(t, { allow: ['api.example.com'], timeouts: { idleMs: 1000 }, connect: () => net.connect({ port: hostPort, host: '127.0.0.1' }) })
+  const ok = await connectVia(w.proxyPort, 'api.example.com:443')
+  assert.equal(ok.status, 200)
+  ok.socket.on('error', () => {})
+  ok.socket.on('data', () => {})
+  ok.socket.write(Buffer.alloc(BIG, 0x75))
+  assert.equal(await got, BIG)
+  ok.socket.destroy()
+})
+
+// The idle timer's rules, with stand-in sockets on real timers: what moved is
+// what the test says moved.
+function fakeSocket() {
+  const s = new EventEmitter()
+  Object.assign(s, { bytesRead: 0, bytesWritten: 0, writableLength: 0, _handle: { writeQueueSize: 0 }, paused: false, writableNeedDrain: false, destroyed: false, timer: null })
+  s.isPaused = () => s.paused
+  s.setTimeout = ms => { clearTimeout(s.timer); s.timer = setTimeout(() => s.emit('timeout'), ms) }
+  s.stop = () => { clearTimeout(s.timer); s.destroyed = true }
+  return s
+}
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+function watched(ms, opts) {
+  const [socket, peer] = [fakeSocket(), fakeSocket()]
+  const cuts = []
+  const start = Date.now()
+  idleTimer(socket, peer, ms, () => { cuts.push(Date.now()); socket.stop() }, opts)
+  return { socket, peer, cuts, start, stop: () => { socket.stop(); peer.stop() } }
+}
+
+test('idleTimer: a socket where nothing moves is cut once, after ms and the grace', async (t) => {
+  const w = watched(100)
+  t.after(w.stop)
+  await sleep(450)
+  assert.equal(w.cuts.length, 1)
+  const at = w.cuts[0] - w.start
+  assert.ok(at >= 195 && at < 400, `cut at ${at} ms`)
+})
+
+test('idleTimer: a socket waiting on a peer that moved since its last look is spared, and cut once the peer has stopped', async (t) => {
+  // the peer moves once, before the first look and never in a grace
+  const w = watched(200, { graceMs: 20, waiting: () => true })
+  t.after(w.stop)
+  await sleep(50)
+  w.peer._handle.writeQueueSize -= 1000
+  await sleep(700)
+  assert.equal(w.cuts.length, 1, 'cut in the end: the listener outlasts the re-arm')
+  const at = w.cuts[0] - w.start
+  assert.ok(at >= 395 && at < 650, `spared at the first look, cut at the second: ${at} ms`)
+})
+
+test('idleTimer: a paused socket whose peer keeps moving is never cut, however many times it is re-armed', async (t) => {
+  const w = watched(100, { graceMs: 20 })
+  t.after(w.stop)
+  w.socket.paused = true
+  for (let i = 0; i < 16; i++) { await sleep(60); w.peer.bytesWritten += 1000 }
+  assert.deepEqual(w.cuts, [], 'not cut while the peer moves')
+  const stopped = Date.now()
+  await sleep(500)
+  assert.equal(w.cuts.length, 1, 'cut once the peer stopped')
+  assert.ok(w.cuts[0] - stopped < 400, `within twice ms and the grace: ${w.cuts[0] - stopped} ms`)
+})
+
+test('idleTimer: each side waiting on the other, with nothing moving, is still cut', async (t) => {
+  const w = watched(100, { waiting: () => true })
+  t.after(w.stop)
+  await sleep(500)
+  assert.equal(w.cuts.length, 1)
+})
+
+test('idleTimer: a stalled event loop isn\'t idleness: I/O that was due when the timer fired, and lands in the grace, spares the socket', async (t) => {
+  const w = watched(100)
+  t.after(w.stop)
+  await sleep(50)
+  // the loop stalls past the timer's deadline, outside the timers phase as
+  // a long callback would; the next turn runs the late timer first, and
+  // what moved meanwhile shows only after it, as I/O does
+  await new Promise(resolve => setImmediate(resolve))
+  const until = Date.now() + 200
+  while (Date.now() < until);
+  setImmediate(() => { w.socket.bytesRead += 1000 })
+  // past the grace (it ends 100 ms after the late timer), before the next look
+  await sleep(160)
+  assert.deepEqual(w.cuts, [], 'spared')
+  await sleep(500)
+  assert.equal(w.cuts.length, 1, 'and cut once nothing moves')
+})
+
+test('idleTimer: a socket gone during the grace isn\'t cut', async (t) => {
+  const w = watched(100)
+  t.after(w.stop)
+  await sleep(150)
+  w.socket.destroyed = true
+  await sleep(250)
+  assert.deepEqual(w.cuts, [])
+})
+
+// An idle cut resets the host's side too, not only the PR's.
+test('a tunnel cut for idleness reaches the host as ECONNRESET too', BOUNDED, async (t) => {
+  let settle
+  const outcome = new Promise(resolve => { settle = resolve })
+  const host = net.createServer(socket => {
+    socket.on('data', () => {})
+    socket.on('error', err => settle(err.code))
+    socket.on('end', () => settle('a clean end'))
+  })
+  const hostPort = await listening(host)
+  t.after(() => host.close())
+  const w = await world(t, { allow: ['api.example.com'], timeouts: { idleMs: 100 }, connect: () => net.connect({ port: hostPort, host: '127.0.0.1' }) })
+  const ok = await connectVia(w.proxyPort, 'api.example.com:443')
+  assert.equal(ok.status, 200)
+  ok.socket.on('error', () => {})
+  assert.equal(await outcome, 'ECONNRESET')
+})
+
+// --- Round 2 of #40's review ---------------------------------------------------------
+
+// The PR's side of a plain-HTTP answer had no timer once the host was done:
+// a PR that stopped reading near the end held it for ever, at answer sizes
+// where the last of it no longer fits the kernel's buffers (around 850 KB on
+// loopback). A sweep of sizes there, every one let go once nothing moves.
+test('a plain-HTTP answer the host has finished, to a PR that never reads, is closed once nothing moves: no connection is held', { timeout: 30_000 }, async (t) => {
+  const w = await world(t, {
+    allow: ['api.example.com'],
+    timeouts: { idleMs: 300 },
+    app: (req, res) => {
+      const size = Number(req.url.split('/').at(-1))
+      res.writeHead(200, { 'content-length': String(size) })
+      res.end(Buffer.alloc(size, 0x62))
+    },
+  })
+  const sizes = Array.from({ length: 24 }, (_, i) => 800_000 + i * 8_192)
+  const clients = await Promise.all(sizes.map(async size => {
+    const c = net.connect(w.proxyPort, '127.0.0.1')
+    c.on('error', () => {})
+    await once(c, 'connect')
+    c.pause() // never reads
+    c.write(`GET http://api.example.com/${size} HTTP/1.1\r\nHost: api.example.com\r\nConnection: close\r\n\r\n`)
+    return c
+  }))
+  t.after(() => { for (const c of clients) c.destroy() })
+  const connections = server => new Promise(resolve => server.getConnections((_, n) => resolve(n)))
+  // every answer is done on the host's side well before the PR's is let go
+  await waitUntil(async () => (await connections(w.appServer)) === 0, 10_000)
+  await waitUntil(async () => (await connections(w.fwd.servers[1])) === 0, 10_000)
+})
+
+// A host that fails after the headers: a close-delimited answer (HTTP/1.0)
+// would read a clean end as complete, so the PR gets a reset. Both ways it
+// fails: a reset from the host, and a host that stalls past idleMs.
+test('a plain-HTTP host that resets or stalls after the headers gives an HTTP/1.0 client ECONNRESET, never a clean end', BOUNDED, async (t) => {
+  const w = await world(t, {
+    allow: ['api.example.com'],
+    timeouts: { idleMs: 300 },
+    app: (req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.write('x'.repeat(1000))
+      if (req.url.endsWith('/reset')) setTimeout(() => res.socket.resetAndDestroy(), 50)
+      // else: never another byte
+    },
+  })
+  for (const path of ['reset', 'stall']) {
+    const client = net.connect(w.proxyPort, '127.0.0.1', () => client.write(`GET http://api.example.com/${path} HTTP/1.0\r\nHost: api.example.com\r\n\r\n`))
+    let got = ''
+    const outcome = await new Promise(resolve => {
+      client.on('data', chunk => { got += chunk })
+      client.on('error', err => resolve(err.code))
+      client.on('end', () => resolve('a clean end'))
+    })
+    assert.match(got, /^HTTP\/1\.1 200/, path)
+    assert.doesNotMatch(got, /transfer-encoding|content-length/i, `${path}: close-delimited`)
+    assert.equal(outcome, 'ECONNRESET', path)
+  }
+})
+
+// The inbound forward, the other way round from the app's reset: a client
+// that resets partway through its request reaches the app as a reset too.
+test('a client that resets mid-request through the inbound forward reaches the app as ECONNRESET, never a clean end', BOUNDED, async (t) => {
+  let settle
+  const outcome = new Promise(resolve => { settle = resolve })
+  const app = net.createServer(socket => {
+    socket.on('data', () => {})
+    socket.on('error', err => settle(err.code))
+    socket.on('end', () => settle('a clean end'))
+  })
+  const appPort = await listening(app)
+  t.after(() => app.close())
+  const fwd = await createForwarder({ host: '127.0.0.1', forward: { listen: await free(), to: `127.0.0.1:${appPort}` } })
+  t.after(() => fwd.close())
+  const client = net.connect(fwd.servers[0].address().port, '127.0.0.1')
+  client.on('error', () => {})
+  await once(client, 'connect')
+  client.write('POST /upload HTTP/1.1\r\nHost: app\r\nContent-Length: 100000\r\n\r\n')
+  client.write('y'.repeat(1000), () => setTimeout(() => client.resetAndDestroy(), 50))
+  assert.equal(await outcome, 'ECONNRESET')
+})
+
+// A listed host that takes the request and never answers: after idleMs the
+// PR gets a 502 `failed`, never a reset (the PR-side timer is armed only
+// once the answer's headers are written).
+test('a plain-HTTP host that accepts the request but never answers gets the PR a 502 failed after idleMs', BOUNDED, async (t) => {
+  const silent = net.createServer(socket => { socket.on('error', () => {}); socket.on('data', () => {}) })
+  const silentPort = await listening(silent)
+  t.after(() => silent.close())
+  const w = await world(t, { allow: ['api.example.com'], timeouts: { idleMs: 300 }, connect: () => net.connect({ port: silentPort, host: '127.0.0.1' }) })
+  const out = await viaProxy(w.proxyPort, 'http://api.example.com/slow')
+  assert.deepEqual([out.status, out.headers['x-qa-egress']], [502, 'failed'])
 })
