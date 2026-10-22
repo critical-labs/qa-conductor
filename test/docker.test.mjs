@@ -456,11 +456,11 @@ const SHIM_BANNER = 'Emulate Docker CLI using podman. Create /etc/containers/nod
 const LOGRUS_PIPE = 'time="2026-10-15T10:00:00Z" level=warning msg="The cgroupv2 manager is set to systemd but there is no systemd user session available"'
 const LOGRUS_TTY = 'WARN[0000] Using cgroups-v1 which is deprecated in favor of cgroups-v2 with Podman v5 and will be removed in a future version.'
 
-test('rmForce removes all names in one call, and tolerates only names already gone', async () => {
+test('rmForce removes each name in a call of its own, and tolerates only names already gone', async () => {
   const exec = recordingExec()
   const docker = createDocker({ execFileFn: exec })
   await docker.rmForce(['qa-app-base', 'qa-pg-base'])
-  assert.deepEqual(exec.calls, [['docker', 'rm', '-f', '-v', 'qa-app-base', 'qa-pg-base']])
+  assert.deepEqual(exec.calls, [['docker', 'rm', '-f', '-v', 'qa-app-base'], ['docker', 'rm', '-f', '-v', 'qa-pg-base']])
 
   // docker rm exits 1 when any name is missing, having removed the others
   for (const err of [
@@ -473,6 +473,7 @@ test('rmForce removes all names in one call, and tolerates only names already go
     dockerFailure(`${SHIM_BANNER}\nError: no container with name or ID "a" found: no such container\n`),
     dockerFailure(`${LOGRUS_PIPE}\nError: no container with name or ID "a" found: no such container\n`),
     dockerFailure(`${LOGRUS_TTY}\nError: no container with name or ID "a" found: no such container\n`),
+    dockerFailure('Error response from daemon: No such container: a\nexit status 1\n'),
   ]) {
     await createDocker({ execFileFn: recordingExec([err]) }).rmForce(['a', 'b'])
   }
@@ -525,6 +526,54 @@ test('runtime keeps what docker version said when docker info fails, and fails o
   assert.deepEqual([out.version, out.os, out.osError], ['Client: Podman Engine\nVersion: 5.2.0\n', null, infoFails])
   const down = dockerFailure('Cannot connect to the Docker daemon\n')
   await assert.rejects(createDocker({ execFileFn: recordingExec([down]) }).runtime(), e => e === down)
+})
+
+// Behind the podman-docker shim, `docker context inspect` is Podman's,
+// which has no Docker context: it prints nothing, or fails on the template.
+// The daemon's endpoint is then Podman's own connection.
+test('endpoint under the podman-docker shim: CONTAINER_HOST, the connection CONTAINER_CONNECTION names, the default one, else local', async () => {
+  const contextFails = dockerFailure('Error: template: inspect:1:12: executing "inspect" at <.Endpoints.docker.Host>: can\'t evaluate field Endpoints in type config.Connection\n')
+  const list = JSON.stringify([
+    { Name: 'machine', URI: 'ssh://core@127.0.0.1:50000/run/user/1000/podman/podman.sock', Identity: '/x', Default: true },
+    { Name: 'here', URI: 'unix:///run/podman/podman.sock', Identity: '', Default: false },
+  ])
+  const at = (answers, env = {}) => createDocker({ execFileFn: recordingExec(answers), env })
+  assert.equal(await at(['\n', '[]\n']).endpoint({ podman: true }), 'local')
+  assert.equal(await at([contextFails, 'null\n']).endpoint({ podman: true }), 'local')
+  assert.equal(await at(['', '']).endpoint({ podman: true }), 'local')
+  assert.equal(await at(['', list]).endpoint({ podman: true }), 'ssh://core@127.0.0.1:50000/run/user/1000/podman/podman.sock')
+  assert.equal(await at(['', list], { CONTAINER_CONNECTION: 'here' }).endpoint({ podman: true }), 'unix:///run/podman/podman.sock')
+  await assert.rejects(at(['', list], { CONTAINER_CONNECTION: 'gone' }).endpoint({ podman: true }), /CONTAINER_CONNECTION names "gone", which podman doesn't list/)
+  assert.equal(await at([''], { CONTAINER_HOST: 'tcp://10.0.0.5:8888' }).endpoint({ podman: true }), 'tcp://10.0.0.5:8888')
+  await assert.rejects(at(['', '{"Name":"x"}']).endpoint({ podman: true }), /gave no list/)
+  // the docker CLI against Podman's socket has a context, and that is it
+  assert.equal(await at(['unix:///run/podman/podman.sock\n'], { CONTAINER_HOST: 'ssh://elsewhere' }).endpoint({ podman: true }), 'unix:///run/podman/podman.sock')
+  // Docker's own CLI: a failure is still one, and nothing is asked of Podman
+  await assert.rejects(at([contextFails]).endpoint(), e => e === contextFails)
+  const exec = recordingExec(['', '[]'])
+  await createDocker({ execFileFn: exec, env: {} }).endpoint({ podman: true })
+  assert.deepEqual(exec.calls, [
+    ['docker', 'context', 'inspect', '--format', '{{.Endpoints.docker.Host}}'],
+    ['docker', 'system', 'connection', 'list', '--format', 'json'],
+  ])
+})
+
+// Podman's own CLI (behind the podman-docker shim) has no .IPAM in its
+// network inspect: its gateways are under .Subnets.
+test('networkGateways reads Podman\'s own format when Docker\'s has no .IPAM, and any other failure is one', async () => {
+  const noIpam = dockerFailure('Error: template: inspect:1:8: executing "inspect" at <.IPAM.Config>: can\'t evaluate field IPAM in type *types.Network\n')
+  const exec = recordingExec([noIpam, '10.89.0.1 fd00:89::1 \n'])
+  assert.deepEqual(await createDocker({ execFileFn: exec }).networkGateways('qa-session-pr'), ['10.89.0.1', 'fd00:89::1'])
+  assert.deepEqual(exec.calls, [
+    ['docker', 'network', 'inspect', '--format', '{{range .IPAM.Config}}{{.Gateway}} {{end}}', 'qa-session-pr'],
+    ['docker', 'network', 'inspect', '--format', '{{range .Subnets}}{{.Gateway}} {{end}}', 'qa-session-pr'],
+  ])
+  const gone = dockerFailure('Error: No such network: qa-session-pr\n')
+  const once = recordingExec([gone, '10.89.0.1 \n'])
+  await assert.rejects(createDocker({ execFileFn: once }).networkGateways('qa-session-pr'), e => e === gone)
+  assert.equal(once.calls.length, 1)
+  const both = dockerFailure('Error: network not found\n')
+  await assert.rejects(createDocker({ execFileFn: recordingExec([noIpam, both]) }).networkGateways('qa-session-pr'), e => e === both)
 })
 
 // A wedged daemon must not hold the boot at the probe for ever. The docker
@@ -581,6 +630,9 @@ test('createNetwork and rmNetwork build exact argv; rmNetwork tolerates only a n
     dockerFailure('Error response from daemon: unable to find network with name or ID qa-session-base: network not found\n'),
     dockerFailure(`${SHIM_BANNER}\nError: unable to find network with name or ID qa-session-base: network not found\n`),
     dockerFailure(`${LOGRUS_PIPE}\n${LOGRUS_TTY}\nError: unable to find network with name or ID qa-session-base: network not found\n`),
+    // the docker CLI on CI's Ubuntu runners adds a line of its own: what the
+    // integration test found, a sweep that failed on a clean host
+    dockerFailure('Error response from daemon: network qa-session-base not found\nexit status 1\n'),
   ]) {
     await createDocker({ execFileFn: recordingExec([err]) }).rmNetwork('gone')
   }
@@ -644,7 +696,8 @@ test('sweepQaContainers lists by label then force-removes', async () => {
   const ids = await docker.sweepQaContainers()
   assert.deepEqual(exec.calls, [
     ['docker', 'ps', '-aq', '--filter', 'label=qa-conductor-session'],
-    ['docker', 'rm', '-f', '-v', 'abc123', 'def456'],
+    ['docker', 'rm', '-f', '-v', 'abc123'],
+    ['docker', 'rm', '-f', '-v', 'def456'],
   ])
   assert.deepEqual(ids, ['abc123', 'def456'])
 })
@@ -696,4 +749,136 @@ test('logsTail rejects an unsafe container name without any exec call', async ()
   const docker = createDocker({ execFileFn: exec })
   await assert.rejects(docker.logsTail('bad;name'), /unsafe/)
   assert.equal(exec.calls.length, 0)
+})
+
+// --- #32: the PR pane on an internal network -------------------------------------
+
+test('an internal network, an app with no host port, the forwarder and a network connect build exact argv', async () => {
+  const exec = recordingExec()
+  const docker = createDocker({ execFileFn: exec })
+  await docker.createNetwork('qa-session-pr', { internal: true })
+  await docker.runApp('qa-app-pr', 'ghcr.io/x/app:pr-7-abc', 'qa-session-pr', '/compose/.env.qa-pr', null)
+  const config = { host: '0.0.0.0', forward: { listen: 3000, to: 'qa-app-pr:3000' }, proxy: { listen: 3128, allow: ['api.example.com'] } }
+  await docker.runForwarder('qa-fwd-pr', 'node:22-alpine', 'qa-session-pr-edge', { hostPort: 3112, config, source: 'console.log(1)' })
+  await docker.connectNetwork('qa-session-pr', 'qa-fwd-pr', { alias: 'qa-egress' })
+  assert.equal(await docker.networkInternal('qa-session-pr'), false, 'docker answered nothing')
+  assert.deepEqual(exec.calls, [
+    ['docker', 'network', 'create', '--label', 'qa-conductor-session', '--internal', 'qa-session-pr'],
+    ['docker', 'run', '-d', '--name', 'qa-app-pr', '--network', 'qa-session-pr', '--label', 'qa-conductor-session', '--cap-drop', 'NET_RAW', '--env-file', '/compose/.env.qa-pr', 'ghcr.io/x/app:pr-7-abc'],
+    [
+      'docker', 'run', '-d', '--name', 'qa-fwd-pr', '--network', 'qa-session-pr-edge', '--label', 'qa-conductor-session',
+      '--cap-drop', 'ALL', '--read-only', '--security-opt', 'no-new-privileges', '--user', 'node',
+      '-p', '127.0.0.1:3112:3000', '-e', `PANE_FORWARDER=${JSON.stringify(config)}`,
+      '--entrypoint', 'node', 'node:22-alpine', '--input-type=module', '-e', 'console.log(1)',
+    ],
+    ['docker', 'network', 'connect', '--alias', 'qa-egress', 'qa-session-pr', 'qa-fwd-pr'],
+    ['docker', 'network', 'inspect', '--format', '{{.Internal}}', 'qa-session-pr'],
+  ])
+  assert.equal(await createDocker({ execFileFn: recordingExec(['true\n']) }).networkInternal('qa-session-pr'), true)
+  await assert.rejects(docker.runForwarder('qa fwd', 'node:22-alpine', 'x', { hostPort: 1, config, source: '' }), /unsafe container name/)
+  await assert.rejects(docker.connectNetwork('x', 'qa fwd', { alias: 'a' }), /unsafe container name/)
+})
+
+// #40's review: a DNS server for the PR pane's containers on an internal
+// network (CVE-2024-29018), and whether the forwarder runs.
+test('runPg, runMigrate, runApp and runProbe take a DNS server, and all but runPg hosts entries; containerRunning and addressOn read the container', async () => {
+  const exec = recordingExec(['', '', '', '', 'true\n', ''])
+  const docker = createDocker({ execFileFn: exec })
+  await docker.runPg('qa-pg-pr', 'qa-session-pr', { password: 'pw', dns: '192.0.2.1' })
+  await docker.runMigrate('m:1', 'qa-session-pr', '/e', { name: 'qa-migrate-pr', dns: '192.0.2.1' })
+  await docker.runApp('qa-app-pr', 'a:1', 'qa-session-pr', '/e', null, { dns: '192.0.2.1' })
+  await docker.runProbe('qa-probe-pr', 'qa-session-pr', 'true', [], { dns: '192.0.2.1' })
+  assert.equal(await docker.containerRunning('qa-fwd-pr'), true)
+  assert.equal(await docker.containerRunning('qa-fwd-pr'), false, 'docker answered nothing')
+  for (const call of exec.calls.slice(0, 4)) {
+    const at = call.indexOf('--dns')
+    assert.ok(at !== -1 && call[at + 1] === '192.0.2.1' && call.indexOf('--network') < at, call.join(' '))
+  }
+  assert.deepEqual(exec.calls.slice(4), [
+    ['docker', 'inspect', '--format', '{{.State.Running}}', 'qa-fwd-pr'],
+    ['docker', 'inspect', '--format', '{{.State.Running}}', 'qa-fwd-pr'],
+  ])
+  // without one, the argv is as before
+  const plain = recordingExec()
+  await createDocker({ execFileFn: plain }).runApp('qa-app-pr', 'a:1', 'qa-session-pr', '/e', 3112)
+  assert.equal(plain.calls[0].includes('--dns'), false)
+  await assert.rejects(docker.containerRunning('qa fwd'), /unsafe container name/)
+  // hosts entries, after the DNS server, for all but the database
+  const hosted = recordingExec(['', '', '', '172.20.0.3\n'])
+  const h = createDocker({ execFileFn: hosted })
+  const hosts = ['qa-pg-pr:172.20.0.3', 'qa-egress:172.20.0.2']
+  await h.runMigrate('m:1', 'qa-session-pr', '/e', { name: 'qa-migrate-pr', dns: '192.0.2.1', hosts })
+  await h.runApp('qa-app-pr', 'a:1', 'qa-session-pr', '/e', null, { dns: '192.0.2.1', hosts })
+  await h.runProbe('qa-probe-pr', 'qa-session-pr', 'true', [], { dns: '192.0.2.1', hosts })
+  for (const call of hosted.calls.slice(0, 3)) {
+    const at = call.indexOf('--dns')
+    assert.deepEqual(call.slice(at, at + 6), ['--dns', '192.0.2.1', '--add-host', 'qa-pg-pr:172.20.0.3', '--add-host', 'qa-egress:172.20.0.2'], call.join(' '))
+  }
+  assert.equal(await h.addressOn('qa-pg-pr', 'qa-session-pr'), '172.20.0.3')
+  assert.deepEqual(hosted.calls[3], ['docker', 'inspect', '--format', '{{with index .NetworkSettings.Networks "qa-session-pr"}}{{.IPAddress}}{{end}}', 'qa-pg-pr'])
+  await assert.rejects(h.addressOn('qa-pg-pr', 'qa session'), /unsafe network name/)
+  for (const bad of ['qa-pg-pr', 'qa pg:1.2.3.4', 'qa-pg-pr:1.2.3.4 --privileged', '--privileged:1.2.3.4']) {
+    await assert.rejects(h.runApp('qa-app-pr', 'a:1', 'qa-session-pr', '/e', null, { hosts: [bad] }), /unsafe host entry/, bad)
+  }
+})
+
+// --- Round 3 of #40's review ---------------------------------------------------------
+
+// Podman before 5.1 (Ubuntu 24.04's 4.9.3, Debian 12's 4.3.1, as the
+// podman-docker shim drives it): `rm -f a b c` stops at the first name
+// that is gone, removes none of the rest, and exits 0.
+function oldPodmanRm(present) {
+  const calls = []
+  const fn = async (file, args) => {
+    calls.push(args.join(' '))
+    if (args[0] === 'rm') {
+      const names = args.slice(3)
+      if (names.some(n => !present.has(n))) return { stdout: '' }
+      for (const n of names) present.delete(n)
+      return { stdout: `${names.join('\n')}\n` }
+    }
+    if (args[0] === 'ps') return { stdout: `${[...present].join('\n')}\n` }
+    return { stdout: '' }
+  }
+  fn.calls = calls
+  return fn
+}
+
+test('rmForce and the sweep remove every container under Podman before 5.1, whose batched rm stops at a name already gone', async () => {
+  // what the batch did there: nothing removed, exit 0
+  const batch = new Set(['qa-app-pr', 'qa-fwd-pr', 'qa-pg-pr'])
+  await createDocker({ execFileFn: oldPodmanRm(batch) }).run(['rm', '-f', '-v', 'qa-app-pr', 'qa-migrate-pr', 'qa-fwd-pr', 'qa-pg-pr'])
+  assert.equal(batch.size, 3, 'the old batch removed nothing')
+  // one name at a time removes them all
+  const present = new Set(['qa-app-pr', 'qa-fwd-pr', 'qa-pg-pr'])
+  await createDocker({ execFileFn: oldPodmanRm(present) }).rmForce(['qa-app-pr', 'qa-migrate-pr', 'qa-probe-pr', 'qa-fwd-pr', 'qa-pg-pr'])
+  assert.deepEqual([...present], [])
+  // the sweep too, with a container gone between its list and its rm
+  const swept = new Set(['c1', 'c2', 'c3'])
+  const exec = oldPodmanRm(swept)
+  const docker = createDocker({ execFileFn: async (file, args) => { const out = await exec(file, args); if (args[0] === 'ps') swept.delete('c2'); return out } })
+  await docker.sweepQaContainers()
+  assert.deepEqual([...swept], [])
+})
+
+// A real failure whose last line ends in "exit status N" is no noise: only
+// a line that is nothing but that is.
+test('a failure line that only ends in "exit status N" is a failure, never noise', async () => {
+  const err = dockerFailure('Error response from daemon: No such container: a\nError: OCI runtime error: crun: kill: exit status 125\n')
+  await assert.rejects(createDocker({ execFileFn: recordingExec([err]) }).rmForce(['a']), e => e === err)
+  const gone = dockerFailure('Error response from daemon: No such container: a\nexit status 1\n')
+  await createDocker({ execFileFn: recordingExec([gone]) }).rmForce(['a'])
+})
+
+test('createNetwork can isolate an internal network\'s gateway, and networkGatewayIsolated reads it back', async () => {
+  const exec = recordingExec(['', 'isolated\n', '\n'])
+  const docker = createDocker({ execFileFn: exec })
+  await docker.createNetwork('qa-session-pr', { internal: true, isolatedGateway: true })
+  assert.equal(await docker.networkGatewayIsolated('qa-session-pr'), true)
+  assert.equal(await docker.networkGatewayIsolated('qa-session-pr'), false)
+  assert.deepEqual(exec.calls, [
+    ['docker', 'network', 'create', '--label', 'qa-conductor-session', '--internal', '-o', 'com.docker.network.bridge.gateway_mode_ipv4=isolated', '-o', 'com.docker.network.bridge.gateway_mode_ipv6=isolated', 'qa-session-pr'],
+    ['docker', 'network', 'inspect', '--format', '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}', 'qa-session-pr'],
+    ['docker', 'network', 'inspect', '--format', '{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}', 'qa-session-pr'],
+  ])
 })

@@ -169,3 +169,126 @@ test('the README\'s Contents link every second-level heading after it, in order'
   const want = headings.slice(1).map(heading => [...anchors(`## ${heading}`)][0])
   assert.deepEqual(linked.filter(anchor => want.includes(anchor)), want)
 })
+
+// The README's sandbox-exec profile, run as written, on a Mac: each port it
+// names is refused over IPv4, IPv6, localhost, IPv4-mapped IPv6 and other
+// spellings of loopback, another port isn't, and a parameter left out keeps
+// the profile from loading. QA_SANDBOX_ROUNDS (3 by default; CI's job asks
+// for 30) repeats every try, so one pass means something. The profile's
+// parameters are the ones the README's wiring passes and its check names.
+// Elsewhere it is skipped, and so is it where sandbox-exec can't nest (this
+// process already runs in a sandbox), unless QA_REQUIRE_SANDBOX=1 asks for
+// it, as CI's macos-sandbox job does: then it fails instead.
+const SANDBOX_EXEC = '/usr/bin/sandbox-exec'
+const REQUIRE_SANDBOX = process.env.QA_REQUIRE_SANDBOX === '1'
+const runSandbox = async (args, opts = {}) => {
+  const { execFile } = await import('node:child_process')
+  return new Promise(resolve => execFile(SANDBOX_EXEC, args, { timeout: 15_000, ...opts }, (err, stdout, stderr) => resolve({ code: typeof err?.code === 'number' ? err.code : err ? -1 : 0, stdout, stderr })))
+}
+async function whyNoSandbox() {
+  if (process.platform !== 'darwin') return 'not macOS'
+  if (!existsSync(SANDBOX_EXEC)) return `no ${SANDBOX_EXEC}`
+  // sandbox-exec can't nest: under a sandbox already, applying a profile
+  // fails with exit 71
+  const probe = await runSandbox(['-p', '(version 1)(allow default)', '/usr/bin/true'])
+  if (probe.code === 71 && /sandbox_apply: Operation not permitted/.test(probe.stderr)) return 'sandbox-exec can\'t nest, and this process already runs in a sandbox'
+  return null
+}
+// Decided in the test, not as the file loads: the probe can take a while,
+// and a test registered late would be cut off by --test-force-exit.
+test('the README\'s sandbox-exec profile shuts the ports it names, over IPv4, IPv6, localhost and IPv4-mapped IPv6, and no other; a parameter left out keeps it from loading', { timeout: 120_000 }, async (t) => {
+  const noSandbox = await whyNoSandbox()
+  if (noSandbox && !REQUIRE_SANDBOX) return t.skip(noSandbox)
+  if (noSandbox) assert.fail(`QA_REQUIRE_SANDBOX=1, but ${noSandbox}`)
+  const net = await import('node:net')
+  const { rmSync } = await import('node:fs')
+  const lines = section('#### A `sandbox-exec` profile for the process Provisioner (macOS)')
+  const text = lines.join('\n')
+  const open = lines.indexOf('```scheme')
+  assert.ok(open >= 0, 'the section has a scheme block')
+  const profile = lines.slice(open + 1, lines.indexOf('```', open + 1)).join('\n')
+  // The profile's parameters, the wiring's and the check's: the same names
+  const names = [...profile.matchAll(/\(param "([A-Z_]+)"\)/g)].map(m => m[1])
+  assert.deepEqual(names, ['HARNESS', 'BASE_PROXY', 'PR_PROXY', 'BASE_APP', 'BASE_DB'])
+  const conductorPorts = Object.keys(JSON.parse(/const conductorPorts = (\{[^}]*\})/.exec(text)[1].replace(/'/g, '"').replace(/(\w+):/g, '"$1":')))
+  const basePorts = [...text.matchAll(/basePorts\.([A-Z_]+) =/g)].map(m => m[1])
+  assert.deepEqual([...conductorPorts, ...basePorts].sort(), [...names].sort(), 'the wiring passes every parameter the profile names')
+  const checked = [...text.matchAll(/-D ([A-Z_]+)=/g)].map(m => m[1])
+  assert.deepEqual([...new Set(checked)].sort(), [...names].sort(), 'the check names every parameter')
+
+  const dir = mkdtempSync(path.join(tmpdir(), 'qa-sbx-'))
+  const file = path.join(dir, 'pr-pane.sb')
+  writeFileSync(file, profile)
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  // one port on both loopback addresses: IPv4 first, then the same on ::1
+  const listen = (host, port) => new Promise((resolve, reject) => {
+    const server = net.createServer(socket => { socket.on('error', () => {}); socket.end('hi') })
+    server.once('error', reject)
+    server.listen(port, host, () => resolve(server))
+  })
+  const servers = []
+  t.after(() => { for (const server of servers) server.close() })
+  const both = async () => {
+    for (let i = 0; i < 20; i++) {
+      const v4 = await listen('127.0.0.1', 0)
+      const v6 = await listen('::1', v4.address().port).catch(() => null)
+      if (v6) { servers.push(v4, v6); return v4.address().port }
+      v4.close()
+    }
+    throw new Error('no port free on both 127.0.0.1 and ::1')
+  }
+  const ports = {}
+  for (const name of [...names, 'OTHER']) ports[name] = await both()
+  const HOSTS = ['127.0.0.1', '::1', 'localhost', '::ffff:127.0.0.1', '::ffff:7f00:1', '127.1', '0.0.0.0']
+  const tries = [...names, 'OTHER'].flatMap(name => HOSTS.map(host => [`${name} over ${host}`, host, ports[name]]))
+  const rounds = Number(process.env.QA_SANDBOX_ROUNDS) || 3
+  // Every try, `rounds` times, one round after another. Each outcome; for
+  // one that broke the rule, what it reached (address and port), the
+  // addresses Node tried in turn (localhost's fallback from ::1 to
+  // 127.0.0.1, say), the round and its place in it, and what localhost
+  // resolves to: CI's macOS 14 once connected over localhost to a named
+  // port, so a failure says how
+  const client = `
+    const net = require('net')
+    const [tries, rounds] = JSON.parse(process.argv[1])
+    const out = {}
+    const odd = []
+    const one = (round, seq, [name, host, port]) => new Promise(resolve => {
+      const socket = net.connect({ host, port })
+      const record = outcome => {
+        const want = name.startsWith('OTHER') ? 'connected' : 'EPERM'
+        if (out[name] === undefined || out[name] === want) out[name] = outcome
+        if (outcome !== want) odd.push({ name, round, seq, port, outcome, remote: socket.remoteAddress ? socket.remoteAddress + ':' + socket.remotePort : null, tried: socket.autoSelectFamilyAttemptedAddresses ?? null })
+        socket.destroy()
+        resolve()
+      }
+      socket.on('connect', () => record('connected'))
+      socket.on('error', err => record(err.code ?? String(err)))
+    })
+    ;(async () => {
+      for (let round = 0; round < rounds; round++) await Promise.all(tries.map((t, seq) => one(round, seq, t)))
+      require('dns').lookup('localhost', { all: true }, (err, list) => console.log(JSON.stringify({ out, odd: odd.slice(0, 20), oddCount: odd.length, localhost: err ? err.code : list.map(a => a.address) })))
+    })()`
+  const flags = names.flatMap(name => ['-D', `${name}=${ports[name]}`])
+  const got = await runSandbox([...flags, '-f', file, process.execPath, '-e', client, JSON.stringify([tries, rounds])], { timeout: 90_000 })
+  assert.equal(got.code, 0, got.stderr)
+  const { out, odd, oddCount, localhost } = JSON.parse(got.stdout)
+  assert.deepEqual(out, Object.fromEntries(tries.map(([name]) => [name, name.startsWith('OTHER') ? 'connected' : 'EPERM'])), JSON.stringify({ rounds, oddCount, odd, localhost, ports }))
+  assert.equal(oddCount, 0, JSON.stringify({ rounds, odd, localhost, ports }))
+  // another of the host's addresses, not loopback: a named port is refused
+  // there too, before any connect, so it needs no listener. (An unnamed
+  // port there isn't tried: with nothing listening, a firewall may hold
+  // the connect.)
+  const { networkInterfaces } = await import('node:os')
+  const own = Object.values(networkInterfaces()).flat().find(a => a && a.family === 'IPv4' && !a.internal)
+  if (own) {
+    const away = names.map(name => [`${name} at ${own.address}`, own.address, ports[name]])
+    const there = await runSandbox([...flags, '-f', file, process.execPath, '-e', client, JSON.stringify([away, 1])])
+    assert.equal(there.code, 0, there.stderr)
+    assert.deepEqual(JSON.parse(there.stdout).out, Object.fromEntries(away.map(([name]) => [name, 'EPERM'])))
+  } else t.diagnostic('this host has no address but loopback: the profile\'s other-address case is untried')
+  // a parameter left out: the profile doesn't load, and nothing runs
+  const missing = await runSandbox([...flags.slice(0, -2), '-f', file, '/usr/bin/true'])
+  assert.equal(missing.code, 65, missing.stderr)
+  assert.match(missing.stderr, /string-append/)
+})

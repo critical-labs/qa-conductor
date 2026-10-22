@@ -12,7 +12,7 @@ The conductor owns the choreography: session state, cancellation, the harness UI
 - [Quickstart: QA your own app](#quickstart-qa-your-own-app)
 - [Use](#use), with the [Entry points](#entry-points)
 - [Using the harness](#using-the-harness)
-- [Security](#security)
+- [Security](#security), with the [Isolation verdicts](#isolation-verdicts) and the [Hardening opt-ins](#hardening-opt-ins)
 - [The seams](#the-seams): [Types](#types), [Contracts](#contracts-between-the-seams), the built-in [`build-worktree`](#built-in-adaptersbuild-worktree-git-worktree-buildconvention), [`provisioner-process`](#built-in-adaptersprovisioner-process-process-provisioner) and [`provisioner-docker`](#built-in-adaptersprovisioner-docker-docker-provisioner), the [Effect wrappers](#effect-wrappers), and [Exposure](#exposure-optional)
 - [Configuration](#configuration): [The env file](#the-env-file), [Sample `.env.qa` files](#sample-envqa-files), [Tokens](#tokens), [Keys](#keys), [A `cfg` built in code](#a-cfg-built-in-code)
 - [HTTP API](#http-api-harness-port), [Expose CLI](#expose-cli), [Demo](#demo)
@@ -175,7 +175,7 @@ It serves the harness on `cfg.ports.harness` and one proxy per pane on `cfg.port
 | `@critical-labs/qa-conductor/exposure` | `mountsFor`, `reconcileExposure`, `runExpose` | one [exposure](#exposure-optional) pass, outside a conductor |
 | `@critical-labs/qa-conductor/proxy` | `createPaneProxy`, `panePolicy`, `parseSetCookie`, `isAllowedHost`, `requestHostname`, `misdirected` | the pane proxy, and the [Host allowlist](#security) check every server runs |
 | `@critical-labs/qa-conductor/verdict` | `formatVerdict`, `postVerdict` | the verdict comment and label |
-| `@critical-labs/qa-conductor/adapters/provisioner-docker` | `createDockerProvisioner` | a Provisioner that runs each pane as containers on the host's Docker daemon |
+| `@critical-labs/qa-conductor/adapters/provisioner-docker` | `createDockerProvisioner`, `dockerEngineMajor` | a Provisioner that runs each pane as containers on the host's Docker daemon; and `dockerEngineMajor(version)`, Docker Engine's major version from `docker version`'s text, or `null` (Podman, or no server) |
 | `@critical-labs/qa-conductor/adapters/provisioner-process` | `createProcessProvisioner` | a Provisioner for local process groups |
 | `@critical-labs/qa-conductor/adapters/build-worktree` | `createWorktreeBuild`, `trustDecision` | a BuildConvention that runs PRs from git worktrees, behind a trust gate |
 | `@critical-labs/qa-conductor/adapters/exposure-tailscale` | `createTailscaleExposure` | an Exposure adapter on `tailscale serve` |
@@ -278,7 +278,7 @@ Each session gets a verdict on whether the PR pane can reach the base pane. The 
 - **What must run no PR code:** everything before the check, that is a BuildConvention without that declaration (its `resolveBaseImages` and `resolvePrImages`, and so `build-worktree`'s `servicesFor`, included) and the Provisioner's `provisionDatabase`.
 - **Same host:** the Docker Provisioner's probe speaks for the host the conductor runs on. A daemon elsewhere (a context or `DOCKER_HOST` that isn't `unix://` or `npipe://`) publishes the pane apps there, so its verdict is `unknown`. A `unix://` socket counts as this host, a forwarded one included (say, an SSH tunnel to another host's socket): don't forward one here.
 - **Floors** the conductor applies to whatever the Provisioner says:
-  - on macOS, never better than `reachable`: containers run in a VM that forwards the host's loopback (left out for a Provisioner that declares `shared-host`, which runs none);
+  - on macOS, never better than `reachable`: containers run in a VM that forwards the host's loopback. It is left out for a Provisioner that declares `shared-host`, which runs none, and when the check's result says the PR pane is on an internal network, as with the Docker Provisioner's [`internal`](#the-pr-pane-on-an-internal-network);
   - a non-loopback `QA_BIND_HOST`: `reachable`;
   - any loopback bind but `127.0.0.1`, such as `127.0.0.2`, `::1` or `localhost`: at best `unknown`. The pane apps are published on `127.0.0.1`, which a runtime may forward alone, so a probe that misses the conductor elsewhere can't speak for them.
 - **Fails closed:** a check that can't run, can't finish, or can't reach even the PR pane's own database gives `unknown`, never `isolated`.
@@ -310,9 +310,135 @@ By runtime, from the runtimes' sources and docs. These rows weren't each run end
 | Rootless Podman on Linux | no, by default (pasta and slirp4netns map no host loopback) | yes | `reachable` |
 | Docker Engine with `"iptables": false` | no | yes | `reachable` |
 | Docker Engine, dual-stack networks, `"ip6tables": false` (the default before 27) | no | yes, over IPv6 | `reachable` |
+| Docker Desktop or Podman machine, with the Docker Provisioner's [`internal`](#the-pr-pane-on-an-internal-network) | not from the PR pane, if its probe finds no way | no: the PR pane's network has no route off itself | `isolated`, once checked by hand |
 | Process Provisioner (any host) | yes | yes, as the same user | `shared-host` |
 
 The probe doesn't try the node's `tailscale serve` ports: every way through them ends at a conductor listener, which the [capability](#security) guards.
+
+### Hardening opt-ins
+
+Three more ways to narrow what the PR pane can reach, each opt-in, with what it does and doesn't guarantee. None of them changes the [isolation verdict](#isolation-verdicts): the probe and the declarations decide that. With the Docker Provisioner, the first is its [internal network](#the-pr-pane-on-an-internal-network).
+
+#### A `sandbox-exec` profile for the process Provisioner (macOS)
+
+**What it guarantees** (checked on macOS 12 and 15; on 14, see Checked, and #43): the PR pane's processes can't open a TCP connection to the port numbers the profile names, on any address: this Mac's loopback over IPv4 and IPv6, an IPv4-mapped IPv6 address (`::ffff:127.0.0.1`), `0.0.0.0` or another of the host's addresses. They are:
+- the conductor's three (`QA_HARNESS_PORT`, `QA_BASE_PROXY_PORT`, `QA_PR_PROXY_PORT`);
+- the base pane's service and database ports.
+
+**The trade-off:** those port numbers are refused on every host, remote ones too. A PR pane that must reach, say, port 3100 on another machine can't while the conductor uses it.
+
+**What it doesn't:**
+- The PR pane still runs as you. It can read and write your files (your browser's profile, which holds the capability, included), signal your processes, and use Unix sockets and every loopback port the profile doesn't name.
+- **Routes around it:**
+  - A BuildConvention's install step runs the PR's code before the PR pane starts, outside the profile.
+  - `tailscale serve`'s ports on the node's tailnet address front the conductor too, on port numbers the profile doesn't name. The [capability](#security) still turns such a request away, and on a tagged node (below) the identity gate does first.
+  - A file the PR pane writes can change what an unsandboxed process runs later: a script, a config, a shell profile, the profile itself if it can write it.
+- So the verdict stays `shared-host`, and the trust gate is still the boundary.
+
+**The profile** denies each port it is given, on any address (`*:<port>`), so it names what to shut rather than what to open.
+- **Why any address:** a deny on `localhost:<port>` refused `127.0.0.1`, `::1` and `localhost`, but on macOS 12 an IPv4-mapped IPv6 address, `::ffff:127.0.0.1`, reached every port it named, through the IPv4 listener.
+- **Why not shut everything and open a list:** on macOS 12, an allow for one port after `(deny network-outbound (remote ip "localhost:*"))` didn't reopen it, although after a bare `(deny network-outbound)` it did. A profile that shuts everything and opens a list would depend on which form it used.
+
+```scheme
+; pr-pane.sb: no TCP to these port numbers, on any address
+(version 1)
+(allow default)
+(deny network-outbound (remote ip (string-append "*:" (param "HARNESS"))))
+(deny network-outbound (remote ip (string-append "*:" (param "BASE_PROXY"))))
+(deny network-outbound (remote ip (string-append "*:" (param "PR_PROXY"))))
+(deny network-outbound (remote ip (string-append "*:" (param "BASE_APP"))))
+(deny network-outbound (remote ip (string-append "*:" (param "BASE_DB"))))
+```
+
+**Wire it in through `command`.** The boot launches the base pane's database and services before the PR pane's, so `command` can note the base pane's ports and pass them to the PR pane's sandbox. `sandbox-exec` runs the command in its own place, with the same pid, so teardown still signals the server's group:
+
+```js
+import path from 'node:path'
+import { createProcessProvisioner } from '@critical-labs/qa-conductor/adapters/provisioner-process'
+
+const conductorPorts = { HARNESS: '3100', BASE_PROXY: '3101', PR_PROXY: '3102' }  // match QA_*_PORT
+const basePorts = {}
+
+const provisioner = createProcessProvisioner({
+  stateDir: '/var/lib/qa-conductor/acme-widget',
+  database: {
+    command: ({ paneRef, port }) => {
+      if (paneRef.role === 'base') basePorts.BASE_DB = String(port)
+      return { cmd: '/usr/bin/java', args: ['-jar', 'DynamoDBLocal.jar', '-inMemory', '-port', String(port)], cwd: '/opt/dynamodb-local' }
+    },
+    ready: async () => {},
+    handle: ({ port }) => ({ dsn: `http://127.0.0.1:${port}`, db: {} }),
+  },
+  command: ({ ref, port, paneRef }) => {
+    const server = { cmd: path.join(ref, 'node_modules/.bin/tsx'), args: ['packages/api/src/dev.ts'] }
+    if (paneRef.role === 'base') {
+      basePorts.BASE_APP = String(port)
+      return { ...server, cwd: ref, env: { PORT: String(port) } }
+    }
+    const params = Object.entries({ ...conductorPorts, ...basePorts }).flatMap(([name, value]) => ['-D', `${name}=${value}`])
+    return {
+      cmd: '/usr/bin/sandbox-exec',
+      args: [...params, '-f', '/usr/local/etc/qa-conductor/pr-pane.sb', server.cmd, ...server.args],
+      cwd: ref,
+      env: { PORT: String(port) },
+    }
+  },
+})
+```
+
+- **Keep the profile where PR code can't write it:** the PR pane runs as you, so a profile in a directory you own can be rewritten before the next boot. For example:
+  - `sudo mkdir -p /usr/local/etc/qa-conductor`, then `sudo cp pr-pane.sb /usr/local/etc/qa-conductor/`;
+  - then `sudo chown -R root:wheel /usr/local/etc/qa-conductor`, `sudo chmod 755 /usr/local/etc/qa-conductor` and `sudo chmod 644 /usr/local/etc/qa-conductor/pr-pane.sb`, since `mkdir -p` leaves a directory that is already there as it was;
+  - `ls -ld /usr/local/etc/qa-conductor /usr/local/etc/qa-conductor/pr-pane.sb` should then show `root` for both, and no `w` but the owner's.
+- **Every parameter the profile names must be passed.** One missing, such as `BASE_DB` with no database, makes the profile fail to load: `sandbox-exec` exits 65 (`string-append: argument 2 must be: string`), and the pane doesn't start. Drop that line from the profile instead.
+- **`sandbox-exec` can't nest.** A conductor that itself runs under a sandbox (an app's own, say) can't start the PR pane under this profile: `sandbox-exec` exits 71, with `sandbox_apply: Operation not permitted`.
+- With more than one base service, note each port and add a line per port to the profile.
+
+**Checked:**
+- **On macOS 12.7.6,** by hand and by `test/docs.test.mjs`: a process under this profile got `EPERM` for each named port, over `127.0.0.1`, `::1`, `localhost`, `::ffff:127.0.0.1`, `::ffff:7f00:1`, `127.1`, `0.0.0.0` and another of the host's addresses, and connected to another port over each loopback form.
+- **On macOS 15,** by CI's `macos-sandbox` job on GitHub's runner, on every pull request: it runs that docs test, 30 rounds of every try, and fails if the test was skipped.
+- **On macOS 14, not yet.** The same job runs there, and with the earlier `localhost:<port>` form it let one named port through, over `localhost`, in 2 of 5 runs, though `127.0.0.1` to the same port got `EPERM` in the same process. Whether the `*:<port>` form holds there is tracked in [#43](https://github.com/critical-labs/qa-conductor/issues/43).
+- **The job is advisory:** it isn't a required check, until it has run reliably on both.
+- Apple already marks `sandbox-exec` deprecated on macOS 12, and still ships it on 14 and 15.
+- **Check yours** while a session runs, with the ports you use:
+  - `sandbox-exec -D HARNESS=3100 -D BASE_PROXY=3101 -D PR_PROXY=3102 -D BASE_APP=<port> -D BASE_DB=<port> -f /usr/local/etc/qa-conductor/pr-pane.sb "$(command -v node)" -e "require('net').connect(3100, '127.0.0.1').on('connect', function () { console.log('connected'); this.destroy() }).on('error', e => console.log(e.code))"` must print `EPERM`, and the same `node -e` without `sandbox-exec` must print `connected`. A closed port would print `ECONNREFUSED`.
+  - Or with `curl -sv` in place of `node -e`: `Immediate connect fail for 127.0.0.1: Operation not permitted`, where `curl -sS` alone says only that it couldn't connect.
+
+#### Tag the conductor's Tailscale node
+
+**What it guarantees:** in tailscale mode, a request that reaches `tailscale serve` from the conductor's own node carries no `Tailscale-User-Login`, so the [identity gate](#security) refuses it.
+- `tailscale serve` sets no identity headers for traffic from a tagged device.
+- On a node a person owns, the same request carries the owner's login, which is usually in `QA_ALLOWED_LOGINS`.
+- Whether code on this host, or a container on it, can reach `tailscale serve` through the node's tailnet name or address depends on the platform, and isn't checked here. With the tag, any request that does gets no login.
+
+**What it doesn't:**
+- Code on this host can still reach the conductor's loopback ports directly and send any login it likes. There, as everywhere, the [capability](#security) is what turns it away.
+- Reviewers' own devices are unaffected: their requests still carry their logins.
+
+**How:**
+- In the tailnet policy, give the tag an owner (`"tagOwners": { "tag:qa-conductor": ["<your login>"] }`).
+- Grant the reviewers access to the tag on the harness and pane ports (`8444`, `8443` and `10000` by default). A policy that grants each person their own devices no longer covers a tagged node.
+- Then tag the node, with `tailscale up --advertise-tags=tag:qa-conductor` or from the admin console.
+- `QA_ALLOWED_LOGINS` stays the reviewers' logins.
+
+**Checked:** not here: nothing in this repository runs `tailscale`. Check it from the conductor's host while it runs: `curl -sS -D - https://<machine>.<tailnet>.ts.net:8444/qa/api/state`. Every case answers `403`, so read its `X-QA-Refusal` header and its body:
+- `X-QA-Refusal: identity` and `403: no Tailscale identity: …`: the node is tagged, and the identity gate refused a request with no login;
+- `X-QA-Refusal: identity` and `403: <login> is not in QA_ALLOWED_LOGINS`: the node isn't tagged, and its owner isn't an allowed login. The header alone can't tell this from a tagged node;
+- `X-QA-Refusal: capability` and a JSON body with `"refusal":"capability"`: the node isn't tagged, its owner's login got past the gate, and only the capability refused it.
+
+#### Unix-socket listeners (Linux, not yet supported)
+
+**What it would guarantee:** with the harness and both pane proxies listening on Unix sockets behind `tailscale serve`, there would be no TCP listener for a pane to reach. A container that reaches the host's loopback, or a process pane, would find nothing there, and a socket's file mode would decide who can connect.
+
+**Why not yet:**
+- The conductor listens only on TCP (`QA_BIND_HOST` and the three ports), so it can't take this step.
+- `tailscale serve` can proxy to a `unix:` target. [Issue #32](https://github.com/critical-labs/qa-conductor/issues/32) records that this takes Tailscale 1.94 or later, and two catches:
+  - since Tailscale v1.100, a socket target needs root or an operator who can use sudo;
+  - the backend then gets `Host: localhost`.
+- So supporting it means more than a socket. The conductor would need to take the harness and pane origins from its config, rather than the `Host` header, for its [same-origin](#security) and pane request checks.
+- Tracked in [#42](https://github.com/critical-labs/qa-conductor/issues/42).
+
+**Today:** the Docker Provisioner's [internal network](#the-pr-pane-on-an-internal-network) is meant to close the same path for container panes: it gives the PR pane no route to the host's loopback. Each session's probe checks that it doesn't reach the conductor or the base pane there. CI runs the topology on Linux, against Docker Engine and Podman, where containers don't reach the host's loopback anyway. Its check by hand on Docker Desktop and Podman machine, where they do, is tracked in [#43](https://github.com/critical-labs/qa-conductor/issues/43).
 
 ## The seams
 
@@ -320,7 +446,7 @@ A boot runs these five seams in order: `ensureBuilt` → `provisionDatabase` (bo
 
 | Seam | Members | Owns |
 |---|---|---|
-| **Provisioner** | `provisionDatabase({paneRef, databases, signal}) → {dsn, db}`, `reserveServices({paneRef, services, signal}) → {name: {url, port}}`, `launchServices({paneRef, services, env, reserved, signal})`, `waitHealthy({services, signal})`, `teardown({paneRef})`; optional `runMigrate({paneRef, migrate, env, signal})`, `sweep()`, `logs({paneRef, stage, lines}) → string` (or a promise of one), `isolation` (`'shared-host'`, or `({signal, canary}) → {verdict, reasons}`) | Where panes run: databases, processes or containers, ports, env at rest, cleanup, and whether they are kept apart |
+| **Provisioner** | `provisionDatabase({paneRef, databases, signal}) → {dsn, db}`, `reserveServices({paneRef, services, signal}) → {name: {url, port}}`, `launchServices({paneRef, services, env, reserved, signal})`, `waitHealthy({services, signal})`, `teardown({paneRef})`; optional `runMigrate({paneRef, migrate, env, signal})`, `sweep()`, `logs({paneRef, stage, lines}) → string` (or a promise of one), `isolation` (`'shared-host'`, or `({signal, canary}) → {verdict, reasons, internal?}`), `internal: true` when it means to put the PR pane on an internal network | Where panes run: databases, processes or containers, ports, env at rest, cleanup, and whether they are kept apart |
 | **BuildConvention** | `migrationStrategy` (`'one-shot-image' \| 'on-boot' \| 'none'`), `ensureBuilt(pr, {signal})`, `resolvePrImages(pr)`, `resolveBaseImages()` → `{services: {name: ref}, migrate?, label?}`; optional `subscribeBuild(cb)` with `cb({runUrl?, runStatus?, runConclusion?, message?})`, `describePrs(prs) → [{number, status: 'built'\|'building'\|'none'\|'blocked', runUrl, reason?}]`, `isolation: 'shared-host'` when it runs the PR's code on this host to build it ([Isolation verdicts](#isolation-verdicts)) | What gets run for base and PR, whether it's ready, and whether it may run at all |
 | **Seed** | `databases`, `seedPane({paneRef, db, databases, signal})` | Where each pane's data comes from and how it moves |
 | **EnvTransform** | `derivePaneEnv({prodEnv, pane}) → {service: env}` (pure) | Pointing a pane at its own DB and origin, and neutralizing side effects (email, payments, storage) |
@@ -366,6 +492,7 @@ What the seams pass each other. Any method above may return its result or a prom
   - It resolves to `{verdict, reasons}`, with `verdict` one of `isolated`, `unknown`, `reachable` and `shared-host`, and `reasons` saying why for anything but `isolated`. A throw, or anything else, counts as `unknown`. A check must fail closed: one that couldn't show it can reach anything isn't `isolated`.
   - `canary` is `{port, path, expect}`: while the check runs, the harness, on `port` (the harness port, on the conductor's bind address), answers a `GET` of `path`, and only that, with `expect`, before the identity gate. A probe from the PR pane's side that gets `expect` there has reached this conductor, so it reaches the host's loopback.
   - The core raises the result to its floors and records it ([Isolation verdicts](#isolation-verdicts)). `bootSession` takes the call as `deps.checkIsolation({stage, signal})`, with `stage` `'start'` before the build and `'panes'` at this point; a throw fails the boot.
+  - **An internal network.** A Provisioner that means to put the PR pane on a network with no route off itself says so with `internal: true`. Then the macOS floor waits for its check, and is left out only when the check's result says `internal: true` too: the PR pane is on such a network, and the check's probe speaks for the VM's forwarding. The Docker Provisioner's `internal` option does this ([its section](#the-pr-pane-on-an-internal-network)).
 - **Startup sweep.** The conductor calls `sweep()` once, at startup. A boot started before it settles waits for it before `ensureBuilt`, so the sweep can't remove the new session's panes. While it waits, the harness shows `waiting for startup cleanup…` under the first boot step, then `startup cleanup done`, and counts the wait in that step's time and the boot's. There is no timeout. A failed sweep is logged and doesn't block boots, even one that throws synchronously or rejects with something other than an `Error`, but it keeps enrolment shut until it succeeds: it runs again when a browser tries to enrol with no session running ([Security](#security)). A sweep, like a `teardown`, must reject when it leaves anything running. A teardown or takeover during the wait cancels the waiting boot, as it would at any other point.
 - **Build progress.** `subscribeBuild(cb)` payloads are `{runUrl?, runStatus?, runConclusion?, message?}`. The harness shows `message` (plain text, e.g. `installing dependencies for #12 (abc1234)…`) under the first boot step, else a summary of the run's status that names a `completed` run's conclusion when it isn't `success` (`Build ended: failure`), and links the run when `runUrl` is `https://`. `/api/state` returns the latest as `buildRun: {url, status, conclusion, message}`. A boot that fails at `ensuring-image` with an error that carries `run: {url, status, conclusion}`, as `awaitPreviewImage`'s does, gets that run as its last build event before the error, so `buildRun` and the error's run link show the run that failed. Only string fields are kept, and only when there is a `url` or a `status`.
 - **`blocked`.** `describePrs` may report a PR as `blocked`, with a plain-text `reason` (for example, an untrusted author or a head branch in someone else's fork). The picker shows it as `can't boot: <reason>`. Opening the PR is still allowed, because `ensureBuilt` is the real gate. `describePrs` receives `listOpenPrs()` items, or for `/api/build-status` an item built from `github.prInfo(pr)` (`{number, headSha, author, authorAssociation, headRepo, headOwner}`), falling back to `{number, headSha}` from `prHead` when `github` has no `prInfo`.
@@ -481,7 +608,7 @@ The other options are `healthTimeoutMs` (60000, per service), `host` (`127.0.0.1
 - **Health.** `waitHealthy` polls `<url><healthPath>` until `healthy(status)`, for up to `healthTimeoutMs`. A process that exits first fails the boot at once, with its log tail. `healthy(status)` gets the service's own response status: redirects aren't followed (an app often redirects to its public origin, the pane proxy, which answers `503` until the boot is done), so under the default `status < 500` a `3xx` counts as up. A strict predicate such as `status === 200` needs a `healthPath` that doesn't redirect.
 - **Logs.** Each pane keeps its last `logLines` lines of stdout and stderr, prefixed `[name]`, and `logs()` returns the tail. The buffer survives teardown, and resets when the pane's next boot starts.
 - **Teardown** signals process **groups**, never bare pids, because a wrapper may exit at once while its server lives on. Services go first, then the database: SIGTERM, then SIGKILL after `graceMs`. A group that survives SIGKILL, or a pid teardown can't check, is logged and left for the next sweep, and teardown then rejects, naming it, once it has stopped the rest; so does a sweep that leaves one running. Once a leader has exited, its pid can be reissued, so teardown checks it with `ps` first: a pid held by another process means our group is gone, and it isn't signalled.
-- **Isolation.** It declares `isolation: 'shared-host'`: both panes run as you on one host, so each can reach the other's ports, files and processes, and every session's [isolation verdict](#isolation-verdicts) is `shared-host`. A base-vs-PR comparison is advisory with it.
+- **Isolation.** It declares `isolation: 'shared-host'`: both panes run as you on one host, so each can reach the other's ports, files and processes, and every session's [isolation verdict](#isolation-verdicts) is `shared-host`. A base-vs-PR comparison is advisory with it. On macOS, a `sandbox-exec` profile can shut the PR pane out of the conductor's and the base pane's loopback ports ([Hardening opt-ins](#hardening-opt-ins)).
 - **Crash cleanup.** Each process is recorded in `<stateDir>/pids.json` with its start time from `ps` and the boot it ran in. The directory must be a real directory owned by you and not writable by group or others (it's created `0700`; one that others could write to is refused, since its contents may be planted), and `pids.json` must be a regular file owned by you (written `0600`). `sweep()`, which the conductor runs at startup, kills the groups a previous run left behind. It skips any pid that now belongs to another process, drops entries from an earlier boot without signalling anything, and leaves in place entries it can't check (no start time). Give each conductor its own `stateDir`. A `process.on('exit')` hook SIGKILLs every live group; signals don't run it, so call the conductor's `shutdown()` from your signal handlers.
 - There's no `runMigrate`: process consumers migrate on boot.
 
@@ -522,6 +649,9 @@ const provisioner = createDockerProvisioner({
 | `hostPorts` | `{ base: 3111, pr: 3112 }` | the loopback host port each pane's app container is published on |
 | `registry` | `null` | `{ user, token }`: log in to `ghcr.io` before pulling, and again before each retry |
 | `probeTimeoutMs` | `30000` | how long the isolation probe's `docker run` may take in all, after which the docker CLI is killed (`SIGKILL`), the probe container removed, and the verdict is `unknown`. A teardown or takeover during the probe stops it too |
+| `internal` | `null` (off) | `true`, or `{ egress, image }`: the PR pane on an internal network, its only way in and out a forwarder ([below](#the-pr-pane-on-an-internal-network)). `egress` is the allowlist (default `[]`: no egress at all), `image` the forwarder's (default `node:22-alpine`). A bad entry or option throws |
+| `forwarderReadyMs` | `10000` | with `internal`: how long the forwarder may take to say it is ready before the topology counts as not set up |
+| `log` | `console` | where the Provisioner logs, with `error(line)`: an `internal` topology that couldn't be set up |
 
 For each pane:
 - `provisionDatabase` creates the pane's network, pulls the postgres image if it's missing, and starts `qa-pg-<role>` on the network, with the pane's password. It waits until the database answers twice in a row, creates each of the Seed's `databases`, and returns the `dsn` `postgresql://<user>:<password>@qa-pg-<role>:5432`, with the user and password percent-encoded, and a `db` of `{ dsn, query(sql, { database }) }`, which runs `psql` in the container. A pane network left over from an earlier run is reused.
@@ -530,17 +660,101 @@ For each pane:
 - `waitHealthy` polls `http://127.0.0.1:<port>/api/health` until it answers `200`, for up to a minute.
 - `logs` tails the app container at `starting`, else the postgres one.
 - `isolation` checks whether the PR pane can reach the base pane, once both databases exist and before either is seeded ([Isolation verdicts](#isolation-verdicts)).
-  - **The runtime:** `docker version` naming Podman (the podman-docker shim included), whose networks don't keep the panes apart, makes it `reachable` at once. So does `docker info` naming Docker Desktop, which forwards the host's loopback. A daemon that isn't on this host (the current context's endpoint, which `DOCKER_HOST` sets, isn't `unix://` or `npipe://`) makes it `unknown`.
+  - **The runtime:** `docker version` naming Podman (the podman-docker shim included), whose networks don't keep the panes apart, makes it `reachable` at once. So does `docker info` naming Docker Desktop, which forwards the host's loopback. A daemon that isn't on this host (the current context's endpoint, which `DOCKER_HOST` sets, isn't `unix://` or `npipe://`) makes it `unknown`. The podman-docker shim has no Docker context, so there the endpoint is Podman's own: `CONTAINER_HOST`, else the connection `CONTAINER_CONNECTION` names, else the default connection (`podman system connection list`); with none, Podman runs its containers on this host.
   - **The probe:** `qa-probe-pr`, a throwaway container from the postgres image, on the PR pane's network, labelled, with no capabilities, ports or mounts.
     - **What it needs:** `bash` with `/dev/tcp`, `timeout` that takes its seconds first (GNU coreutils, or a BusyBox from 1.30), `grep` and `cat`, as the official Debian-based `postgres` images have. It checks the tools first, and stops if one is missing or different.
     - **What it tries:** it asks this conductor's harness port for the canary at each address a runtime gives the host: `host.docker.internal`, `gateway.docker.internal`, `host.containers.internal`, `host.lima.internal`, `host.rancher-desktop.internal`, `192.168.65.254`, `192.168.65.2`, `192.168.127.254`, `192.168.5.2`, `10.0.2.2`, `169.254.1.2`, `172.17.0.1`, and the PR network's gateway. It also connects to the base pane's database at each of its addresses, IPv6 ones included: on a dual-stack network with `ip6tables` off (the default before Docker Engine 27, or `"ip6tables": false`), Docker doesn't isolate IPv6 between networks, and a probe of IPv4 alone would miss that. Each address family's misses count only once its own control hit over that family.
     - **Its positive control:** the PR pane's own database, which it must reach over each address family the base database has: an IPv4 hit says nothing of IPv6.
     - **Timing:** all at once, each in at most 3 seconds. The `docker run` gets `probeTimeoutMs` in all (default 30 s), after which the docker CLI is killed and the probe container removed. A teardown or takeover stops it too.
   - **The verdict:** a canary answered, or the base database connected, makes it `reachable`, saying where, even in a run that then failed or ran out of time. It is `unknown` when the probe didn't run (a tool missing, say), didn't finish, or didn't reach its own pane's database, or when the runtime, the daemon's endpoint or the addresses weren't found. Else it is `isolated`.
-- `teardown` removes the pane's containers (a migrate run still in flight, and the PR pane's probe, among them) and their volumes, then its network and its env file. A name already gone is fine, in Docker Engine's words or Podman's (through its own CLI, the podman-docker shim or its Docker-compatible API, after any warnings it writes first), but when docker fails otherwise (no daemon, a container it can't kill, a network still in use), `teardown` rejects with that error once it has tried every step. So does `sweep`.
-- `sweep` removes both env files, which hold an earlier run's env and passwords, then every container with `createDocker`'s `label` and both panes' networks. When `network` is a prefix, it also removes the network of that very name, which both panes shared in 0.3.1 and earlier, but only if it carries the label, as that network did. It leaves the name alone when it is one of Docker's or Podman's own, or lowercase hex digits alone.
+- `teardown` removes the pane's containers (a migrate run still in flight, and the PR pane's probe, among them) and their volumes, then its network and its env file. With `internal`, the PR pane's also removes the forwarder and the edge network; the base pane's leaves them alone. A name already gone is fine, in Docker Engine's words or Podman's (through its own CLI, the podman-docker shim or its Docker-compatible API, after any warnings it writes first), but when docker fails otherwise (no daemon, a container it can't kill, a network still in use), `teardown` rejects with that error once it has tried every step. So does `sweep`.
+- `sweep` removes both env files, which hold an earlier run's env and passwords, then every container with `createDocker`'s `label` (the forwarder among them), both panes' networks, and, only while `internal` is on, the PR pane's edge network. When `network` is a prefix, it also removes the network of that very name, which both panes shared in 0.3.1 and earlier, but only if it carries the label, as that network did. It leaves the name alone when it is one of Docker's or Podman's own, or lowercase hex digits alone.
 
-The provisioner also has `networks`, `{ base, pr }` (frozen): the two network names.
+The provisioner also has `networks`, `{ base, pr }` (frozen): the two network names, and `internal`, whether the `internal` option is on.
+
+#### The PR pane on an internal network
+
+With `internal`, the PR pane gets no route off its own network. So on Docker Desktop and Podman machine too it should reach neither the host's loopback, where the base app is published, nor the base pane, and the probe can find it `isolated`. It is off by default: it pulls a Node image and runs one more container.
+
+**Where it is checked:**
+- **Linux, in CI:** on every pull request, CI's `docker-integration` job runs [`test/integration/docker-internal.test.mjs`](test/integration/docker-internal.test.mjs) against Docker Engine, and against Podman through its Docker-compatible socket. It boots both panes on the topology, and checks:
+  - the probe's `isolated`;
+  - that the PR pane reaches neither the host's loopback, the base pane's database nor `169.254.169.254`, and has no direct route out (`1.1.1.1:443`, which the base pane reaches);
+  - a host service on `0.0.0.0`: out of reach on Docker Engine 28 and later, and on Podman reached only at the PR network's own gateway, which the probe reports (its limits, below);
+  - its DNS;
+  - the proxy's refusals;
+  - a fallback refused under `QA_REQUIRE_ISOLATION=1`;
+  - that teardown leaves nothing, before any sweep.
+
+  The job isn't a required check yet: making it one is a repository setting, for later.
+- **Docker Desktop and Podman machine:** not yet checked on a real runtime. There, each session's probe still decides the verdict, and the check by hand below is tracked in [#43](https://github.com/critical-labs/qa-conductor/issues/43).
+
+```js
+const provisioner = createDockerProvisioner({
+  docker: createDocker({ execFileFn: makeExecFileFn() }),
+  fsx: fs.promises,
+  workDir: '/var/lib/qa-conductor',
+  internal: { egress: ['api.example.com', '*.example.net'] },
+})
+```
+
+- **The topology.**
+  - **`qa-session-pr` is created `--internal`.** The PR pane's postgres, migrate run, app and probe join only it.
+  - **The forwarder, `qa-fwd-pr`,** runs the package's `lib/forwarder.mjs` with `node` from `internal.image`. It starts on an ordinary network, `qa-session-pr-edge`, then joins `qa-session-pr` as `qa-egress`. It runs with `--cap-drop ALL`, `--read-only` and `--security-opt no-new-privileges`, as the image's `node` user, with no mounts. Its config is one env var, `PANE_FORWARDER`.
+  - **Inbound:** the forwarder publishes `127.0.0.1:<hostPorts.pr>` and pipes each connection to `qa-app-pr:3000`. The PR app publishes nothing.
+  - **Egress:** an HTTP proxy at `qa-egress:3128`. HTTPS goes through `CONNECT` and is never intercepted. The PR pane's env gets these, over the EnvTransform's:
+    - `HTTP_PROXY` and `HTTPS_PROXY`, and their lowercase forms;
+    - `NO_PROXY` (`localhost`, `127.0.0.1`, `::1`, `qa-pg-pr` and `qa-app-pr`);
+    - `NODE_USE_ENV_PROXY=1`.
+
+    An app that ignores them reaches nothing outside its network. On Docker and on Podman, the PR pane's containers also get `--dns 192.0.2.1`, an address nothing answers, so no name outside the network resolves for them (DNS, under its limits below).
+- **The allowlist, `egress`.**
+  - **Entries:** `api.example.com` (that host), `*.example.com` (any host under it, not the domain itself) or a public IP address (an IPv6 one in brackets), each with an optional `:port`. Without a port, an entry allows 80 and 443. They are compared as the URL parser has them. Anything else throws when the Provisioner is made: a private address in any form, a name only this host or its network has (`*.localhost`, `*.internal`, `*.local`, …), a bad port.
+  - **A wildcard is as wide as written:** `*.github.io` admits every site under it.
+  - **Empty, or `internal: true`:** no egress at all.
+  - **What a request needs:** a host on the list, and every address it resolves to public. The forwarder connects to the address it checked, so a second DNS answer can't swap it.
+  - **Always refused, listed or not:** loopback, private, link-local (cloud metadata), CGNAT and Tailscale, unique-local and the like, so every address a runtime gives the host.
+  - **Per address, not per host:** HTTPS goes through a tunnel the forwarder doesn't inspect, so its SNI and Host can name any site served from a listed name's addresses. Don't list a name on a shared CDN's addresses unless every site there may be reached.
+  - **A refusal** answers `403` with `X-QA-Egress: refused` and a reason. The forwarder logs it to stdout (`docker logs qa-fwd-pr`), so triage's log tail shows it. A host it can't reach answers `502` with `X-QA-Egress: failed`.
+  - **Every wait is bounded:** a connect takes at most 10 s, and a tunnel or an answer through which nothing has moved is closed: after 5 minutes, or up to about 10 where each side waits on the other, since the timer then looks twice. So is an answer the host has finished but the PR has stopped reading. One waiting on a slow reader that still reads isn't idle, as long as each `idleMs` the reader frees some room: a plain-HTTP answer's PR side is timed on its own, and the kernel's buffers can hide a very slow reader's progress for longer, so such a reader can be cut.
+  - **A cut reaches the app as one:** a host that fails, resets or idles out partway through gives the PR side a reset, never a clean end that could pass for a complete answer.
+- **The verdict.** With the topology up, the check's result says `internal: true`, and:
+  - the probe decides alone. The runtime's own reasons (Docker Desktop's forwarding, Podman's networks, a `docker info` that fails under the podman-docker shim) and the macOS floor give way to it. It tries the same addresses as ever, from the internal network;
+  - the probe also asks the forwarder's proxy for each of them, as a `CONNECT`. One it lets through is a hit. The proxy must answer for every one, proxied or refused: one it is silent on makes the verdict `unknown`, and the reason names it.
+- **Up, or not.** The topology is up once `qa-session-pr` reads back as internal, and the forwarder is running and has logged that it is ready, within `forwarderReadyMs` (10 s). Triage's log tail for the PR app then ends with the forwarder's, under `[qa-fwd-pr]`.
+- **If it can't be set up** (the internal network, the forwarder's image, the forwarder, the join or its readiness):
+  - the PR pane runs as it would without `internal`: on an ordinary network, its app published, no proxy, and its egress isn't restricted;
+  - the Provisioner logs that, through `log.error`: `[qa] the PR pane's internal network couldn't be set up (…): it runs on an ordinary network, and its egress isn't restricted`;
+  - the check's result carries no `internal`, so the floors apply, and it is never better than `unknown`, with the reason `egress isn't restricted: the PR pane's internal network couldn't be set up (…)`. So `QA_REQUIRE_ISOLATION=1` refuses the session, and the harness's chip says why;
+  - the undo must remove the internal network. When it can't, or finds an internal one still there as it makes the ordinary one, the boot fails instead.
+- **A forwarder that dies later** takes the PR app's port with it: the pane goes down rather than open.
+- **Cleanup:** the PR pane's `teardown` removes the forwarder and the edge network too, and the base pane's leaves them alone. `sweep` removes the forwarder with the other labelled containers, and the edge network only while `internal` is on: one an earlier run left before `internal` was turned off stays until `docker network rm qa-session-pr-edge`. An internal network left over is reused only when it is internal.
+- **Its limits:**
+  - Only the PR pane is internal. The base pane runs as before.
+  - **The host's own address on the PR pane's network, on Podman and Docker Engine before 28.** An internal network keeps the PR pane off the host's loopback and off other networks, but there not off the host's address on its own bridge (its gateway; on Podman, `host.containers.internal` too). So a host service bound to `0.0.0.0`, or to that bridge's address, is reachable from the PR pane. CI found this on Docker Engine and on Podman.
+    - **On Docker Engine 28 and later it is closed:** the internal network is created with an isolated gateway (`com.docker.network.bridge.gateway_mode_ipv4=isolated`, and `_ipv6`), so its bridge has no address of the host's, and not even a host service on `0.0.0.0` is reachable. An Engine that refuses the option gets a plain internal network, and one left over without it is made again. CI checks both runtimes.
+    - **The probe reports it for the conductor's own port only:** each session's probe tries the harness port there, finds a conductor reachable and says `reachable`. Other host services on `0.0.0.0` aren't probed.
+    - **The defaults aren't reachable:** the conductor binds `127.0.0.1` by default (`QA_BIND_HOST`), and so do the panes' published ports. With those, the PR pane can't reach them, and the verdict is `isolated`.
+    - **Other host services:** keep them off `0.0.0.0` too, or behind a firewall that drops traffic from the bridge.
+  - The forwarder listens on IPv4.
+  - A private address can't be allowed, even for a listed host. An app that needs an internal service leaves `internal` off.
+  - Only HTTP and HTTPS go out, through the proxy. An app reaches a host only if its HTTP client honours the proxy env: a Node.js that supports `NODE_USE_ENV_PROXY` does with it set, and most other clients read `HTTPS_PROXY`. Raw TCP to a database elsewhere, or SMTP, doesn't go out.
+  - **DNS.** A Docker Engine without the fix (23.0.11, 25.0.5, 26.0.0 and later), with the host's resolver on its loopback (systemd-resolved, dnsmasq), resolves an internal network's outside names through the host, so PR code could carry data out in its queries (CVE-2024-29018). So the PR pane's containers run with `--dns 192.0.2.1`, the advisory's workaround: names on the network still resolve, and an outside one gets no answer. The forwarder resolves the hosts it lets through itself.
+    - **On Docker,** the network's names resolve through Docker's own DNS, beside the `--dns`.
+    - **On Podman,** its DNS also answers an internal network's outside names: CI found it on Podman 4.9. A `--dns` there replaces Podman's DNS, so the names the PR pane needs, `qa-pg-pr` and `qa-egress`, go in its containers' hosts files (`--add-host`).
+    - **A container you start on `qa-session-pr` yourself** gets neither. Upgrade an affected Engine anyway.
+  - A runtime whose internal networks have no DNS can't resolve `qa-pg-pr` or `qa-egress` there, so the PR pane fails to boot.
+- **Check it by hand** on a runtime CI doesn't run (Docker Desktop and Podman machine, tracked in [#43](https://github.com/critical-labs/qa-conductor/issues/43)). Boot a PR, then while it runs:
+  1. The harness chip should say `isolated`.
+  2. From the PR pane's network, the host's loopback and the base pane's database must fail. For a `curl` here, only a curl error passes: the `echo $?` after it must print `6` (no such name), `7` (no connect) or `28` (timed out). Any answer from the conductor, `421: unrecognised Host header` or `403: …` included, means the PR pane's network reached the host:
+     - `docker run --rm --network qa-session-pr curlimages/curl -sS -m 3 http://host.docker.internal:<harness port>/qa/; echo $?` (on Podman, `host.containers.internal`);
+     - by address too: `http://192.168.65.254:<harness port>/qa/` on Docker Desktop, `http://192.168.127.254:<harness port>/qa/` on Podman machine;
+     - `docker run --rm --network qa-session-pr busybox nc -zw3 <an address of qa-pg-base> 5432; echo $?`, which must print `1`;
+     - an outside name, as the PR pane's containers resolve it: `docker run --rm --network qa-session-pr --dns 192.0.2.1 busybox nslookup example.com`;
+     - and as any container there resolves it: `docker run --rm --network qa-session-pr busybox nslookup example.com`. If this one answers, the runtime's DNS forwards the internal network's names: on Docker, the Engine has CVE-2024-29018, and on Podman it is how its DNS works (DNS, under its limits above). The PR pane's own containers are covered by their `--dns`.
+  3. Through the proxy, a host off the list gets `403` (`curl: (56) CONNECT tunnel failed, response 403`), and `docker logs qa-fwd-pr` says why: `docker run --rm --network qa-session-pr curlimages/curl -sS -m 5 -x http://qa-egress:3128 https://example.com`.
+  4. A host on the list goes through, the same way.
+
 
 Its limits:
 - **One service per pane.** Every service would run as `qa-app-<role>` with the same env file.
@@ -591,19 +805,20 @@ Its limits:
   - **Otherwise it just polls GHCR.** That happens while the run can't be told apart, after a failed lookup, and in every other wait for the PR, such as one for a build this client didn't dispatch.
   - **`onRun(run)`** hears the run, in `findPreviewRun`'s shape `{url, status, conclusion, startedAt}`, each time the run taken for the dispatch's changes, or its status or conclusion does. A throw or rejection in `onRun` is ignored. Pass `onRun` on to the `subscribeBuild` callback as `runUrl`, `runStatus` and `runConclusion`, and `buildRun` follows the run while the wait lasts. Without it, the core still shows a failed run, from `err.run` (see [Build progress](#contracts-between-the-seams)).
 
-**`docker`.** `createDocker({ execFileFn, label, postgres })` runs the `docker` CLI for the Docker Provisioner, and for a Seed that copies databases between containers:
+**`docker`.** `createDocker({ execFileFn, label, postgres, env })` runs the `docker` CLI for the Docker Provisioner, and for a Seed that copies databases between containers:
 
 | Option | Default | |
 |---|---|---|
 | `execFileFn` | *(required)* | `makeExecFileFn()` from `./exec`. Your own must pass `opts.env` on to the child, since `login` and `runPg` put secrets there. It must also reject with docker's stderr in the error's `message` or `stderr`, as `makeExecFileFn` does: that is how the Docker Provisioner tells a pane network that already exists from a real failure |
 | `label` | `'qa-conductor-session'` | put on every container and network it creates; `sweepQaContainers()` removes whatever carries it |
+| `env` | `process.env` | where `endpoint({ podman: true })` reads `CONTAINER_HOST` and `CONTAINER_CONNECTION` |
 | `postgres` | `{ image: 'postgres:16', user: 'qa', password: 'qa', db: 'postgres' }` | the pane database containers; keys you leave out, or set to `undefined`, keep these values. The image's entrypoint must set its database up from `POSTGRES_USER`, `POSTGRES_PASSWORD` and `POSTGRES_DB`, and write `POSTGRES_HOST_AUTH_METHOD` into `pg_hba.conf`, as the official `postgres` image's does. An image whose data directory is already initialised ignores them all, and keeps its own password and `pg_hba.conf`: set the provisioner's `postgres.password` to that password, which both panes then share. If that `pg_hba.conf`, or the entrypoint, lets TCP connections in without a password (`trust`), the panes' passwords protect nothing |
 
 `runPg(name, network, { password })` starts a database container, with `password` as its superuser's. `postgres.password` is only the default for a call that passes none: the Docker Provisioner always passes its own. The password reaches `docker run` through the CLI's environment (a bare `-e POSTGRES_PASSWORD`), never its argv, which other local users can read. A password that is empty or not a string throws.
 
 It also passes `-e POSTGRES_HOST_AUTH_METHOD=md5`. That overrides an image's own `ENV`, which may say `trust` (as `cimg/postgres`'s does), and the official entrypoint writes it into `pg_hba.conf` for TCP connections. `md5` uses SCRAM where the stored password is SCRAM, as it is by default from postgres 14 on.
 
-Its members are `run(argv)`, `login(user, token)` (to `ghcr.io`, with the token in the environment, never in argv), `imagePresent`, `ensureImage(image, { retries, relogin })`, `ensurePgImage(opts)` (the same, for `postgres.image`), `runPg`, `waitHealthyPg`, `createDatabase`, `pipeDump(from, to, db)` and `cloneDb(from, to, db)` (a host-side `pg_dump | psql` between two containers), `runMigrate`, `runApp`, `waitHealthyApp`, `psql`, `rmForce` and `rmNetwork` (which reject unless docker says only that what they remove is already gone), `createNetwork`, `rmLabelledNetwork(name)` (only a network of exactly that name that carries `label`), `sweepQaContainers`, `inspectImageOf`, `logsTail`, and for the isolation probe `runtime()` (`{version, os, osError}`, from `docker version` and `docker info`; a failing `info` leaves `os` null and its error in `osError`), `endpoint()` (the current context's daemon endpoint), `networkGateways(name)`, `containerAddresses(name)` (IPv4 and IPv6) and `runProbe(name, network, script, args, { timeoutMs, signal })` (default 30 s, then `SIGKILL`; `signal` stops it too). The module also exports `errorLine(err)`: the first line of a docker CLI failure that says something of it, past the podman-docker shim's banner and Podman's logger warnings. `runPg`, `runMigrate` and `runApp` run their containers with `--cap-drop NET_RAW`. `login`, `createDatabase`, `pipeDump`, `cloneDb`, `logsTail` and `runProbe` throw on a name that isn't letters, digits, `_` and `-`.
+Its members are `run(argv)`, `login(user, token)` (to `ghcr.io`, with the token in the environment, never in argv), `imagePresent`, `ensureImage(image, { retries, relogin })`, `ensurePgImage(opts)` (the same, for `postgres.image`), `runPg`, `waitHealthyPg`, `createDatabase`, `pipeDump(from, to, db)` and `cloneDb(from, to, db)` (a host-side `pg_dump | psql` between two containers), `runMigrate`, `runApp` (a `hostPort` of `null` publishes nothing), `waitHealthyApp`, `psql`, `rmForce` and `rmNetwork` (which reject unless docker says only that what they remove is already gone; `rmForce` removes one name at a time, since Podman before 5.1 stops a batch at a name already gone, removes none of the rest, and still exits 0), `createNetwork(name, { internal, isolatedGateway })`, `networkInternal(name)`, `networkGatewayIsolated(name)`, `containerRunning(name)`, `rmLabelledNetwork(name)` (only a network of exactly that name that carries `label`), `sweepQaContainers`, `inspectImageOf`, `logsTail`, and for the isolation probe `runtime()` (`{version, os, osError}`, from `docker version` and `docker info`; a failing `info` leaves `os` null and its error in `osError`), `endpoint({ podman })` (the current context's daemon endpoint; with `podman` and no context, as under the podman-docker shim, Podman's own connection's URI, or `'local'` when it has none), `networkGateways(name)`, `containerAddresses(name)` (IPv4 and IPv6) and `runProbe(name, network, script, args, { timeoutMs, signal })` (default 30 s, then `SIGKILL`; `signal` stops it too), and for an internal network `runForwarder(name, image, network, { hostPort, config, source })` and `connectNetwork(network, container, { alias })`. The module also exports `errorLine(err)`: the first line of a docker CLI failure that says something of it, past the podman-docker shim's banner and Podman's logger warnings. `runPg`, `runMigrate` and `runApp` run their containers with `--cap-drop NET_RAW`. They and `runProbe` take a `dns` option, the container's DNS server (`--dns`). `login`, `createDatabase`, `pipeDump`, `cloneDb`, `logsTail`, `runProbe`, `runForwarder` and `connectNetwork` throw on a name that isn't letters, digits, `_` and `-`.
 
 **`exec`.** `makeExecFileFn({ maxBuffer })` returns an `execFileFn(cmd, args, opts)` that runs `execFile` with `maxBuffer` (default 64 MB, which `opts` can override) and resolves `{ stdout }`. It rejects with an Error whose message is `<cmd> <first arg>: <execFile's message>`, then, on the next line, up to 2000 characters of stderr. The original error is its `cause`, and it also carries the whole `stdout` and `stderr`, the exit `code`, and `killed` and `signal`, so a caller that set a `timeout` can tell a child killed for it. A call aborted through `opts.signal` rejects with the name `AbortError`.
 
@@ -863,7 +1078,7 @@ Demo mode runs the real conductor with fixture PRs and fake adapters, so you can
 - **The PR pane can still reach parts of the base pane.**
   - **Each session says which.** Its [isolation verdict](#isolation-verdicts) is `isolated` only when a check found none of these paths, and a base-vs-PR comparison is advisory otherwise.
   - **With the Docker Provisioner,** each pane has its own network and its own database password, so on Docker Engine with its default iptables rules PR code can't reach the base pane's database directly. These gaps remain ([its section](#built-in-adaptersprovisioner-docker-docker-provisioner)):
-    - where containers can reach the host's loopback (Docker Desktop, Podman machine, and the Lima-based colima, Lima and Rancher Desktop), PR code can still reach the base pane's app, on its published port. It reaches the base pane's proxy, which signs it in as the operator, and the harness too, but they answer it `403` without an enrolled browser's capability;
+    - where containers can reach the host's loopback (Docker Desktop, Podman machine, and the Lima-based colima, Lima and Rancher Desktop), PR code can still reach the base pane's app, on its published port, unless the PR pane is on an [internal network](#the-pr-pane-on-an-internal-network). It reaches the base pane's proxy, which signs it in as the operator, and the harness too, but they answer it `403` without an enrolled browser's capability;
     - with a non-loopback `QA_BIND_HOST`, it can reach the harness and the base pane's proxy on any runtime, which answer it the same way;
     - without Docker Engine's default iptables rules (`"iptables": false`, or Podman), it can reach the base pane's containers by address, and over IPv6 on a dual-stack network with `"ip6tables": false` (the default before Docker Engine 27);
     - where the networks don't keep the panes apart, PR code can sign in to the base pane's database when the provisioner's `postgres.password` is set, since both panes use it, or when the image doesn't enforce the password ([`createDocker`'s `postgres.image`](#effect-wrappers)).
