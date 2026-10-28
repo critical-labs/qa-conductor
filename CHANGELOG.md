@@ -71,7 +71,7 @@ What changed in each release, newest first. A 0.x minor version may break the in
 
 ### The PR pane on an internal network
 
-- **The Docker Provisioner can put the PR pane on an internal network** (`internal`, off by default, #32). The PR pane can then reach neither the host's loopback nor the base pane, on Docker Desktop and Podman machine too, so its isolation probe can find it `isolated` there. README's [The PR pane on an internal network](README.md#the-pr-pane-on-an-internal-network) has the details and a check by hand for each runtime.
+- **The Docker Provisioner can put the PR pane on an internal network** (`internal`, off by default, #32). The PR pane can then reach neither the host's loopback nor the base pane, on Docker Desktop and Podman machine too, so its isolation probe can find it `isolated` there. README's [The PR pane on an internal network](README.md#the-pr-pane-on-an-internal-network) has the details and a check by hand for each runtime. Running it on Docker Desktop and Podman machine is tracked in #43.
   - **The topology:** `qa-session-pr` is created `--internal`. A forwarder, `qa-fwd-pr`, runs the package's `lib/forwarder.mjs` in `node:22-alpine` with no capabilities, a read-only root and no mounts. It sits on an ordinary network, `qa-session-pr-edge`, and joins the internal one as `qa-egress`. It publishes the PR app on `127.0.0.1:<hostPorts.pr>`, and its HTTP proxy is the PR pane's only way out.
   - **The allowlist, `internal.egress`:** host names, `*.domains` and public addresses, with an optional port (80 and 443 without one), checked as the Provisioner is made. Empty by default: no egress. A request goes out only to a listed host whose every address is public, and to the address checked. HTTPS is never intercepted.
   - **No DNS out:** the PR pane's containers run with `--dns 192.0.2.1`, which nothing answers, so an Engine with CVE-2024-29018, or Podman's DNS, which forwards an internal network's outside names too, can't resolve them. On Podman, the names the pane needs go in its hosts files.
@@ -87,6 +87,13 @@ What changed in each release, newest first. A 0.x minor version may break the in
 - **New in `createDocker`:** an `env` option, and `endpoint({ podman })`. `createNetwork(name, { internal, isolatedGateway })`, `networkInternal(name)`, `networkGatewayIsolated(name)`, `containerRunning(name)`, `runForwarder(name, image, network, { hostPort, config, source })` and `connectNetwork(network, container, { alias })`. `runApp` publishes nothing when `hostPort` is `null`. `runPg`, `runMigrate`, `runApp` and `runProbe` take `dns`.
 - **New in `createDockerProvisioner`:** `forwarderReadyMs` and `log`. Its entry point also exports `dockerEngineMajor(version)`.
 - **Nothing changes without `internal`.**
+
+### Hardening opt-ins
+
+- **README's [Hardening opt-ins](README.md#hardening-opt-ins) documents three more, each with what it guarantees and what it doesn't** (#32):
+  - **a `sandbox-exec` profile for the process Provisioner on macOS**, which shuts the PR pane out of the conductor's and the base pane's port numbers, on any address (IPv4-mapped IPv6 included; the same numbers on remote hosts too). It was checked on macOS 12, and on macOS 15 by CI's advisory `macos-sandbox` job. macOS 14 is tracked in #43;
+  - **tagging the conductor's Tailscale node**, so a request that reaches `tailscale serve` from the node itself carries no login for the identity gate to admit;
+  - **Unix-socket listeners behind `tailscale serve`**, which the conductor doesn't support yet: what they would guarantee, and what supporting them would take. Tracked in #42.
 
 ### The Docker Provisioner
 

@@ -12,7 +12,7 @@ The conductor owns the choreography: session state, cancellation, the harness UI
 - [Quickstart: QA your own app](#quickstart-qa-your-own-app)
 - [Use](#use), with the [Entry points](#entry-points)
 - [Using the harness](#using-the-harness)
-- [Security](#security)
+- [Security](#security), with the [Isolation verdicts](#isolation-verdicts) and the [Hardening opt-ins](#hardening-opt-ins)
 - [The seams](#the-seams): [Types](#types), [Contracts](#contracts-between-the-seams), the built-in [`build-worktree`](#built-in-adaptersbuild-worktree-git-worktree-buildconvention), [`provisioner-process`](#built-in-adaptersprovisioner-process-process-provisioner) and [`provisioner-docker`](#built-in-adaptersprovisioner-docker-docker-provisioner), the [Effect wrappers](#effect-wrappers), and [Exposure](#exposure-optional)
 - [Configuration](#configuration): [The env file](#the-env-file), [Sample `.env.qa` files](#sample-envqa-files), [Tokens](#tokens), [Keys](#keys), [A `cfg` built in code](#a-cfg-built-in-code)
 - [HTTP API](#http-api-harness-port), [Expose CLI](#expose-cli), [Demo](#demo)
@@ -315,6 +315,131 @@ By runtime, from the runtimes' sources and docs. These rows weren't each run end
 
 The probe doesn't try the node's `tailscale serve` ports: every way through them ends at a conductor listener, which the [capability](#security) guards.
 
+### Hardening opt-ins
+
+Three more ways to narrow what the PR pane can reach, each opt-in, with what it does and doesn't guarantee. None of them changes the [isolation verdict](#isolation-verdicts): the probe and the declarations decide that. With the Docker Provisioner, the first is its [internal network](#the-pr-pane-on-an-internal-network).
+
+#### A `sandbox-exec` profile for the process Provisioner (macOS)
+
+**What it guarantees** (checked on macOS 12 and 15; on 14, see Checked, and #43): the PR pane's processes can't open a TCP connection to the port numbers the profile names, on any address: this Mac's loopback over IPv4 and IPv6, an IPv4-mapped IPv6 address (`::ffff:127.0.0.1`), `0.0.0.0` or another of the host's addresses. They are:
+- the conductor's three (`QA_HARNESS_PORT`, `QA_BASE_PROXY_PORT`, `QA_PR_PROXY_PORT`);
+- the base pane's service and database ports.
+
+**The trade-off:** those port numbers are refused on every host, remote ones too. A PR pane that must reach, say, port 3100 on another machine can't while the conductor uses it.
+
+**What it doesn't:**
+- The PR pane still runs as you. It can read and write your files (your browser's profile, which holds the capability, included), signal your processes, and use Unix sockets and every loopback port the profile doesn't name.
+- **Routes around it:**
+  - A BuildConvention's install step runs the PR's code before the PR pane starts, outside the profile.
+  - `tailscale serve`'s ports on the node's tailnet address front the conductor too, on port numbers the profile doesn't name. The [capability](#security) still turns such a request away, and on a tagged node (below) the identity gate does first.
+  - A file the PR pane writes can change what an unsandboxed process runs later: a script, a config, a shell profile, the profile itself if it can write it.
+- So the verdict stays `shared-host`, and the trust gate is still the boundary.
+
+**The profile** denies each port it is given, on any address (`*:<port>`), so it names what to shut rather than what to open.
+- **Why any address:** a deny on `localhost:<port>` refused `127.0.0.1`, `::1` and `localhost`, but on macOS 12 an IPv4-mapped IPv6 address, `::ffff:127.0.0.1`, reached every port it named, through the IPv4 listener.
+- **Why not shut everything and open a list:** on macOS 12, an allow for one port after `(deny network-outbound (remote ip "localhost:*"))` didn't reopen it, although after a bare `(deny network-outbound)` it did. A profile that shuts everything and opens a list would depend on which form it used.
+
+```scheme
+; pr-pane.sb: no TCP to these port numbers, on any address
+(version 1)
+(allow default)
+(deny network-outbound (remote ip (string-append "*:" (param "HARNESS"))))
+(deny network-outbound (remote ip (string-append "*:" (param "BASE_PROXY"))))
+(deny network-outbound (remote ip (string-append "*:" (param "PR_PROXY"))))
+(deny network-outbound (remote ip (string-append "*:" (param "BASE_APP"))))
+(deny network-outbound (remote ip (string-append "*:" (param "BASE_DB"))))
+```
+
+**Wire it in through `command`.** The boot launches the base pane's database and services before the PR pane's, so `command` can note the base pane's ports and pass them to the PR pane's sandbox. `sandbox-exec` runs the command in its own place, with the same pid, so teardown still signals the server's group:
+
+```js
+import path from 'node:path'
+import { createProcessProvisioner } from '@critical-labs/qa-conductor/adapters/provisioner-process'
+
+const conductorPorts = { HARNESS: '3100', BASE_PROXY: '3101', PR_PROXY: '3102' }  // match QA_*_PORT
+const basePorts = {}
+
+const provisioner = createProcessProvisioner({
+  stateDir: '/var/lib/qa-conductor/acme-widget',
+  database: {
+    command: ({ paneRef, port }) => {
+      if (paneRef.role === 'base') basePorts.BASE_DB = String(port)
+      return { cmd: '/usr/bin/java', args: ['-jar', 'DynamoDBLocal.jar', '-inMemory', '-port', String(port)], cwd: '/opt/dynamodb-local' }
+    },
+    ready: async () => {},
+    handle: ({ port }) => ({ dsn: `http://127.0.0.1:${port}`, db: {} }),
+  },
+  command: ({ ref, port, paneRef }) => {
+    const server = { cmd: path.join(ref, 'node_modules/.bin/tsx'), args: ['packages/api/src/dev.ts'] }
+    if (paneRef.role === 'base') {
+      basePorts.BASE_APP = String(port)
+      return { ...server, cwd: ref, env: { PORT: String(port) } }
+    }
+    const params = Object.entries({ ...conductorPorts, ...basePorts }).flatMap(([name, value]) => ['-D', `${name}=${value}`])
+    return {
+      cmd: '/usr/bin/sandbox-exec',
+      args: [...params, '-f', '/usr/local/etc/qa-conductor/pr-pane.sb', server.cmd, ...server.args],
+      cwd: ref,
+      env: { PORT: String(port) },
+    }
+  },
+})
+```
+
+- **Keep the profile where PR code can't write it:** the PR pane runs as you, so a profile in a directory you own can be rewritten before the next boot. For example:
+  - `sudo mkdir -p /usr/local/etc/qa-conductor`, then `sudo cp pr-pane.sb /usr/local/etc/qa-conductor/`;
+  - then `sudo chown -R root:wheel /usr/local/etc/qa-conductor`, `sudo chmod 755 /usr/local/etc/qa-conductor` and `sudo chmod 644 /usr/local/etc/qa-conductor/pr-pane.sb`, since `mkdir -p` leaves a directory that is already there as it was;
+  - `ls -ld /usr/local/etc/qa-conductor /usr/local/etc/qa-conductor/pr-pane.sb` should then show `root` for both, and no `w` but the owner's.
+- **Every parameter the profile names must be passed.** One missing, such as `BASE_DB` with no database, makes the profile fail to load: `sandbox-exec` exits 65 (`string-append: argument 2 must be: string`), and the pane doesn't start. Drop that line from the profile instead.
+- **`sandbox-exec` can't nest.** A conductor that itself runs under a sandbox (an app's own, say) can't start the PR pane under this profile: `sandbox-exec` exits 71, with `sandbox_apply: Operation not permitted`.
+- With more than one base service, note each port and add a line per port to the profile.
+
+**Checked:**
+- **On macOS 12.7.6,** by hand and by `test/docs.test.mjs`: a process under this profile got `EPERM` for each named port, over `127.0.0.1`, `::1`, `localhost`, `::ffff:127.0.0.1`, `::ffff:7f00:1`, `127.1`, `0.0.0.0` and another of the host's addresses, and connected to another port over each loopback form.
+- **On macOS 15,** by CI's `macos-sandbox` job on GitHub's runner, on every pull request: it runs that docs test, 30 rounds of every try, and fails if the test was skipped.
+- **On macOS 14, not yet.** The same job runs there, and with the earlier `localhost:<port>` form it let one named port through, over `localhost`, in 2 of 5 runs, though `127.0.0.1` to the same port got `EPERM` in the same process. Whether the `*:<port>` form holds there is tracked in [#43](https://github.com/critical-labs/qa-conductor/issues/43).
+- **The job is advisory:** it isn't a required check, until it has run reliably on both.
+- Apple already marks `sandbox-exec` deprecated on macOS 12, and still ships it on 14 and 15.
+- **Check yours** while a session runs, with the ports you use:
+  - `sandbox-exec -D HARNESS=3100 -D BASE_PROXY=3101 -D PR_PROXY=3102 -D BASE_APP=<port> -D BASE_DB=<port> -f /usr/local/etc/qa-conductor/pr-pane.sb "$(command -v node)" -e "require('net').connect(3100, '127.0.0.1').on('connect', function () { console.log('connected'); this.destroy() }).on('error', e => console.log(e.code))"` must print `EPERM`, and the same `node -e` without `sandbox-exec` must print `connected`. A closed port would print `ECONNREFUSED`.
+  - Or with `curl -sv` in place of `node -e`: `Immediate connect fail for 127.0.0.1: Operation not permitted`, where `curl -sS` alone says only that it couldn't connect.
+
+#### Tag the conductor's Tailscale node
+
+**What it guarantees:** in tailscale mode, a request that reaches `tailscale serve` from the conductor's own node carries no `Tailscale-User-Login`, so the [identity gate](#security) refuses it.
+- `tailscale serve` sets no identity headers for traffic from a tagged device.
+- On a node a person owns, the same request carries the owner's login, which is usually in `QA_ALLOWED_LOGINS`.
+- Whether code on this host, or a container on it, can reach `tailscale serve` through the node's tailnet name or address depends on the platform, and isn't checked here. With the tag, any request that does gets no login.
+
+**What it doesn't:**
+- Code on this host can still reach the conductor's loopback ports directly and send any login it likes. There, as everywhere, the [capability](#security) is what turns it away.
+- Reviewers' own devices are unaffected: their requests still carry their logins.
+
+**How:**
+- In the tailnet policy, give the tag an owner (`"tagOwners": { "tag:qa-conductor": ["<your login>"] }`).
+- Grant the reviewers access to the tag on the harness and pane ports (`8444`, `8443` and `10000` by default). A policy that grants each person their own devices no longer covers a tagged node.
+- Then tag the node, with `tailscale up --advertise-tags=tag:qa-conductor` or from the admin console.
+- `QA_ALLOWED_LOGINS` stays the reviewers' logins.
+
+**Checked:** not here: nothing in this repository runs `tailscale`. Check it from the conductor's host while it runs: `curl -sS -D - https://<machine>.<tailnet>.ts.net:8444/qa/api/state`. Every case answers `403`, so read its `X-QA-Refusal` header and its body:
+- `X-QA-Refusal: identity` and `403: no Tailscale identity: …`: the node is tagged, and the identity gate refused a request with no login;
+- `X-QA-Refusal: identity` and `403: <login> is not in QA_ALLOWED_LOGINS`: the node isn't tagged, and its owner isn't an allowed login. The header alone can't tell this from a tagged node;
+- `X-QA-Refusal: capability` and a JSON body with `"refusal":"capability"`: the node isn't tagged, its owner's login got past the gate, and only the capability refused it.
+
+#### Unix-socket listeners (Linux, not yet supported)
+
+**What it would guarantee:** with the harness and both pane proxies listening on Unix sockets behind `tailscale serve`, there would be no TCP listener for a pane to reach. A container that reaches the host's loopback, or a process pane, would find nothing there, and a socket's file mode would decide who can connect.
+
+**Why not yet:**
+- The conductor listens only on TCP (`QA_BIND_HOST` and the three ports), so it can't take this step.
+- `tailscale serve` can proxy to a `unix:` target. [Issue #32](https://github.com/critical-labs/qa-conductor/issues/32) records that this takes Tailscale 1.94 or later, and two catches:
+  - since Tailscale v1.100, a socket target needs root or an operator who can use sudo;
+  - the backend then gets `Host: localhost`.
+- So supporting it means more than a socket. The conductor would need to take the harness and pane origins from its config, rather than the `Host` header, for its [same-origin](#security) and pane request checks.
+- Tracked in [#42](https://github.com/critical-labs/qa-conductor/issues/42).
+
+**Today:** the Docker Provisioner's [internal network](#the-pr-pane-on-an-internal-network) is meant to close the same path for container panes: it gives the PR pane no route to the host's loopback. Each session's probe checks that it doesn't reach the conductor or the base pane there. CI runs the topology on Linux, against Docker Engine and Podman, where containers don't reach the host's loopback anyway. Its check by hand on Docker Desktop and Podman machine, where they do, is tracked in [#43](https://github.com/critical-labs/qa-conductor/issues/43).
+
 ## The seams
 
 A boot runs these five seams in order: `ensureBuilt` → `provisionDatabase` (both panes) → the [isolation check](#isolation-verdicts) → per pane (`seedPane` → `reserveServices`) → `derivePaneEnv` (+ `runMigrate`) → `launchServices` → `waitHealthy` → `establishSession`. A sixth, [Exposure](#exposure-optional), is optional and outside the boot: it publishes the conductor itself. The shapes they pass each other are under [Types](#types).
@@ -483,7 +608,7 @@ The other options are `healthTimeoutMs` (60000, per service), `host` (`127.0.0.1
 - **Health.** `waitHealthy` polls `<url><healthPath>` until `healthy(status)`, for up to `healthTimeoutMs`. A process that exits first fails the boot at once, with its log tail. `healthy(status)` gets the service's own response status: redirects aren't followed (an app often redirects to its public origin, the pane proxy, which answers `503` until the boot is done), so under the default `status < 500` a `3xx` counts as up. A strict predicate such as `status === 200` needs a `healthPath` that doesn't redirect.
 - **Logs.** Each pane keeps its last `logLines` lines of stdout and stderr, prefixed `[name]`, and `logs()` returns the tail. The buffer survives teardown, and resets when the pane's next boot starts.
 - **Teardown** signals process **groups**, never bare pids, because a wrapper may exit at once while its server lives on. Services go first, then the database: SIGTERM, then SIGKILL after `graceMs`. A group that survives SIGKILL, or a pid teardown can't check, is logged and left for the next sweep, and teardown then rejects, naming it, once it has stopped the rest; so does a sweep that leaves one running. Once a leader has exited, its pid can be reissued, so teardown checks it with `ps` first: a pid held by another process means our group is gone, and it isn't signalled.
-- **Isolation.** It declares `isolation: 'shared-host'`: both panes run as you on one host, so each can reach the other's ports, files and processes, and every session's [isolation verdict](#isolation-verdicts) is `shared-host`. A base-vs-PR comparison is advisory with it.
+- **Isolation.** It declares `isolation: 'shared-host'`: both panes run as you on one host, so each can reach the other's ports, files and processes, and every session's [isolation verdict](#isolation-verdicts) is `shared-host`. A base-vs-PR comparison is advisory with it. On macOS, a `sandbox-exec` profile can shut the PR pane out of the conductor's and the base pane's loopback ports ([Hardening opt-ins](#hardening-opt-ins)).
 - **Crash cleanup.** Each process is recorded in `<stateDir>/pids.json` with its start time from `ps` and the boot it ran in. The directory must be a real directory owned by you and not writable by group or others (it's created `0700`; one that others could write to is refused, since its contents may be planted), and `pids.json` must be a regular file owned by you (written `0600`). `sweep()`, which the conductor runs at startup, kills the groups a previous run left behind. It skips any pid that now belongs to another process, drops entries from an earlier boot without signalling anything, and leaves in place entries it can't check (no start time). Give each conductor its own `stateDir`. A `process.on('exit')` hook SIGKILLs every live group; signals don't run it, so call the conductor's `shutdown()` from your signal handlers.
 - There's no `runMigrate`: process consumers migrate on boot.
 
