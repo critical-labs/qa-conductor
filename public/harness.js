@@ -87,16 +87,21 @@ function markType(event) {
 // group the oldest first (createdAt, undated ones after dated ones, then by
 // number). PRs in `skipped` come last, in the order they were skipped.
 const READINESS_RANK = new Map([['built', 0], ['building', 1]])
-function reviewQueue(prs, { verdictLabels, skipped = [], done = [] } = {}) {
+// Whether a PR's labels hold either verdict label (GitHub label names are
+// case-insensitive).
+function hasVerdictLabel(pr, verdictLabels) {
   const verdicts = new Set([verdictLabels?.accept, verdictLabels?.reject].filter(l => typeof l === 'string').map(l => l.toLowerCase()))
+  const labels = Array.isArray(pr?.labels) ? pr.labels : []
+  return labels.some(l => typeof l === 'string' && verdicts.has(l.toLowerCase()))
+}
+function reviewQueue(prs, { verdictLabels, skipped = [], done = [] } = {}) {
   const finished = new Set(done.map(Number))
   const skipOrder = new Map(skipped.map((n, i) => [Number(n), i]))
   let blocked = 0
   const waiting = []
   for (const pr of Array.isArray(prs) ? prs : []) {
     if (!pr || !Number.isInteger(pr.number)) continue
-    const labels = Array.isArray(pr.labels) ? pr.labels : []
-    if (labels.some(l => typeof l === 'string' && verdicts.has(l.toLowerCase()))) continue
+    if (hasVerdictLabel(pr, verdictLabels)) continue
     if (finished.has(pr.number)) continue
     if (pr.imageStatus === 'blocked') { blocked++; continue }
     waiting.push(pr)
@@ -172,15 +177,19 @@ function inviteFromHash(hash) {
     review: { on: false, queue: [], blocked: 0, current: null, posted: null, error: null },
   }
 
-  // What this visit skipped or finished, kept in the tab's session storage
-  // so a reload at #/review carries on; in memory where storage throws.
+  // What this visit skipped, the PRs it posted a verdict for whose label the
+  // PR list hasn't shown yet (`done`, dropped once it does), and how many it
+  // reviewed, kept in the tab's session storage so a reload at #/review
+  // carries on; in memory where storage throws.
   const REVIEW_KEY = 'qa-review'
-  let reviewMemory = { skipped: [], done: [] }
+  let reviewMemory = { skipped: [], done: [], reviewed: 0 }
   const reviewStore = {
     get() {
       try {
         const v = JSON.parse(sessionStorage.getItem(REVIEW_KEY) || 'null')
-        if (v && Array.isArray(v.skipped) && Array.isArray(v.done)) return { skipped: v.skipped.map(Number), done: v.done.map(Number) }
+        if (v && Array.isArray(v.skipped) && Array.isArray(v.done)) {
+          return { skipped: v.skipped.map(Number), done: v.done.map(Number), reviewed: Number.isInteger(v.reviewed) ? v.reviewed : 0 }
+        }
       } catch { /* memory only */ }
       return reviewMemory
     },
@@ -320,7 +329,7 @@ function inviteFromHash(hash) {
     }
     if (route.view === 'review') return renderReview(s)
     // any other route leaves Change Review; a session it opened stays
-    S.review.on = false
+    leaveReview()
     const active = s.status !== 'idle'
     if (route.view === 'picker' || !route.pr) { teardownSessionUi(); return renderPicker(s) }
     if (active && s.pr === route.pr) {
@@ -483,11 +492,18 @@ function inviteFromHash(hash) {
     return reviewing
   }
 
+  // Leaving #/review for any other view: the walk forgets where it was, so a
+  // later visit starts from the queue head, and a session it opened stays.
+  function leaveReview() { S.review.on = false; S.review.current = null; S.review.posted = null; S.review.error = null }
+
   async function reviewWalk(state) {
     S.review.on = true
+    // the page left #/review while this walk awaited: nothing more to draw
+    const left = () => parseHash().view !== 'review'
     let prs
     try { ({ prs } = await api('/prs')) } catch (err) {
       if (err && err.capability) return // enrolment takes over, and renders again
+      if (left()) return
       // the queue can't be read: say so, and keep showing a session the walk
       // was on, if any
       S.review.error = err.message
@@ -498,36 +514,49 @@ function inviteFromHash(hash) {
       renderStrip(); showView('queueClear'); setPill('review')
       return
     }
+    if (left()) return
     S.review.error = null
-    const { skipped, done } = reviewStore.get()
+    const stored = reviewStore.get()
+    // the sessions the walk itself opened and finished or skipped: these it
+    // may end without asking; any other running session is the reviewer's
+    const owned = pr => stored.done.includes(pr) || stored.skipped.includes(pr)
+    // a PR whose verdict label the list now shows needs no more cover
+    const done = stored.done.filter(n => !prs.some(p => p.number === n && hasVerdictLabel(p, S.verdictLabels)))
+    if (done.length !== stored.done.length) reviewStore.set({ ...stored, done })
+    const { skipped } = stored
     const { queue, blocked } = reviewQueue(prs, { verdictLabels: S.verdictLabels, skipped, done })
     S.review.queue = queue; S.review.blocked = blocked
     const active = state.status !== 'idle' && state.status !== 'error'
+    const previous = S.review.current // null on a fresh entry, or after a verdict or skip
     if (queue.length === 0) {
-      // nothing left: end what runs (the last PR's session, say) and say so
       S.review.current = null
-      if (active || state.status === 'error') { teardownSessionUi(); await postJson('/teardown').catch(() => {}) }
+      // a session on a PR the walk never opened is the reviewer's: ask
+      if (active && !owned(state.pr)) return showHold('foreign-empty', state)
+      // nothing left: end the walk's own last session and say so
+      if (active || state.status === 'error') {
+        teardownSessionUi(); await postJson('/teardown').catch(() => {})
+        if (left()) return
+      }
       renderStrip(); showView('queueClear'); setPill('queue clear')
       const b = $('queueClearBlocked'); b.hidden = blocked === 0
       b.textContent = blocked === 0 ? '' : `${blocked} can't boot and ${blocked === 1 ? 'is' : 'are'} left out.`
       return
     }
     const queued = active && queue.some(p => p.number === state.pr)
-    const resuming = S.review.current === null // a fresh entry, or after a verdict or skip
     S.review.current = queued ? state.pr : queue[0].number
     renderStrip()
     if (active && !queued) {
       // the session is on a PR the queue is done with: replace it with the
       // next; on any other PR, ask (a review started from the picker, say)
-      if (done.includes(state.pr) || skipped.includes(state.pr)) { teardownSessionUi(); return openSession(S.review.current, { takeover: true }) }
+      if (owned(state.pr)) { teardownSessionUi(); return openSession(S.review.current, { takeover: true }) }
       return showHold('foreign', state)
     }
     if (active) return state.status === 'ready' ? renderSession(state) : renderBoot(state.pr, state)
     // a boot of the current PR failed: its error, with Retry, Skip and Stop
     if (state.status === 'error' && state.pr === S.review.current) return renderBoot(state.pr, state)
-    // the walk was on this PR and its session ended (the idle teardown, say):
-    // don't boot again by itself
-    if (!resuming) return showHold('ended', state)
+    // the walk was on this very PR and its session ended (the idle teardown,
+    // say): don't boot it again by itself
+    if (previous !== null && previous === S.review.current) return showHold('ended', state)
     teardownSessionUi()
     return openSession(S.review.current)
   }
@@ -536,12 +565,12 @@ function inviteFromHash(hash) {
   // verdict, and a failed queue read. Titles and errors are text.
   function renderStrip() {
     const r = S.review
-    const { done } = reviewStore.get()
+    const { reviewed } = reviewStore.get()
     const pr = r.queue.find(p => p.number === r.current) || null
     $('reviewNum').textContent = r.current === null ? '' : `#${r.current}`
     $('reviewTitle').textContent = pr && pr.title ? pr.title : ''
-    const total = done.length + r.queue.length
-    $('reviewCount').textContent = r.queue.length ? `${done.length + 1} of ${total}` : `${done.length} of ${total} done`
+    const total = reviewed + r.queue.length
+    $('reviewCount').textContent = r.queue.length ? `${reviewed + 1} of ${total}` : `${reviewed} of ${total} done`
     const next = r.queue.filter(p => p.number !== r.current)[0]
     $('reviewNext').textContent = r.queue.length === 0 ? '' : next ? `next #${next.number}` : 'last one'
     $('reviewBlocked').textContent = r.blocked ? `${r.blocked} can't boot` : ''
@@ -559,14 +588,20 @@ function inviteFromHash(hash) {
   function showHold(kind, state) {
     const n = S.review.current
     showView('reviewHold'); setPill('review')
-    $('holdResume').hidden = kind !== 'foreign'
-    if (kind === 'foreign') {
+    $('holdResume').hidden = kind === 'ended'
+    if (kind !== 'ended') {
       $('holdHeading').textContent = `A session is running on #${state.pr}, which isn't in the queue`
-      $('holdText').textContent = `Resume it in the plain harness, or end it and open #${n}, the next pull request waiting for a verdict.`
-      $('holdPrimary').textContent = `End #${state.pr} and open #${n}`
       $('holdResume').textContent = `Resume #${state.pr}`
-      $('holdResume').onclick = () => { S.review.on = false; go(`#/pr/${state.pr}`) }
-      twoStepConfirm($('holdPrimary'), 'End & open?', () => { teardownSessionUi(); openSession(n, { takeover: true }).catch(err => announce(`Couldn't open #${n}: ${err.message}`, true)) })
+      $('holdResume').onclick = () => { leaveReview(); go(`#/pr/${state.pr}`) }
+      if (kind === 'foreign-empty') {
+        $('holdText').textContent = 'No other pull request is waiting for a verdict. Resume it in the plain harness, or end it.'
+        $('holdPrimary').textContent = `End #${state.pr}`
+        twoStepConfirm($('holdPrimary'), 'End?', async () => { teardownSessionUi(); await postJson('/teardown').catch(() => {}); renderReview({ status: 'idle' }) })
+      } else {
+        $('holdText').textContent = `Resume it in the plain harness, or end it and open #${n}, the next pull request waiting for a verdict.`
+        $('holdPrimary').textContent = `End #${state.pr} and open #${n}`
+        twoStepConfirm($('holdPrimary'), 'End & open?', () => { teardownSessionUi(); openSession(n, { takeover: true }).catch(err => announce(`Couldn't open #${n}: ${err.message}`, true)) })
+      }
     } else {
       $('holdHeading').textContent = `The session for #${n} has ended`
       $('holdText').textContent = 'The idle teardown, or someone ending it. Continue to open it again, or skip it.'
@@ -576,7 +611,7 @@ function inviteFromHash(hash) {
   }
   $('holdStop').onclick = () => stopReview()
 
-  function stopReview() { S.review.on = false; S.review.current = null; go('#/') }
+  function stopReview() { leaveReview(); go('#/') }
   $('stopBtn').onclick = stopReview
   $('queueBack').onclick = stopReview
   $('queueAgain').onclick = () => api('/state').then(renderReview, () => renderReview({ status: 'idle' }))
@@ -587,8 +622,10 @@ function inviteFromHash(hash) {
   async function skipReview() {
     const pr = S.review.current
     if (pr === null) return
-    const { skipped, done } = reviewStore.get()
-    reviewStore.set({ skipped: skipped.filter(n => n !== pr).concat(pr), done })
+    // a walk in flight may be opening a session: a skip now would be lost
+    if (reviewing) return announce('Change Review is busy; try again in a moment', true)
+    const stored = reviewStore.get()
+    reviewStore.set({ ...stored, skipped: stored.skipped.filter(n => n !== pr).concat(pr) })
     S.review.current = null; S.review.posted = null
     teardownSessionUi()
     await postJson('/teardown').catch(() => {})
@@ -599,8 +636,8 @@ function inviteFromHash(hash) {
 
   // A verdict posted in Change Review: the PR is done, and the next opens.
   async function reviewAdvance(pr, url) {
-    const { skipped, done } = reviewStore.get()
-    reviewStore.set({ skipped: skipped.filter(n => n !== pr), done: done.includes(pr) ? done : done.concat(pr) })
+    const { skipped, done, reviewed } = reviewStore.get()
+    reviewStore.set({ skipped: skipped.filter(n => n !== pr), done: done.includes(pr) ? done : done.concat(pr), reviewed: reviewed + 1 })
     S.review.posted = { pr, url }; S.review.current = null
     hideVerdictBody(); $('verdictPreview').hidden = true; $('verdictEdit').hidden = false
     teardownSessionUi()
@@ -706,7 +743,7 @@ function inviteFromHash(hash) {
   }
   function showOpenErr(err) { showErrorText(err.message) }
   function mkBtn(text, cls, onclick) { const b = document.createElement('button'); b.className = cls; b.textContent = text; b.onclick = onclick; return b }
-  $('cancelBoot').onclick = async () => { await postJson('/teardown').catch(() => {}); go('#/') }
+  $('cancelBoot').onclick = async () => { leaveReview(); await postJson('/teardown').catch(() => {}); go('#/') }
 
   // --- session -------------------------------------------------------------
   function onReady(meta) { if (!S.review.on) setHashSilent(`#/pr/${meta.pr || bootPr}`); showIsolation(meta.isolation); renderSession(meta) }
@@ -954,7 +991,7 @@ function inviteFromHash(hash) {
       case '3': setWidth(0); break
       case 'v': toggleVerdict(); break
       case 'e': $('teardownBtn').click(); break
-      case 'Escape': for (const id of ['teardownBtn', 'skipBtn']) $(id)._disarm && $(id)._disarm(); if (!$('verdictBody').hidden) hideVerdictBody(); break
+      case 'Escape': for (const id of ['teardownBtn', 'skipBtn', 'barSkip', 'holdPrimary']) $(id)._disarm && $(id)._disarm(); if (!$('verdictBody').hidden) hideVerdictBody(); break
     }
   })
   $('shortcutsClose').onclick = () => $('shortcuts').close()
@@ -997,5 +1034,5 @@ function inviteFromHash(hash) {
 // --- test exports (node --test evaluates this file through a CJS wrapper) ---
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { esc, isHttpsUrl, LABELS, harnessOriginNotice, buildSummary, buildFromEvent, inviteFromHash, isCapabilityRefusal, isolationLabel, reviewQueue }
+  module.exports = { esc, isHttpsUrl, LABELS, harnessOriginNotice, buildSummary, buildFromEvent, inviteFromHash, isCapabilityRefusal, isolationLabel, hasVerdictLabel, reviewQueue }
 }

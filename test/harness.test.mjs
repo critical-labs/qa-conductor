@@ -11,11 +11,19 @@ import { dirname, join } from 'node:path'
 const harnessPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'public', 'harness.js')
 const cjsModule = { exports: {} }
 new Function('module', 'exports', readFileSync(harnessPath, 'utf8'))(cjsModule, cjsModule.exports)
-const { esc, isHttpsUrl, LABELS, harnessOriginNotice, buildSummary, buildFromEvent, inviteFromHash, isCapabilityRefusal, isolationLabel, reviewQueue } = cjsModule.exports
+const { esc, isHttpsUrl, LABELS, harnessOriginNotice, buildSummary, buildFromEvent, inviteFromHash, isCapabilityRefusal, isolationLabel, hasVerdictLabel, reviewQueue } = cjsModule.exports
 const harnessSrc = readFileSync(harnessPath, 'utf8')
 
 test('the CJS guard exports the pure helpers only', () => {
-  assert.deepEqual(Object.keys(cjsModule.exports).sort(), ['LABELS', 'buildFromEvent', 'buildSummary', 'esc', 'harnessOriginNotice', 'inviteFromHash', 'isCapabilityRefusal', 'isHttpsUrl', 'isolationLabel', 'reviewQueue'])
+  assert.deepEqual(Object.keys(cjsModule.exports).sort(), ['LABELS', 'buildFromEvent', 'buildSummary', 'esc', 'harnessOriginNotice', 'hasVerdictLabel', 'inviteFromHash', 'isCapabilityRefusal', 'isHttpsUrl', 'isolationLabel', 'reviewQueue'])
+})
+
+test('hasVerdictLabel: either verdict label, whatever its case; nothing else', () => {
+  const v = { accept: 'qa-approved', reject: 'qa-changes-requested' }
+  assert.equal(hasVerdictLabel({ labels: ['bug', 'QA-Approved'] }, v), true)
+  assert.equal(hasVerdictLabel({ labels: ['qa-changes-requested'] }, v), true)
+  for (const pr of [{ labels: ['bug'] }, { labels: [] }, {}, null, { labels: 'qa-approved' }]) assert.equal(hasVerdictLabel(pr, v), false, JSON.stringify(pr))
+  assert.equal(hasVerdictLabel({ labels: ['qa-approved'] }, undefined), false)
 })
 
 const VERDICTS = { accept: 'qa-approved', reject: 'qa-changes-requested' }
@@ -167,6 +175,7 @@ function fakeBrowser({ hash = '#/', stored = null, routes = {}, elements = {}, c
   const listeners = []
   const intervals = [] // { fn, ms }, in the order set; none ever runs by itself
   const store = new Map(stored === null ? [] : [['qa-cap', stored]])
+  const sources = [] // every EventSource the page opened, to feed events to
   const sessionStorage = sessionThrows
     ? { getItem() { throw new Error('storage off') }, setItem() { throw new Error('storage off') }, removeItem() { throw new Error('storage off') } }
     : { getItem: k => session.get(k) ?? null, setItem: (k, v) => session.set(k, String(v)), removeItem: k => session.delete(k) }
@@ -214,7 +223,7 @@ function fakeBrowser({ hash = '#/', stored = null, routes = {}, elements = {}, c
     },
     localStorage: { getItem: k => store.get(k) ?? null, setItem: (k, v) => store.set(k, String(v)), removeItem: k => store.delete(k) },
     sessionStorage,
-    EventSource: class { static CLOSED = 2; constructor(url) { log.push(['source', url]); this.readyState = 0 } close() {} },
+    EventSource: class { static CLOSED = 2; constructor(url) { log.push(['source', url]); this.readyState = 0; sources.push(this) } close() {} },
     history: { replaceState: (_s, _t, url) => { log.push(['replace', url]); location.hash = `#${String(url).split('#')[1] ?? ''}` } },
     location,
     navigator: {},
@@ -226,7 +235,7 @@ function fakeBrowser({ hash = '#/', stored = null, routes = {}, elements = {}, c
   const names = Object.keys(globals)
   new Function(...names, 'module', harnessSrc)(...names.map(n => globals[n]), undefined)
   const settle = async () => { for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r)) }
-  return { log, listeners, store, session, byId, location, settle, intervals }
+  return { log, listeners, store, session, sources, byId, location, settle, intervals }
 }
 
 const CAPTURE = { status: 403, body: { error: 'this browser is not enrolled' }, headers: { 'x-qa-refusal': 'capability' } }
@@ -854,9 +863,9 @@ test('a verdict in Change Review records the PR as done and opens the next with 
   await b.byId('postBtn').onclick(); await b.settle()
   assert.equal(posts(b, '/qa/api/verdict'), 1)
   assert.deepEqual(sessions(b), [{ pr: 8, takeover: true }], 'the next PR replaces the finished one')
-  assert.deepEqual(reviewStored(b), { skipped: [], done: [7] })
+  assert.deepEqual(reviewStored(b), { skipped: [], done: [7], reviewed: 1 })
   assert.ok(!b.log.some(e => e[0] === 'replace' && /verdict/.test(e[1])), 'no #/pr/7/verdict')
-  assert.equal(b.byId('reviewPosted').textContent, '', 'the note is built from text nodes')
+  assert.ok(b.log.some(e => e[0] === 'set' && e[1] === 'reviewPosted' && e[2] === 'textContent' && e[3] === ''), 'the note is rebuilt from text nodes')
   assert.equal(b.byId('reviewCount').textContent, '2 of 2')
   assert.equal(b.byId('reviewNext').textContent, 'last one')
 })
@@ -876,18 +885,19 @@ test('Skip sends the current PR to the back for this visit, ends its session and
   await confirmClick(b.byId('skipBtn')); await b.settle()
   assert.equal(posts(b, '/qa/api/teardown'), 1)
   assert.deepEqual(sessions(b), [{ pr: 7 }, { pr: 8 }])
-  assert.deepEqual(reviewStored(b), { skipped: [7], done: [] })
+  assert.deepEqual(reviewStored(b), { skipped: [7], done: [], reviewed: 0 })
   assert.equal(b.byId('reviewNext').textContent, 'next #7', 'the skipped PR comes back at the end')
   // skipping the last one brings the skipped PR round again
   await confirmClick(b.byId('skipBtn')); await b.settle()
   assert.deepEqual(sessions(b), [{ pr: 7 }, { pr: 8 }, { pr: 7 }])
-  assert.deepEqual(reviewStored(b), { skipped: [7, 8], done: [] }, 'in the order they were skipped')
+  assert.deepEqual(reviewStored(b), { skipped: [7, 8], done: [], reviewed: 0 }, 'in the order they were skipped')
 })
 
-test('an empty queue ends the session and shows Queue clear, with the blocked count', async () => {
+test('an empty queue ends the walk\'s own last session and shows Queue clear, with the blocked count', async () => {
   const prs = [QUEUE_PRS[0], { number: 9, title: 'nine', imageStatus: 'blocked', reason: 'fork', labels: [] }]
+  const session = new Map([['qa-review', JSON.stringify({ skipped: [], done: [4], reviewed: 1 })]])
   const b = fakeBrowser({
-    hash: '#/review', stored: 'tok',
+    hash: '#/review', stored: 'tok', session,
     routes: {
       'GET /qa/api/state': { body: { status: 'ready', pr: 4, startedAt: 1, panes: PANES, ...VERDICT_STATE } },
       'GET /qa/api/prs': { body: { prs, session: { pr: 4, status: 'ready' } } },
@@ -900,6 +910,81 @@ test('an empty queue ends the session and shows Queue clear, with the blocked co
   assert.equal(b.byId('queueClear').hidden, false)
   assert.equal(b.byId('queueClearBlocked').hidden, false)
   assert.equal(b.byId('queueClearBlocked').textContent, "1 can't boot and is left out.")
+  assert.equal(b.byId('reviewCount').textContent, '1 of 1 done')
+  // #4's label is in the list now, so the cover for it is dropped
+  assert.deepEqual(reviewStored(b), { skipped: [], done: [], reviewed: 1 })
+})
+
+// A session the reviewer opened from the picker, on a PR the queue is done
+// with, is theirs: the walk asks before ending it, even with nothing to open.
+test('an empty queue never ends a session the walk did not open: it is held, with End as a confirmed click', async () => {
+  const b = fakeBrowser({
+    hash: '#/review', stored: 'tok',
+    routes: {
+      'GET /qa/api/state': { body: { status: 'ready', pr: 4, startedAt: 1, panes: PANES, ...VERDICT_STATE } },
+      'GET /qa/api/prs': { body: { prs: [QUEUE_PRS[0]], session: { pr: 4, status: 'ready' } } },
+      'POST /qa/api/teardown': { body: { ok: true } },
+    },
+  })
+  await b.settle()
+  assert.equal(posts(b, '/qa/api/teardown'), 0)
+  assert.equal(b.byId('reviewHold').hidden, false)
+  assert.equal(b.byId('holdHeading').textContent, "A session is running on #4, which isn't in the queue")
+  assert.equal(b.byId('holdPrimary').textContent, 'End #4')
+  assert.equal(b.byId('holdResume').hidden, false)
+  await confirmClick(b.byId('holdPrimary')); await b.settle()
+  assert.equal(posts(b, '/qa/api/teardown'), 1)
+  assert.equal(b.byId('queueClear').hidden, false)
+})
+
+// The loop the design avoids: a session that ends by itself (the idle
+// teardown) while the walk is on it must not boot again on its own.
+test('a session that ends under the walk is held for Continue, not booted again', async () => {
+  let st = { status: 'idle', ...VERDICT_STATE }
+  const b = fakeBrowser({
+    hash: '#/review', stored: 'tok',
+    routes: {
+      'GET /qa/api/state': () => ({ body: st }),
+      'GET /qa/api/prs': { body: { prs: QUEUE_PRS, session: null } },
+      'POST /qa/api/session': { status: 202, body: { ok: true } },
+    },
+  })
+  await b.settle()
+  assert.deepEqual(sessions(b), [{ pr: 7 }])
+  assert.equal(b.sources.length, 1, 'the boot view follows the progress stream')
+  // the conductor tears the session down (idle) and says so on the stream
+  b.sources[0].onmessage({ data: JSON.stringify({ kind: 'torn-down' }) }); await b.settle()
+  assert.deepEqual(sessions(b), [{ pr: 7 }], 'no boot by itself')
+  assert.equal(b.byId('reviewHold').hidden, false)
+  assert.equal(b.byId('holdHeading').textContent, 'The session for #7 has ended')
+  assert.equal(b.byId('holdResume').hidden, true)
+  b.byId('holdPrimary').onclick(); await b.settle()
+  assert.deepEqual(sessions(b), [{ pr: 7 }, { pr: 7 }], 'Continue opens it again')
+})
+
+// Leaving review mode forgets where the walk was: a later visit starts from
+// the queue head rather than holding for a PR that has no session.
+test('Stop forgets the walk\'s place, so the next visit opens the head without a hold', async () => {
+  let st = { status: 'ready', pr: 7, startedAt: 1, panes: PANES, ...VERDICT_STATE }
+  const b = fakeBrowser({
+    hash: '#/review', stored: 'tok',
+    routes: {
+      'GET /qa/api/state': () => ({ body: st }),
+      'GET /qa/api/prs': { body: { prs: QUEUE_PRS, session: null } },
+      'POST /qa/api/pane-entry': entryRoute,
+      'POST /qa/api/session': { status: 202, body: { ok: true } },
+    },
+  })
+  await b.settle()
+  b.byId('stopBtn').onclick(); await b.settle()
+  assert.equal(b.location.hash, '#/')
+  // the session ended meanwhile; the reviewer comes back
+  st = { status: 'idle', ...VERDICT_STATE }
+  b.location.hash = '#/review'
+  for (const [who, type, fn] of b.listeners) if (who === 'window' && type === 'hashchange') fn()
+  await b.settle()
+  assert.deepEqual(sessions(b), [{ pr: 7 }])
+  assert.equal(b.byId('reviewHold').hidden, true)
 })
 
 test('a failed queue read keeps the running session and says so in the strip, with Try again', async () => {
