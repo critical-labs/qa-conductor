@@ -397,6 +397,16 @@ test('pane proxies 503 without a session, route to the reserved ports once ready
   } finally { c.stop() }
 })
 
+// The harness's review queue filters the PR list on the configured labels,
+// which it learns from state rather than guessing the defaults.
+test('/api/state names the configured verdict labels', async () => {
+  const { c } = makeWorld()
+  try {
+    const port = await harnessPort(c)
+    assert.deepEqual((await api(port, 'GET', '/api/state')).verdictLabels, { accept: 'ok', reject: 'nope' })
+  } finally { c.stop() }
+})
+
 test('pane origins come from config; verdict uses the configured labels', async () => {
   const { c, calls } = makeWorld()
   try {
