@@ -48,10 +48,12 @@ test('listOpenPrs fetches open PRs and maps the fields, including the trust data
       {
         number: 41, title: 'Add widgets', author_association: 'MEMBER', user: { login: 'alice' },
         head: { sha: 'abc123', ref: 'feat/widgets', repo: { full_name: 'acme/widget', owner: { login: 'acme' } } },
+        labels: [{ name: 'qa-approved' }, { name: 'bug' }], created_at: '2026-10-01T10:00:00Z',
       },
       {
         number: 42, title: 'Fix bug', author_association: 'CONTRIBUTOR', user: { login: 'bob' },
         head: { sha: 'def456', ref: 'fix/bug', repo: { full_name: 'bob/widget', owner: { login: 'bob' } } },
+        labels: [], created_at: '2026-10-02T10:00:00Z',
       },
       // a PR whose head repository was deleted: GitHub sends head.repo = null
       { number: 43, title: 'Orphan', author_association: 'NONE', user: { login: 'eve' }, head: { sha: 'fed789', ref: 'x', repo: null } },
@@ -64,9 +66,10 @@ test('listOpenPrs fetches open PRs and maps the fields, including the trust data
   assert.equal(calls[0].options.method, 'GET')
   assertGithubHeaders(calls[0].options)
   assert.deepEqual(prs, [
-    { number: 41, title: 'Add widgets', headSha: 'abc123', headRef: 'feat/widgets', author: 'alice', authorAssociation: 'MEMBER', headRepo: 'acme/widget', headOwner: 'acme' },
-    { number: 42, title: 'Fix bug', headSha: 'def456', headRef: 'fix/bug', author: 'bob', authorAssociation: 'CONTRIBUTOR', headRepo: 'bob/widget', headOwner: 'bob' },
-    { number: 43, title: 'Orphan', headSha: 'fed789', headRef: 'x', author: 'eve', authorAssociation: 'NONE', headRepo: null, headOwner: null },
+    { number: 41, title: 'Add widgets', headSha: 'abc123', headRef: 'feat/widgets', author: 'alice', labels: ['qa-approved', 'bug'], createdAt: '2026-10-01T10:00:00Z', authorAssociation: 'MEMBER', headRepo: 'acme/widget', headOwner: 'acme' },
+    { number: 42, title: 'Fix bug', headSha: 'def456', headRef: 'fix/bug', author: 'bob', labels: [], createdAt: '2026-10-02T10:00:00Z', authorAssociation: 'CONTRIBUTOR', headRepo: 'bob/widget', headOwner: 'bob' },
+    // no labels and no created_at in the answer: an empty list and null
+    { number: 43, title: 'Orphan', headSha: 'fed789', headRef: 'x', author: 'eve', labels: [], createdAt: null, authorAssociation: 'NONE', headRepo: null, headOwner: null },
   ])
 })
 

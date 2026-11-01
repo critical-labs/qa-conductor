@@ -117,7 +117,7 @@ function makeWorld({
     ...cfgOverrides,
   }
   const github = {
-    listOpenPrs: async () => [{ number: 7, title: 't', headRef: 'r', author: 'a', headSha: 'abc' }],
+    listOpenPrs: async () => [{ number: 7, title: 't', headRef: 'r', author: 'a', headSha: 'abc', labels: ['qa-approved'], createdAt: '2026-10-01T10:00:00Z' }],
     prHead: async () => 'abc',
     postComment: async pr => { calls.push(['comment', pr]); return 'https://c' },
     setQaLabel: async (pr, label) => { calls.push(['label', pr, label]) },
@@ -352,6 +352,19 @@ test('/api/prs merges build.describePrs readiness; absent describePrs means none
     adapters.build.describePrs = async prs => prs.map(p => ({ number: p.number, status: 'building', runUrl: 'run' }))
     const after = (await api(port, 'GET', '/api/prs')).prs[0]
     assert.deepEqual([after.number, after.imageStatus, after.runUrl], [7, 'building', 'run'])
+  } finally { c.stop() }
+})
+
+// The harness's review queue filters on the verdict labels and orders by age.
+test('/api/prs passes each PR\'s labels and creation time through, and gives a list without them [] and null', async () => {
+  const { c, github } = makeWorld()
+  try {
+    const port = await harnessPort(c)
+    const pr = (await api(port, 'GET', '/api/prs')).prs[0]
+    assert.deepEqual([pr.labels, pr.createdAt], [['qa-approved'], '2026-10-01T10:00:00Z'])
+    github.listOpenPrs = async () => [{ number: 8, title: 'u', headSha: 'def', labels: 'bogus', createdAt: 7 }]
+    const bare = (await api(port, 'GET', '/api/prs')).prs[0]
+    assert.deepEqual([bare.labels, bare.createdAt], [[], null])
   } finally { c.stop() }
 })
 
