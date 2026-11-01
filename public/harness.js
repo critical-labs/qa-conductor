@@ -1,4 +1,5 @@
-// PR-QA harness: hash-routed picker → boot → side-by-side session → verdict.
+// PR-QA harness: hash-routed picker → boot → side-by-side session → verdict,
+// and Change Review (#/review), which walks the PRs still waiting for one.
 // Plain browser JS, zero dependencies. Server state is authoritative on load.
 //
 // The pure helpers live at top level and are exported through the CommonJS
@@ -161,6 +162,32 @@ function inviteFromHash(hash) {
     path: { base: '', pr: '' }, lastMsg: { base: 0, pr: 0 }, hasNav: { base: false, pr: false },
     unmatched: { base: 0, pr: 0 },
     es: null, idlePoll: null, dotPoll: null, notesTimer: null, confirmTimer: null, pendingVerdict: null, strict: false,
+    // the configured verdict labels, from /api/state
+    verdictLabels: null,
+    // Change Review: `on` while the page is at #/review; `queue` and
+    // `blocked` from the last /api/prs read; `current` the PR the walk is on
+    // (null between PRs, which lets the next render open the head);
+    // `posted` the last verdict's PR and comment URL, shown until the next
+    // session is ready; `error` the last failed queue read.
+    review: { on: false, queue: [], blocked: 0, current: null, posted: null, error: null },
+  }
+
+  // What this visit skipped or finished, kept in the tab's session storage
+  // so a reload at #/review carries on; in memory where storage throws.
+  const REVIEW_KEY = 'qa-review'
+  let reviewMemory = { skipped: [], done: [] }
+  const reviewStore = {
+    get() {
+      try {
+        const v = JSON.parse(sessionStorage.getItem(REVIEW_KEY) || 'null')
+        if (v && Array.isArray(v.skipped) && Array.isArray(v.done)) return { skipped: v.skipped.map(Number), done: v.done.map(Number) }
+      } catch { /* memory only */ }
+      return reviewMemory
+    },
+    set(v) {
+      reviewMemory = v
+      try { sessionStorage.setItem(REVIEW_KEY, JSON.stringify(v)) } catch { /* memory only */ }
+    },
   }
 
   // --- router --------------------------------------------------------------
@@ -169,17 +196,23 @@ function inviteFromHash(hash) {
     let m = h.match(/^\/pr\/(\d+)\/boot$/); if (m) return { view: 'boot', pr: +m[1] }
     m = h.match(/^\/pr\/(\d+)\/verdict$/); if (m) return { view: 'verdict', pr: +m[1] }
     m = h.match(/^\/pr\/(\d+)$/); if (m) return { view: 'session', pr: +m[1] }
+    if (h === '/review') return { view: 'review', pr: null }
     return { view: 'picker', pr: null }
   }
   const go = hash => { if (location.hash !== hash) location.hash = hash; else render() }
   const setHashSilent = hash => history.replaceState(null, '', hash)
 
   function showView(id) {
-    for (const v of ['enrol', 'picker', 'boot', 'session', 'verdictDone']) $(v).hidden = v !== id
+    for (const v of ['enrol', 'picker', 'boot', 'session', 'verdictDone', 'queueClear', 'reviewHold']) $(v).hidden = v !== id
     $('sessionControls').hidden = id !== 'session'
     $('verdictBar').hidden = id !== 'session'
     $('inviteBtn').hidden = id === 'enrol'
-    const heading = { boot: 'bootHeading', session: 'sessionHeading' }[id]
+    // Change Review's strip over its views, and its bar under the panes
+    const review = S.review.on && ['boot', 'session', 'queueClear', 'reviewHold'].includes(id)
+    $('reviewStrip').hidden = !review
+    $('reviewBar').hidden = !(S.review.on && id === 'session')
+    document.body.classList.toggle('review', S.review.on)
+    const heading = { boot: 'bootHeading', session: 'sessionHeading', reviewHold: 'holdHeading' }[id]
     const h = heading ? $(heading) : document.querySelector(`#${id} h1`)
     if (h) setTimeout(() => h.focus(), 0)
   }
@@ -275,13 +308,19 @@ function inviteFromHash(hash) {
   async function render() {
     const route = parseHash()
     let s
-    try { s = await api('/state'); showOriginNotice(s.harnessOrigin); S.strict = s.requireIsolation === true; showIsolation(s.status === 'idle' ? null : s.isolation) } catch (e) {
+    try {
+      s = await api('/state'); showOriginNotice(s.harnessOrigin); S.strict = s.requireIsolation === true; showIsolation(s.status === 'idle' ? null : s.isolation)
+      if (s.verdictLabels) S.verdictLabels = s.verdictLabels
+    } catch (e) {
       if (e && e.capability) return // enrolment takes over
       // At another host or port than the harness origin's, the API refuses a
       // browser (403 not the harness origin) and names the origin instead.
       showOriginNotice(e && e.body ? e.body.harnessOrigin : null)
       s = { status: 'idle' }
     }
+    if (route.view === 'review') return renderReview(s)
+    // any other route leaves Change Review; a session it opened stays
+    S.review.on = false
     const active = s.status !== 'idle'
     if (route.view === 'picker' || !route.pr) { teardownSessionUi(); return renderPicker(s) }
     if (active && s.pr === route.pr) {
@@ -415,6 +454,7 @@ function inviteFromHash(hash) {
     return true
   }
   $('refreshBtn').onclick = () => renderPicker(null)
+  $('reviewBtn').onclick = () => go('#/review')
 
   async function openSession(num, opts = {}) {
     if (picking) return; picking = true
@@ -426,9 +466,153 @@ function inviteFromHash(hash) {
         if (!(err.capability && enrolling && await enrolling)) throw err
         return postJson('/session', { pr: num })
       })
-      go(`#/pr/${num}/boot`)
+      // Change Review stays at #/review: its strip sits over the boot view
+      if (S.review.on) renderBoot(num, null); else go(`#/pr/${num}/boot`)
     } finally { picking = false }
   }
+
+  // --- Change Review (#/review) --------------------------------------------
+  // The walk: the PRs still waiting for a verdict (reviewQueue), one session
+  // at a time. A verdict or a skip ends the PR and the next render opens the
+  // next one; the hash stays #/review throughout, and server state is
+  // authoritative on load, so a reload carries on where it was.
+  let reviewing = null // the render in flight, so two never open two sessions
+
+  function renderReview(state) {
+    reviewing ??= reviewWalk(state).catch(err => announce(`Change Review: ${err.message}`, true)).finally(() => { reviewing = null })
+    return reviewing
+  }
+
+  async function reviewWalk(state) {
+    S.review.on = true
+    let prs
+    try { ({ prs } = await api('/prs')) } catch (err) {
+      if (err && err.capability) return // enrolment takes over, and renders again
+      // the queue can't be read: say so, and keep showing a session the walk
+      // was on, if any
+      S.review.error = err.message
+      if (state.status !== 'idle' && Number.isInteger(state.pr)) {
+        S.review.current = state.pr; renderStrip()
+        return state.status === 'ready' ? renderSession(state) : renderBoot(state.pr, state)
+      }
+      renderStrip(); showView('queueClear'); setPill('review')
+      return
+    }
+    S.review.error = null
+    const { skipped, done } = reviewStore.get()
+    const { queue, blocked } = reviewQueue(prs, { verdictLabels: S.verdictLabels, skipped, done })
+    S.review.queue = queue; S.review.blocked = blocked
+    const active = state.status !== 'idle' && state.status !== 'error'
+    if (queue.length === 0) {
+      // nothing left: end what runs (the last PR's session, say) and say so
+      S.review.current = null
+      if (active || state.status === 'error') { teardownSessionUi(); await postJson('/teardown').catch(() => {}) }
+      renderStrip(); showView('queueClear'); setPill('queue clear')
+      const b = $('queueClearBlocked'); b.hidden = blocked === 0
+      b.textContent = blocked === 0 ? '' : `${blocked} can't boot and ${blocked === 1 ? 'is' : 'are'} left out.`
+      return
+    }
+    const queued = active && queue.some(p => p.number === state.pr)
+    const resuming = S.review.current === null // a fresh entry, or after a verdict or skip
+    S.review.current = queued ? state.pr : queue[0].number
+    renderStrip()
+    if (active && !queued) {
+      // the session is on a PR the queue is done with: replace it with the
+      // next; on any other PR, ask (a review started from the picker, say)
+      if (done.includes(state.pr) || skipped.includes(state.pr)) { teardownSessionUi(); return openSession(S.review.current, { takeover: true }) }
+      return showHold('foreign', state)
+    }
+    if (active) return state.status === 'ready' ? renderSession(state) : renderBoot(state.pr, state)
+    // a boot of the current PR failed: its error, with Retry, Skip and Stop
+    if (state.status === 'error' && state.pr === S.review.current) return renderBoot(state.pr, state)
+    // the walk was on this PR and its session ended (the idle teardown, say):
+    // don't boot again by itself
+    if (!resuming) return showHold('ended', state)
+    teardownSessionUi()
+    return openSession(S.review.current)
+  }
+
+  // The strip: the PR, the count, what's next, the blocked count, the last
+  // verdict, and a failed queue read. Titles and errors are text.
+  function renderStrip() {
+    const r = S.review
+    const { done } = reviewStore.get()
+    const pr = r.queue.find(p => p.number === r.current) || null
+    $('reviewNum').textContent = r.current === null ? '' : `#${r.current}`
+    $('reviewTitle').textContent = pr && pr.title ? pr.title : ''
+    const total = done.length + r.queue.length
+    $('reviewCount').textContent = r.queue.length ? `${done.length + 1} of ${total}` : `${done.length} of ${total} done`
+    const next = r.queue.filter(p => p.number !== r.current)[0]
+    $('reviewNext').textContent = r.queue.length === 0 ? '' : next ? `next #${next.number}` : 'last one'
+    $('reviewBlocked').textContent = r.blocked ? `${r.blocked} can't boot` : ''
+    const posted = $('reviewPosted'); posted.textContent = ''
+    if (r.posted) {
+      posted.append(`Posted to #${r.posted.pr}`)
+      if (isHttpsUrl(r.posted.url)) { posted.append(' '); posted.append(runLink(r.posted.url, '↗')) }
+    }
+    $('reviewError').hidden = !r.error
+    $('reviewErrorText').textContent = r.error ? `Couldn't load the queue: ${r.error}` : ''
+  }
+
+  // A pause in the walk: a session on a PR outside the queue ('foreign'), or
+  // the current PR's session gone ('ended').
+  function showHold(kind, state) {
+    const n = S.review.current
+    showView('reviewHold'); setPill('review')
+    $('holdResume').hidden = kind !== 'foreign'
+    if (kind === 'foreign') {
+      $('holdHeading').textContent = `A session is running on #${state.pr}, which isn't in the queue`
+      $('holdText').textContent = `Resume it in the plain harness, or end it and open #${n}, the next pull request waiting for a verdict.`
+      $('holdPrimary').textContent = `End #${state.pr} and open #${n}`
+      $('holdResume').textContent = `Resume #${state.pr}`
+      $('holdResume').onclick = () => { S.review.on = false; go(`#/pr/${state.pr}`) }
+      twoStepConfirm($('holdPrimary'), 'End & open?', () => { teardownSessionUi(); openSession(n, { takeover: true }).catch(err => announce(`Couldn't open #${n}: ${err.message}`, true)) })
+    } else {
+      $('holdHeading').textContent = `The session for #${n} has ended`
+      $('holdText').textContent = 'The idle teardown, or someone ending it. Continue to open it again, or skip it.'
+      $('holdPrimary').textContent = `Continue with #${n}`
+      $('holdPrimary').onclick = () => { teardownSessionUi(); openSession(n).catch(err => announce(`Couldn't open #${n}: ${err.message}`, true)) }
+    }
+  }
+  $('holdStop').onclick = () => stopReview()
+
+  function stopReview() { S.review.on = false; S.review.current = null; go('#/') }
+  $('stopBtn').onclick = stopReview
+  $('queueBack').onclick = stopReview
+  $('queueAgain').onclick = () => api('/state').then(renderReview, () => renderReview({ status: 'idle' }))
+  $('reviewRetry').onclick = () => api('/state').then(renderReview, () => renderReview({ status: 'idle' }))
+
+  // Skip: the current PR goes to the back of the queue for this visit, its
+  // session ends, and the next opens.
+  async function skipReview() {
+    const pr = S.review.current
+    if (pr === null) return
+    const { skipped, done } = reviewStore.get()
+    reviewStore.set({ skipped: skipped.filter(n => n !== pr).concat(pr), done })
+    S.review.current = null; S.review.posted = null
+    teardownSessionUi()
+    await postJson('/teardown').catch(() => {})
+    return renderReview({ status: 'idle' })
+  }
+  twoStepConfirm($('skipBtn'), 'Skip? (3s)', skipReview)
+  twoStepConfirm($('barSkip'), 'Skip?', skipReview)
+
+  // A verdict posted in Change Review: the PR is done, and the next opens.
+  async function reviewAdvance(pr, url) {
+    const { skipped, done } = reviewStore.get()
+    reviewStore.set({ skipped: skipped.filter(n => n !== pr), done: done.includes(pr) ? done : done.concat(pr) })
+    S.review.posted = { pr, url }; S.review.current = null
+    hideVerdictBody(); $('verdictPreview').hidden = true; $('verdictEdit').hidden = false
+    teardownSessionUi()
+    let s
+    try { s = await api('/state') } catch { s = { status: 'ready', pr } }
+    return renderReview(s)
+  }
+
+  // The compact bar: one pane at a time, flipped with a thumb.
+  $('switchBase').onclick = () => selectTab('base')
+  $('switchPr').onclick = () => selectTab('pr')
+  $('barVerdict').onclick = () => toggleVerdict()
 
   // --- boot ----------------------------------------------------------------
   const stepAt = {}
@@ -495,7 +679,7 @@ function inviteFromHash(hash) {
       else if (e.kind === 'isolation') showIsolation(e)
       else if (e.kind === 'ready') { closeSse(); onReady(e) }
       else if (e.kind === 'error') showBootError(e)
-      else if (e.kind === 'torn-down') { closeSse(); go('#/') }
+      else if (e.kind === 'torn-down') { closeSse(); if (S.review.on) render(); else go('#/') }
     }
   }
   function closeSse() { if (S.es) { S.es.close(); S.es = null } if (bootTimer) { clearInterval(bootTimer); bootTimer = null } }
@@ -509,7 +693,9 @@ function inviteFromHash(hash) {
     const acts = $('bootActions'); acts.hidden = false; acts.textContent = ''
     const retry = mkBtn('Retry boot', 'primary', () => { resetBootUi(); openSession(bootPr).catch(showOpenErr) })
     const back = mkBtn('Back to pull requests', 'ghost', () => go('#/'))
-    acts.append(retry, back)
+    acts.append(retry)
+    if (S.review.on) acts.append(mkBtn('Skip', 'danger-ghost', skipReview), mkBtn('Stop', 'ghost', stopReview))
+    else acts.append(back)
     if (e.step === 'ensuring-image' && isHttpsUrl(e.runUrl)) { const a = runLink(e.runUrl, 'View build log ↗'); a.className = 'btn secondary'; acts.append(a) }
   }
   function showErrorText(line, tail) {
@@ -523,7 +709,7 @@ function inviteFromHash(hash) {
   $('cancelBoot').onclick = async () => { await postJson('/teardown').catch(() => {}); go('#/') }
 
   // --- session -------------------------------------------------------------
-  function onReady(meta) { setHashSilent(`#/pr/${meta.pr || bootPr}`); showIsolation(meta.isolation); renderSession(meta) }
+  function onReady(meta) { if (!S.review.on) setHashSilent(`#/pr/${meta.pr || bootPr}`); showIsolation(meta.isolation); renderSession(meta) }
 
   function renderSession(meta) {
     const pr = meta.pr || bootPr || parseHash().pr
@@ -541,6 +727,7 @@ function inviteFromHash(hash) {
       restoreDraft(pr)
       startIdlePoll(); startDotPoll()
       announce('QA session ready')
+      if (S.review.on) { S.review.posted = null; renderStrip() }
     }
     $('sessionMeta').innerHTML = meta.baseTag ? `#${pr} · <span class="tag">${esc(tagOf(meta.baseTag))}</span> vs <span class="tag">${esc(tagOf(meta.prTag))}</span>` : `#${pr}`
     $('sessionHeading').textContent = `QA session for PR ${pr}`
@@ -728,6 +915,8 @@ function inviteFromHash(hash) {
       const { url } = await postJson('/verdict', { verdict: S.pendingVerdict, notes: $('notes').value })
       localStorage.removeItem(draftKey(S.pr))
       announce('Verdict posted')
+      postBtn.disabled = false; $('previewBack').disabled = false
+      if (S.review.on) return reviewAdvance(S.pr, url)
       $('doneP').textContent = S.pr; $('doneLink').href = url
       go(`#/pr/${S.pr}/verdict`)
     } catch (err) { postBtn.disabled = false; $('previewBack').disabled = false; $('previewLabelChange').textContent = `Failed: ${err.message}` }
@@ -753,9 +942,10 @@ function inviteFromHash(hash) {
     const t = e.target
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return
     if ($('session').hidden) return
-    const keys = ['m', 's', 'r', '1', '2', '3', 'v', 'e']
+    const keys = ['m', 's', 'r', '1', '2', '3', 'v', 'e', 'n']
     if (keys.includes(e.key)) e.preventDefault()
     switch (e.key) {
+      case 'n': if (S.review.on) $('skipBtn').click(); break
       case 'm': setMirror(!S.mirror); break
       case 's': $('scrollMirror').checked = !$('scrollMirror').checked; S.scrollMirror = $('scrollMirror').checked; break
       case 'r': $('resyncBtn').click(); break
@@ -764,7 +954,7 @@ function inviteFromHash(hash) {
       case '3': setWidth(0); break
       case 'v': toggleVerdict(); break
       case 'e': $('teardownBtn').click(); break
-      case 'Escape': $('teardownBtn')._disarm && $('teardownBtn')._disarm(); if (!$('verdictBody').hidden) hideVerdictBody(); break
+      case 'Escape': for (const id of ['teardownBtn', 'skipBtn']) $(id)._disarm && $(id)._disarm(); if (!$('verdictBody').hidden) hideVerdictBody(); break
     }
   })
   $('shortcutsClose').onclick = () => $('shortcuts').close()
@@ -776,6 +966,7 @@ function inviteFromHash(hash) {
   $('tabs').addEventListener('click', e => { const t = e.target.closest('.tab'); if (t) selectTab(t.dataset.tab) })
   function selectTab(which) {
     currentTab = which
+    $('switchBase').classList.toggle('on', which === 'base'); $('switchPr').classList.toggle('on', which === 'pr')
     for (const tab of $('tabs').querySelectorAll('.tab')) tab.classList.toggle('on', tab.dataset.tab === which)
     for (const pane of document.querySelectorAll('#paneRow .pane')) pane.classList.toggle('activeTab', pane.dataset.pane === which)
   }
