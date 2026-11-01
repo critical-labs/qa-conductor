@@ -11,11 +11,40 @@ import { dirname, join } from 'node:path'
 const harnessPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'public', 'harness.js')
 const cjsModule = { exports: {} }
 new Function('module', 'exports', readFileSync(harnessPath, 'utf8'))(cjsModule, cjsModule.exports)
-const { esc, isHttpsUrl, LABELS, harnessOriginNotice, buildSummary, buildFromEvent, inviteFromHash, isCapabilityRefusal, isolationLabel } = cjsModule.exports
+const { esc, isHttpsUrl, LABELS, harnessOriginNotice, buildSummary, buildFromEvent, inviteFromHash, isCapabilityRefusal, isolationLabel, reviewQueue } = cjsModule.exports
 const harnessSrc = readFileSync(harnessPath, 'utf8')
 
 test('the CJS guard exports the pure helpers only', () => {
-  assert.deepEqual(Object.keys(cjsModule.exports).sort(), ['LABELS', 'buildFromEvent', 'buildSummary', 'esc', 'harnessOriginNotice', 'inviteFromHash', 'isCapabilityRefusal', 'isHttpsUrl', 'isolationLabel'])
+  assert.deepEqual(Object.keys(cjsModule.exports).sort(), ['LABELS', 'buildFromEvent', 'buildSummary', 'esc', 'harnessOriginNotice', 'inviteFromHash', 'isCapabilityRefusal', 'isHttpsUrl', 'isolationLabel', 'reviewQueue'])
+})
+
+const VERDICTS = { accept: 'qa-approved', reject: 'qa-changes-requested' }
+
+test('reviewQueue: no verdict label (whatever its case), blocked out and counted, built first then oldest, undated after dated, skipped last in skip order, done excluded', () => {
+  const prs = [
+    { number: 1, imageStatus: 'built', createdAt: '2026-10-03T00:00:00Z', labels: ['bug'] },
+    { number: 2, imageStatus: 'none', createdAt: '2026-10-01T00:00:00Z', labels: [] },
+    { number: 3, imageStatus: 'building', createdAt: '2026-10-02T00:00:00Z', labels: [] },
+    { number: 4, imageStatus: 'built', createdAt: '2026-10-01T00:00:00Z', labels: ['QA-Approved'] },
+    { number: 5, imageStatus: 'blocked', createdAt: '2026-10-01T00:00:00Z', labels: [] },
+    { number: 6, imageStatus: 'built', createdAt: '2026-10-02T00:00:00Z', labels: [] },
+    { number: 7, imageStatus: 'built', labels: [] },
+  ]
+  const { queue, blocked } = reviewQueue(prs, { verdictLabels: VERDICTS, skipped: [6], done: [2] })
+  assert.deepEqual(queue.map(p => p.number), [1, 7, 3, 6])
+  assert.equal(blocked, 1)
+  // nothing skipped or done: the whole order
+  assert.deepEqual(reviewQueue(prs, { verdictLabels: VERDICTS }).queue.map(p => p.number), [6, 1, 7, 3, 2])
+  // the other verdict label keeps a PR out too, and a list without labels is all waiting
+  assert.deepEqual(reviewQueue([{ number: 9, labels: ['qa-changes-requested'] }, { number: 8 }], { verdictLabels: VERDICTS }).queue.map(p => p.number), [8])
+  // several skipped come back in the order they were skipped
+  assert.deepEqual(reviewQueue(prs, { verdictLabels: VERDICTS, skipped: [3, 1] }).queue.map(p => p.number), [6, 7, 2, 3, 1])
+})
+
+test('reviewQueue: nothing to walk gives an empty queue, and bad input is just empty', () => {
+  assert.deepEqual(reviewQueue([], { verdictLabels: VERDICTS }), { queue: [], blocked: 0 })
+  assert.deepEqual(reviewQueue(null, { verdictLabels: VERDICTS }), { queue: [], blocked: 0 })
+  assert.deepEqual(reviewQueue([{ number: 'x' }, null, { number: 5, imageStatus: 'blocked' }], {}), { queue: [], blocked: 1 })
 })
 
 test('isolationLabel: nothing before a verdict, else what it says, its reasons as the title', () => {

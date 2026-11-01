@@ -77,6 +77,37 @@ function markType(event) {
   return null
 }
 
+// The review queue (#/review): the PRs of /api/prs still waiting for a
+// verdict, in the order Change Review walks them. In: every PR whose labels
+// hold neither verdict label (GitHub label names are case-insensitive) and
+// whose number isn't in `done` (verdicts this visit posted, should the list
+// lag the label). Out, and counted: PRs the build reports as blocked, which
+// would fail every boot. Order: built, then building, then the rest; within a
+// group the oldest first (createdAt, undated ones after dated ones, then by
+// number). PRs in `skipped` come last, in the order they were skipped.
+const READINESS_RANK = new Map([['built', 0], ['building', 1]])
+function reviewQueue(prs, { verdictLabels, skipped = [], done = [] } = {}) {
+  const verdicts = new Set([verdictLabels?.accept, verdictLabels?.reject].filter(l => typeof l === 'string').map(l => l.toLowerCase()))
+  const finished = new Set(done.map(Number))
+  const skipOrder = new Map(skipped.map((n, i) => [Number(n), i]))
+  let blocked = 0
+  const waiting = []
+  for (const pr of Array.isArray(prs) ? prs : []) {
+    if (!pr || !Number.isInteger(pr.number)) continue
+    const labels = Array.isArray(pr.labels) ? pr.labels : []
+    if (labels.some(l => typeof l === 'string' && verdicts.has(l.toLowerCase()))) continue
+    if (finished.has(pr.number)) continue
+    if (pr.imageStatus === 'blocked') { blocked++; continue }
+    waiting.push(pr)
+  }
+  const rank = pr => READINESS_RANK.get(pr.imageStatus) ?? 2
+  const age = pr => { const t = Date.parse(pr.createdAt ?? ''); return Number.isFinite(t) ? t : Infinity }
+  const byAge = (a, b) => rank(a) - rank(b) || age(a) - age(b) || a.number - b.number
+  const fresh = waiting.filter(pr => !skipOrder.has(pr.number)).sort(byAge)
+  const again = waiting.filter(pr => skipOrder.has(pr.number)).sort((a, b) => skipOrder.get(a.number) - skipOrder.get(b.number))
+  return { queue: fresh.concat(again), blocked }
+}
+
 // The ticket an invite link carries in its fragment (#enrol=<ticket>), else
 // null. The fragment never reaches a server or a Referer.
 function inviteFromHash(hash) {
@@ -775,5 +806,5 @@ function inviteFromHash(hash) {
 // --- test exports (node --test evaluates this file through a CJS wrapper) ---
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { esc, isHttpsUrl, LABELS, harnessOriginNotice, buildSummary, buildFromEvent, inviteFromHash, isCapabilityRefusal, isolationLabel }
+  module.exports = { esc, isHttpsUrl, LABELS, harnessOriginNotice, buildSummary, buildFromEvent, inviteFromHash, isCapabilityRefusal, isolationLabel, reviewQueue }
 }
