@@ -142,8 +142,29 @@
   .kbd { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 13px }
   .kbd kbd { font: var(--mono); background: var(--surface-2); border: 1px solid var(--line-strong); border-radius: 4px; padding: 1px 6px }
 
+  /* Change Review (#/review): the strip under the header, the hold and
+     queue-clear views, and in compact mode the bar at the bottom */
+  #reviewStrip { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; padding: 6px 14px; background: var(--surface-2); border-bottom: 1px solid var(--line); font-size: 13px; color: var(--text-dim) }
+  #reviewStrip .what { color: var(--text); font-weight: 600 }
+  #reviewStrip .title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40vw }
+  #reviewStrip .acts { margin-left: auto; display: flex; gap: 6px }
+  #reviewPosted a, #reviewHold a { color: var(--accent-hover) }
+  #reviewError { color: var(--danger); display: flex; gap: 6px; align-items: center; flex-basis: 100% }
+  #queueClear, #reviewHold { max-width: 780px; width: 100%; margin: 28px auto; padding: 0 16px }
+  #queueClear p, #reviewHold p { color: var(--text-dim) }
+  #queueClear .acts, #reviewHold .acts { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap }
+  #reviewBar { display: none; gap: 8px; padding: 8px 10px; background: var(--surface); border-top: 1px solid var(--line); position: sticky; bottom: 0; align-items: stretch }
+  #reviewBar .switch { display: flex; flex: 1; gap: 4px }
+  #reviewBar .switch button { flex: 1; min-height: 44px; font: var(--mono); text-transform: uppercase; color: var(--text-dim); background: var(--surface-2); border: 1px solid var(--line) }
+  #reviewBar .switch button.on { background: var(--accent-soft); border-color: var(--accent); color: var(--text) }
+  #reviewBar > button { min-height: 44px }
+
   /* compact <900px */
   body.compact #tabs { display: flex }
+  body.compact.review #tabs { display: none !important }
+  body.compact.review #reviewBar { display: flex }
+  body.compact.review #reviewStrip .title, body.compact.review #reviewNext, body.compact.review #reviewBlocked { display: none }
+  body.compact #queueClear, body.compact #reviewHold { margin: 16px auto }
   body.compact #paneRow .pane { display: none; border-right: 0 }
   body.compact #paneRow .pane.activeTab { display: flex }
   body.compact .widths { display: none }
@@ -180,6 +201,20 @@
   <button id="inviteBtn" class="ghost" title="A link that enrols another browser" hidden>Invite</button>
 </header>
 <p id="originNotice" role="alert" hidden></p>
+<div id="reviewStrip" hidden>
+  <span class="what">Change Review</span>
+  <span id="reviewNum" class="pill"></span>
+  <span id="reviewTitle" class="title"></span>
+  <span id="reviewCount"></span>
+  <span id="reviewNext"></span>
+  <span id="reviewBlocked"></span>
+  <span id="reviewPosted"></span>
+  <span class="acts">
+    <button id="skipBtn" class="danger-ghost" title="Skip to the next pull request (n)">Skip</button>
+    <button id="stopBtn" class="ghost" title="Leave Change Review; the session stays">Stop</button>
+  </span>
+  <span id="reviewError" hidden><span id="reviewErrorText"></span><button id="reviewRetry" class="ghost">Try again</button></span>
+</div>
 
 <div id="announcer" class="sr" role="status" aria-live="polite"></div>
 <div id="announcerAssertive" class="sr" role="alert" aria-live="assertive"></div>
@@ -194,7 +229,7 @@
   </section>
 
   <section id="picker" class="view" hidden>
-    <h1 tabindex="-1">Open pull requests <button id="refreshBtn" class="ghost" title="Refresh">↻</button></h1>
+    <h1 tabindex="-1">Open pull requests <button id="refreshBtn" class="ghost" title="Refresh">↻</button> <span class="spacer"></span> <button id="reviewBtn" class="secondary" title="Review every pull request still waiting for a verdict, one after another">Change Review</button></h1>
     <div id="conflictSlot"></div>
     <div id="prList">Loading…</div>
   </section>
@@ -243,7 +278,35 @@
         <div class="paneWrap"><iframe id="prFrame" title="pr pane"></iframe></div>
       </div>
     </div>
+    <div id="reviewBar" hidden>
+      <div class="switch" role="group" aria-label="Pane">
+        <button id="switchBase" class="on">Base</button>
+        <button id="switchPr">PR</button>
+      </div>
+      <button id="barVerdict" class="primary" title="Verdict (v)">Verdict</button>
+      <button id="barSkip" class="danger-ghost" title="Skip to the next pull request">Skip</button>
+    </div>
   </div>
+
+  <section id="queueClear" class="view" hidden>
+    <h1 tabindex="-1">Queue clear</h1>
+    <p>No pull requests are waiting for review.</p>
+    <p id="queueClearBlocked" hidden></p>
+    <div class="acts">
+      <button id="queueAgain" class="primary">Check again</button>
+      <button id="queueBack" class="ghost">Back to pull requests</button>
+    </div>
+  </section>
+
+  <section id="reviewHold" class="view" hidden>
+    <h1 id="holdHeading" tabindex="-1"></h1>
+    <p id="holdText"></p>
+    <div class="acts">
+      <button id="holdPrimary" class="primary"></button>
+      <button id="holdResume" class="secondary" hidden></button>
+      <button id="holdStop" class="ghost">Stop</button>
+    </div>
+  </section>
 
   <section id="verdictDone" class="view" hidden>
     <h1 tabindex="-1">Verdict posted</h1>
@@ -294,6 +357,7 @@
     <kbd>1 / 2 / 3</kbd><span>Pane width 375 / 768 / full</span>
     <kbd>v</kbd><span>Toggle verdict drawer</span>
     <kbd>e</kbd><span>End session (starts confirm)</span>
+    <kbd>n</kbd><span>Skip to the next pull request (Change Review; starts confirm)</span>
     <kbd>?</kbd><span>This overlay</span>
     <kbd>Esc</kbd><span>Close drawer / overlay / cancel confirm</span>
   </div>

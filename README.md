@@ -199,7 +199,8 @@ Open the harness at its origin, under `/qa/`, as startup logs it (`[qa] harness 
 - **The isolation chip** in the header says whether the PR pane can reach the base pane: `isolated`, `not isolated`, `isolation unknown` or `shared host`, with the reasons when you hover it ([Isolation verdicts](#isolation-verdicts)).
 - **Each pane's bar** has a dot (amber while signing in, green while the pane's bridge reports, grey after 10 seconds of silence, red when the pane can't be loaded, with the reason as its path), the pane's path, a count of interactions the other pane couldn't replay (click it to clear), and buttons to copy the path, reload the pane at that path and open it in a new tab.
 - **Verdict** (`v`) opens the drawer: notes, kept in the browser as a draft for each PR, then **Accept** or **Reject**, a preview of the comment and the label change, and **Post to PR #N**. After posting: **End session**, **Keep session open** or **Back to pull requests**.
-- **`?`** lists the keyboard shortcuts, which work while the harness, not a pane, has the focus. `Esc` closes the drawer or the list, or cancels an end-session click. Below 900 pixels wide, the panes become **BASE** and **PR** tabs.
+- **Change Review** (the picker's button, or `#/review`) walks the pull requests still waiting for a verdict, one after another. The queue is every open PR that carries neither verdict label, with the ones whose build is ready first, then those building, then the rest, oldest first within each; PRs that can't boot are left out and counted. It opens the first, and after **Post to PR #N** it opens the next in its place; when nothing is left it ends the session and says **Queue clear**. The strip under the header names the PR, the count and what's next, with **Skip** (`n`, confirmed with a second click), which sends the PR to the back of the queue for this visit and opens the next, and **Stop**, which goes back to the picker and leaves the session running. Skips and verdicts are remembered in the tab until it closes, so a reload at `#/review` carries on. Below 900 pixels wide, a bar at the bottom flips between **Base** and **PR** with a thumb and holds **Verdict** and **Skip**. A session already running on a PR outside the queue is held, with **Resume** or **End … and open**, and a session that ended by itself waits for **Continue**.
+- **`?`** lists the keyboard shortcuts, which work while the harness, not a pane, has the focus. `Esc` closes the drawer or the list, or cancels an end-session or skip click. Below 900 pixels wide, the panes become **BASE** and **PR** tabs.
 
 ## Security
 
@@ -777,7 +778,7 @@ Its limits:
 ### Effect wrappers
 
 **`github`.** The core calls only these, so anything that has them will do:
-- `listOpenPrs()` → `[{ number, title, headSha, headRef, author, authorAssociation, headRepo, headOwner }]`, for the picker;
+- `listOpenPrs()` → `[{ number, title, headSha, headRef, author, labels, createdAt, authorAssociation, headRepo, headOwner }]`, for the picker and the review queue (`labels` are the label names, `createdAt` the PR's creation time or `null`);
 - `prInfo(num)` → `{ number, headSha, author, authorAssociation, isDraft, headRepo, headOwner }`, or without it `prHead(num)` → `headSha`, for `/api/build-status`;
 - `postComment(num, body)` → the comment's URL, and `setQaLabel(num, label)`, for the verdict.
 
@@ -982,8 +983,8 @@ It can leave out `operatorEmail`, `publicHost`, `host` (loopback is the default)
 | | |
 |---|---|
 | `GET /` | harness UI |
-| `GET /api/state` | session status, tags, `buildRun: {url, status, conclusion, message}`, pane login URLs + origins, `harnessOrigin`, `isolation: {verdict, reasons, checkedAt}` ([Isolation verdicts](#isolation-verdicts); `null` until known for this session), `requireIsolation` |
-| `GET /api/prs` | open PRs with build readiness (`imageStatus`, `runUrl`, `reason`) |
+| `GET /api/state` | session status, tags, `buildRun: {url, status, conclusion, message}`, pane login URLs + origins, `harnessOrigin`, `isolation: {verdict, reasons, checkedAt}` ([Isolation verdicts](#isolation-verdicts); `null` until known for this session), `requireIsolation`, `verdictLabels: {accept, reject}` |
+| `GET /api/prs` | open PRs with build readiness (`imageStatus`, `runUrl`, `reason`), each with its `labels` (names) and `createdAt` (or `null`) |
 | `GET /api/build-status?pr=N` | `{pr, status, exists, runUrl}`, plus `reason` when `status` is `blocked` |
 | `GET /api/exposure` | the last [exposure](#exposure-optional) reconcile pass: `{mode, managed, ok, checkedAt, drift, added, error}`. Read-only: it never calls the front door. With no adapter, `managed` is `false` and `ok` and `checkedAt` are `null` |
 | `GET /api/progress` | server-sent boot progress (`step`, `build`, `isolation` with `verdict` and `reasons`, `ready` with `isolation`, `error` with `logTail`, `torn-down`) |
@@ -1062,7 +1063,7 @@ Demo mode runs the real conductor with fixture PRs and fake adapters, so you can
 
 ## Known limits
 
-- **One page of PRs.** The picker lists at most the 50 most recently opened PRs.
+- **One page of PRs.** The picker lists, and Change Review walks, at most the 50 most recently opened PRs.
 - **Mounts outlive the conductor.** Nothing removes a `tailscale serve` mount, so once the conductor stops, its mounts publish whatever listens on those loopback ports next, with no identity gate. The expose CLI refuses to write a mount for a target that isn't a gated conductor, but nothing stops another process taking the port later ([Expose CLI](#expose-cli)).
 - **The panes' pages share the browser's cookies with every app on their hostname**, and can send those apps same-site requests that carry them. Serve the panes on a hostname no other app uses ([Security](#security)).
 - **The identity gate keeps out other devices, not PR code** on the same host: a pane process, or a container pane outside native Linux Docker, can send any login. The capability keeps such code out of the harness and the panes, but not everywhere ([Security](#security)):

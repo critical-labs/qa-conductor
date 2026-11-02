@@ -138,8 +138,11 @@ test('/api/prs returns the fixtures with their statuses', async () => {
     const { status, body } = await api(demo.ports.harness, 'GET', '/api/prs')
     assert.equal(status, 200)
     assert.deepEqual(body.prs.map(p => [p.number, p.imageStatus]), [
-      [101, 'built'], [102, 'built'], [103, 'building'], [104, 'none'], [105, 'blocked'],
+      [101, 'built'], [102, 'built'], [103, 'building'], [104, 'none'], [105, 'blocked'], [106, 'built'],
     ])
+    // the review queue's fields: #106 carries its verdict, every PR its age
+    assert.deepEqual(body.prs.map(p => p.labels), [[], [], [], [], [], ['qa-approved']])
+    assert.ok(body.prs.every(p => /^2026-/.test(p.createdAt)))
     assert.deepEqual(body.prs.map(p => [p.title, p.headRef, p.author]), DEMO_PRS.map(p => [p.title, p.headRef, p.author]))
     // cores that pass `reason` through (0.2.0) show why #105 can't boot
     const blocked = body.prs.find(p => p.number === 105)
@@ -392,11 +395,12 @@ test('demo github: PR fields, trust data, and in-memory comments and labels', as
   const { lines, log } = captureLog()
   const gh = createDemoGithub({ log })
   const prs = await gh.listOpenPrs()
-  assert.equal(prs.length, 5)
+  assert.equal(prs.length, 6)
   for (const pr of prs) {
     assert.match(pr.headSha, /^[0-9a-f]{40}$/)
-    for (const key of ['number', 'title', 'headRef', 'author', 'authorAssociation', 'headRepo', 'headOwner']) assert.ok(key in pr, key)
+    for (const key of ['number', 'title', 'headRef', 'author', 'labels', 'createdAt', 'authorAssociation', 'headRepo', 'headOwner']) assert.ok(key in pr, key)
   }
+  assert.deepEqual(prs.map(p => p.labels), [[], [], [], [], [], ['qa-approved']], 'the fixtures seed the labels')
   assert.equal(await gh.prHead(101), prs[0].headSha)
   assert.deepEqual(await gh.prInfo(105), {
     number: 105, headSha: prs[4].headSha, author: 'grace', authorAssociation: 'COLLABORATOR',
@@ -412,6 +416,7 @@ test('demo github: PR fields, trust data, and in-memory comments and labels', as
   await gh.setQaLabel(101, 'qa-approved')
   await gh.setQaLabel(101, 'qa-changes-requested')
   assert.deepEqual([...gh.labels.get(101)], ['qa-changes-requested'], 'the verdict labels are exclusive')
+  assert.deepEqual((await gh.listOpenPrs()).find(p => p.number === 101).labels, ['qa-changes-requested'], 'a verdict reaches the next PR list')
   await assert.rejects(() => gh.setQaLabel(101, 'bogus'), /unknown QA label/)
   assert.ok(lines.some(l => l.includes('comment on #101')))
 })
@@ -422,7 +427,7 @@ test('demo build: progress messages, labels, readiness, the trust block and abor
   build.subscribeBuild(p => messages.push(p.message))
 
   const statuses = async () => (await build.describePrs(DEMO_PRS)).map(d => [d.number, d.status])
-  assert.deepEqual(await statuses(), [[101, 'built'], [102, 'built'], [103, 'building'], [104, 'none'], [105, 'blocked']])
+  assert.deepEqual(await statuses(), [[101, 'built'], [102, 'built'], [103, 'building'], [104, 'none'], [105, 'blocked'], [106, 'built']])
   const blocked = (await build.describePrs([{ number: 105 }]))[0]
   assert.deepEqual(blocked, { number: 105, status: 'blocked', reason: "head branch is in @mallory's fork (mallory/widgets), not the author's", runUrl: null })
 

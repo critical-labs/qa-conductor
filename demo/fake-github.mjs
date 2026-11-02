@@ -12,7 +12,9 @@ export function createDemoGithub({
   log = console,
 } = {}) {
   const comments = []
-  const labels = new Map() // pr number -> Set of QA labels
+  // pr number -> Set of QA labels, seeded from the fixtures; a verdict replaces
+  // a PR's set, as setQaLabel does on GitHub, so the review queue drops it
+  const labels = new Map(prs.filter(pr => Array.isArray(pr.labels)).map(pr => [pr.number, new Set(pr.labels)]))
   const owner = repo.split('/')[0]
 
   function lookup(num) {
@@ -30,6 +32,7 @@ export function createDemoGithub({
     async listOpenPrs() {
       return prs.map(pr => ({
         number: pr.number, title: pr.title, headSha: pr.headSha, headRef: pr.headRef, author: pr.author,
+        labels: [...(labels.get(pr.number) ?? [])], createdAt: pr.createdAt ?? null,
         authorAssociation: pr.authorAssociation, headRepo: headRepo(pr), headOwner: headOwner(pr),
       }))
     },

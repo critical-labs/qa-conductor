@@ -4,6 +4,12 @@ What changed in each release, newest first. A 0.x minor version may break the in
 
 ## [Unreleased]
 
+### Change Review
+
+- **The harness walks the pull requests still waiting for a verdict.** Its picker gains **Change Review**, and `#/review` opens the first PR whose labels hold neither verdict label (built ones first, then building, then the rest, oldest first within each; PRs that can't boot are left out and counted), shows it in the panes as a session does, and after **Post to PR #N** opens the next in its place, until **Queue clear**. **Skip** (`n`) sends a PR to the back of the queue for this visit, **Stop** goes back to the picker and keeps the session. Skips and verdicts live in the tab's session storage, so a reload at `#/review` carries on. Below 900 pixels wide, a bar at the bottom flips between the panes with a thumb. README's [Using the harness](README.md#using-the-harness) has the details.
+  - **New fields:** `listOpenPrs()` items and `/api/prs` items carry `labels` (the label names) and `createdAt` (or `null`); `/api/state` carries `verdictLabels: {accept, reject}`. A consumer test that compares an `/api/prs` item or `/api/state` whole must add them. A `github` of your own that lacks them still works: the queue then holds every open PR, in number order.
+  - **The demo** gains #106, a reviewed fixture the queue leaves out, and its fake GitHub lets a verdict replace a PR's labels.
+
 ### The per-browser capability
 
 - **The conductor answers only browsers it has enrolled.** Code that reached the conductor on loopback could send whatever a browser would: any `Tailscale-User-Login`, `Origin` and Fetch Metadata. That includes a process pane, or a container pane on a runtime that forwards to the host's loopback, such as Docker Desktop. So PR code could read both panes' sign-in URLs from `/api/state`, take over or end the session and post a verdict. It could also use the base pane through its proxy, signed in as the reviewer. Now every `/api/*` route but `POST /api/enrol`, and every pane request, needs an enrolled browser's capability, else it gets `403` with `X-QA-Refusal: capability`. README's [Security](README.md#security) has the details.
