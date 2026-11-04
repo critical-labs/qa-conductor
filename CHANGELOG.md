@@ -4,6 +4,10 @@ What changed in each release, newest first. A 0.x minor version may break the in
 
 ## [Unreleased]
 
+### Warming the next review
+
+- **Change Review starts the next PR's build while the current one is reviewed.** Once a session is ready, the harness asks `POST /api/prebuild {pr}` for the queue's next PR, and the strip says `warming` beside it. The route calls the BuildConvention's new optional `prebuild(pr) → {started, reason?}`, which starts the build and returns without waiting, once per PR for the conductor's life and never for the PR whose session is on. Without `prebuild`, or for a PR that is built or building, the call answers `started: false` and nothing changes.
+
 ## [0.5.0] — 2026-11-04
 
 The harness can wear a consumer's look, and a page of the consumer's own may embed it. Both are opt-in: without `QA_THEME_CSS`, `QA_TITLE`, `QA_BRAND` or `QA_HARNESS_FRAME_ANCESTORS`, 0.5.0 behaves as 0.4.0 did. [Migrating from 0.4.0](#migrating-from-040) has the one thing a consumer test may notice.
