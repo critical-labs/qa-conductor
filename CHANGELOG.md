@@ -4,6 +4,10 @@ What changed in each release, newest first. A 0.x minor version may break the in
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-11-04
+
+Change Review warms the next pull request's build. Additive: a BuildConvention without `prebuild` behaves as before.
+
 ### Warming the next review
 
 - **Change Review starts the next PR's build while the current one is reviewed.** Once a session is ready, the harness asks `POST /api/prebuild {pr}` for the queue's next PR, and the strip says `warming` beside it. The route calls the BuildConvention's new optional `prebuild(pr) → {started, reason?}`, which starts the build and returns without waiting, once per PR for the conductor's life and never for the PR whose session is on. Without `prebuild`, or for a PR that is built or building, the call answers `started: false` and nothing changes.
@@ -376,7 +380,8 @@ The first standalone release, extracted from homefree's platform code. It instal
 - **`loadConfig`** reads `.env.qa` into the settings the core needs, with a platform's own `defaults`. It has no app defaults, and the verdict labels are configurable.
 - **Built in:** a Docker Provisioner (`adapters/provisioner-docker`): a postgres container and an app container per pane, `0600` env files, registry login and a sweep of labelled orphans. And the effect wrappers for it: `docker`, `github` and `exec`.
 
-[Unreleased]: https://github.com/critical-labs/qa-conductor/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/critical-labs/qa-conductor/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/critical-labs/qa-conductor/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/critical-labs/qa-conductor/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/critical-labs/qa-conductor/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/critical-labs/qa-conductor/compare/v0.3.0...v0.3.1
