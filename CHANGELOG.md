@@ -4,6 +4,12 @@ What changed in each release, newest first. A 0.x minor version may break the in
 
 ## [Unreleased]
 
+### Theme
+
+- **The harness can be restyled.** Every colour, radius, shadow and font the page uses is a custom property on `:root` (README's [Theme](README.md#theme) lists them with the dark defaults), and the page links `/theme.css` after its own styles. `QA_THEME_CSS` (`cfg.theme.css`) names a stylesheet to serve there, read on every request; `QA_TITLE` and `QA_BRAND` (`cfg.theme.title`, `cfg.theme.brand`) set the page title and the header's name, escaped as text. Without them the harness looks as before.
+  - **New:** `GET /theme.css` (an empty sheet with no theme), `cfg.theme`, and `startConductor` throws on a `cfg.theme` value that isn't a string.
+  - **What breaks:** a consumer test that compares the served `index.html` with the file sees `PR QA` and `PR-QA` where the file now has `{{title}}` and `{{brand}}`; a consumer whose own `publicDir` page lacks the placeholders is served unchanged.
+
 ## [0.4.0] — 2026-11-01
 
 The conductor answers only browsers it has enrolled, each session says whether its PR pane can reach the base pane, the Docker Provisioner gives each pane a network and a database password of its own, and the harness gains Change Review, a walk over the pull requests still waiting for a verdict. It is a minor release and it breaks consumers in several places: read [Migrating from 0.3.1](#migrating-from-031) before upgrading.
