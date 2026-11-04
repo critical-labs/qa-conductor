@@ -1018,6 +1018,11 @@ function inviteFromHash(hash) {
   // An invite link's ticket leaves the URL before it is used, so neither a
   // reload nor the history holds it. Without a token, enrol now.
   function start() {
+    // Framed by another page (an admin page that embeds the harness, which
+    // QA_HARNESS_FRAME_ANCESTORS allows): a theme may style it for that.
+    let framed = false
+    try { framed = window.self !== window.top } catch { framed = true }
+    document.body.classList.toggle('framed', framed)
     const invite = inviteFromHash(location.hash)
     if (invite) {
       history.replaceState(null, '', `${location.pathname}${location.search}#/`)

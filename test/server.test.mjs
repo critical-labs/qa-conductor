@@ -623,6 +623,26 @@ test('a browser /api/* request whose Host is another port of the harness hostnam
   } finally { c.stop() }
 })
 
+// QA_HARNESS_FRAME_ANCESTORS: a page that may embed the harness, and so
+// frame the panes through it.
+test('cfg.harnessFrameAncestors opens the harness frame lock to those origins, drops X-Frame-Options, and joins the panes\' policy', async () => {
+  const w = makeWorld({ cfg: { harnessFrameAncestors: ['https://admin.example', 'https://[::1]:9'] } })
+  try {
+    const { harness, base, pr } = await allPorts(w.c)
+    for (const path of ['/qa', '/qa/api/state', '/qa/api/nope']) {
+      const res = await raw(harness, { path })
+      assert.equal(res.headers['content-security-policy'], "frame-ancestors 'self' https://admin.example", path)
+      assert.equal(res.headers['x-frame-options'], undefined, `${path}: X-Frame-Options can't name an origin`)
+      assert.equal(res.headers['referrer-policy'], 'strict-origin-when-cross-origin', path)
+    }
+    for (const port of [base, pr]) {
+      const csp = (await raw(port, { path: '/x' })).headers['content-security-policy']
+      assert.equal(csp, "frame-ancestors 'self' https://h.ts.net:8444 https://admin.example", String(port))
+    }
+    assert.ok(w.logLines.some(l => l.includes('the harness may be framed by https://admin.example')))
+  } finally { w.c.stop() }
+})
+
 // The theme: the page carries cfg.theme's title and brand as text, and links
 // /theme.css, which serves cfg.theme.css or an empty sheet.
 // The package's own page and script, plus one stubbed theme sheet.
@@ -667,7 +687,7 @@ test('a theme stylesheet that cannot be read serves an empty sheet and is logged
   } finally { w.c.stop() }
 })
 
-test('startConductor refuses a cfg.theme that is not strings, before anything listens', () => {
+test('startConductor refuses a cfg.harnessFrameAncestors entry that is not an origin, and a cfg.theme that is not strings, before anything listens', () => {
   const cfg = {
     publicHost: 'h.ts.net', operatorEmail: 'op@example.com', idleMinutes: 30,
     ports: { harness: 0, base: 0, pr: 0 }, paneOrigins: { base: 'https://h.ts.net:8443', pr: 'https://h.ts.net:10000' },
@@ -675,6 +695,11 @@ test('startConductor refuses a cfg.theme that is not strings, before anything li
   }
   const quiet = { log() {}, error() {} }
   const adapters = { provisioner: {}, build: {}, seed: {}, envTransform: {}, auth: {} }
+  for (const bad of [['javascript:alert(1)'], ['admin.example'], ['https://admin.example', 'not an origin']]) {
+    let started = null
+    assert.throws(() => { started = startConductor({ cfg: { ...cfg, harnessFrameAncestors: bad }, github: {}, fsx: {}, adapters, log: quiet }) }, /cfg\.harnessFrameAncestors/, JSON.stringify(bad))
+    started?.stop() // never: a conductor that started by mistake must not hold the test process
+  }
   for (const theme of ['dark', { title: 7 }, { css: {} }, { brand: ['x'] }]) {
     assert.throws(() => startConductor({ cfg: { ...cfg, theme }, github: {}, fsx: {}, adapters, log: quiet }), /cfg\.theme/, JSON.stringify(theme))
   }
