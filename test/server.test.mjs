@@ -705,6 +705,35 @@ test('startConductor refuses a cfg.harnessFrameAncestors entry that is not an or
   }
 })
 
+// Change Review warms the queue's next PR through the BuildConvention's
+// optional prebuild: once per PR, never for the PR whose session is on.
+test('/api/prebuild asks build.prebuild once per PR, not for the running session\'s PR, and says so without prebuild', async () => {
+  const w = makeWorld()
+  try {
+    const port = await harnessPort(w.c)
+    assert.deepEqual(await api(port, 'POST', '/api/prebuild', { pr: 8 }), { pr: 8, started: false, reason: 'the build adapter cannot prebuild' })
+    const asked = []
+    w.adapters.build.prebuild = async pr => { asked.push(pr); return pr === 9 ? { started: false, reason: 'built' } : { started: true } }
+    assert.deepEqual(await api(port, 'POST', '/api/prebuild', { pr: 8 }), { pr: 8, started: true, reason: null })
+    assert.deepEqual(await api(port, 'POST', '/api/prebuild', { pr: 8 }), { pr: 8, started: false, reason: 'already asked' })
+    // a build that didn't start isn't remembered: the next ask tries again
+    assert.deepEqual(await api(port, 'POST', '/api/prebuild', { pr: 9 }), { pr: 9, started: false, reason: 'built' })
+    assert.deepEqual(await api(port, 'POST', '/api/prebuild', { pr: 9 }), { pr: 9, started: false, reason: 'built' })
+    assert.deepEqual(asked, [8, 9, 9])
+    // the PR whose session is on is never warmed
+    await api(port, 'POST', '/api/session', { pr: 7 })
+    await waitFor(async () => (await api(port, 'GET', '/api/state')).status === 'ready')
+    assert.deepEqual(await api(port, 'POST', '/api/prebuild', { pr: 7 }), { pr: 7, started: false, reason: 'its session is on' })
+    assert.deepEqual(asked, [8, 9, 9])
+    // an adapter that throws is reported, and asked again next time
+    w.adapters.build.prebuild = async () => { throw new Error('GitHub down') }
+    assert.deepEqual(await api(port, 'POST', '/api/prebuild', { pr: 10 }), { pr: 10, started: false, reason: 'GitHub down' })
+    w.adapters.build.prebuild = async pr => { asked.push(pr); return { started: true } }
+    assert.equal((await api(port, 'POST', '/api/prebuild', { pr: 10 })).started, true)
+    assert.equal((await api(port, 'POST', '/api/prebuild', { pr: 'x' })).error, 'pr (number) required')
+  } finally { w.c.stop() }
+})
+
 test('/api/state reports the harness origin', async () => {
   for (const [cfg, want] of [
     [{}, () => 'https://h.ts.net:8444'],

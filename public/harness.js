@@ -174,7 +174,8 @@ function inviteFromHash(hash) {
     // (null between PRs, which lets the next render open the head);
     // `posted` the last verdict's PR and comment URL, shown until the next
     // session is ready; `error` the last failed queue read.
-    review: { on: false, queue: [], blocked: 0, current: null, posted: null, error: null },
+    // `warming` the PR whose build /api/prebuild started for the queue
+    review: { on: false, queue: [], blocked: 0, current: null, posted: null, error: null, warming: null },
   }
 
   // What this visit skipped, the PRs it posted a verdict for whose label the
@@ -561,6 +562,17 @@ function inviteFromHash(hash) {
     return openSession(S.review.current)
   }
 
+  // Warm the queue's next PR while this one is reviewed, so its boot finds
+  // the image. The conductor asks the build adapter once per PR; the strip
+  // says "warming" while the answer is that a build started.
+  function warmNext() {
+    const next = S.review.queue.find(p => p.number !== S.review.current)
+    if (!next || next.imageStatus === 'built' || next.imageStatus === 'building') return
+    postJson('/prebuild', { pr: next.number }).then(r => {
+      if (r && r.started && S.review.on) { S.review.warming = next.number; renderStrip() }
+    }).catch(() => {})
+  }
+
   // The strip: the PR, the count, what's next, the blocked count, the last
   // verdict, and a failed queue read. Titles and errors are text.
   function renderStrip() {
@@ -572,7 +584,8 @@ function inviteFromHash(hash) {
     const total = reviewed + r.queue.length
     $('reviewCount').textContent = r.queue.length ? `${reviewed + 1} of ${total}` : `${reviewed} of ${total} done`
     const next = r.queue.filter(p => p.number !== r.current)[0]
-    $('reviewNext').textContent = r.queue.length === 0 ? '' : next ? `next #${next.number}` : 'last one'
+    const warming = next && r.warming === next.number ? ' · warming' : ''
+    $('reviewNext').textContent = r.queue.length === 0 ? '' : next ? `next #${next.number}${warming}` : 'last one'
     $('reviewBlocked').textContent = r.blocked ? `${r.blocked} can't boot` : ''
     const posted = $('reviewPosted'); posted.textContent = ''
     if (r.posted) {
@@ -764,7 +777,7 @@ function inviteFromHash(hash) {
       restoreDraft(pr)
       startIdlePoll(); startDotPoll()
       announce('QA session ready')
-      if (S.review.on) { S.review.posted = null; renderStrip() }
+      if (S.review.on) { S.review.posted = null; renderStrip(); warmNext() }
     }
     $('sessionMeta').innerHTML = meta.baseTag ? `#${pr} · <span class="tag">${esc(tagOf(meta.baseTag))}</span> vs <span class="tag">${esc(tagOf(meta.prTag))}</span>` : `#${pr}`
     $('sessionHeading').textContent = `QA session for PR ${pr}`

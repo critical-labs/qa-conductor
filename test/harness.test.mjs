@@ -853,6 +853,7 @@ test('a verdict in Change Review records the PR as done and opens the next with 
     routes: {
       'GET /qa/api/state': { body: { status: 'ready', pr: 7, startedAt: 1, panes: PANES, ...VERDICT_STATE } },
       'GET /qa/api/prs': { body: { prs: QUEUE_PRS, session: { pr: 7, status: 'ready' } } },
+      'POST /qa/api/prebuild': body => ({ body: { pr: body.pr, started: true, reason: null } }),
       'POST /qa/api/pane-entry': entryRoute,
       'GET /qa/api/verdict/preview': { body: { body: 'preview', applies: 'qa-approved', removes: 'qa-changes-requested' } },
       'POST /qa/api/verdict': { body: { url: 'https://github.example/pull/7#c1' } },
@@ -863,6 +864,9 @@ test('a verdict in Change Review records the PR as done and opens the next with 
   assert.deepEqual(sessions(b), [], 'the running session on a queued PR is resumed, not reopened')
   assert.equal(b.byId('session').hidden, false)
   assert.equal(b.byId('reviewBar').hidden, false, 'the compact bar belongs to the session view')
+  // the next PR (#8, unbuilt) is warmed as soon as the session is up
+  assert.deepEqual(b.log.filter(e => e[0] === 'fetch' && e[2] === '/qa/api/prebuild').map(e => e[4]), [{ pr: 8 }])
+  assert.equal(b.byId('reviewNext').textContent, 'next #8 · warming')
 
   await b.byId('acceptBtn').onclick(); await b.settle()
   await b.byId('postBtn').onclick(); await b.settle()
