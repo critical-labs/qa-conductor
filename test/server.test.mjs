@@ -2,6 +2,7 @@
 // fake adapters — no docker, no network beyond loopback.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 
@@ -49,6 +50,7 @@ function withCap(port, headers) {
 function makeWorld({
   hang = {}, failAt = null, sweepGate = null, sweepFails = false, provisioner: provisionerOverrides = {},
   cfg: cfgOverrides = {}, readBaseEnv: readBaseEnvOverride = null, exposure = null, logThrowsOn = null, enrolled = true, platform = 'linux',
+  fsx: fsxOverride = null,
   pacing = { retryGapMs: 0, enrolWaitMs: 0 },
 } = {}) {
   const calls = []
@@ -122,7 +124,7 @@ function makeWorld({
     postComment: async pr => { calls.push(['comment', pr]); return 'https://c' },
     setQaLabel: async (pr, label) => { calls.push(['label', pr, label]) },
   }
-  const fsx = { readFile: async () => 'x' }
+  const fsx = fsxOverride ?? { readFile: async () => 'x' }
   const readBaseEnv = readBaseEnvOverride ?? (async () => { calls.push(['readBaseEnv']); return { A: '1' } })
   const logLines = []
   const errorLines = []
@@ -641,7 +643,51 @@ test('cfg.harnessFrameAncestors opens the harness frame lock to those origins, d
   } finally { w.c.stop() }
 })
 
-test('startConductor refuses a cfg.harnessFrameAncestors entry that is not an http(s) origin', () => {
+// The theme: the page carries cfg.theme's title and brand as text, and links
+// /theme.css, which serves cfg.theme.css or an empty sheet.
+// The package's own page and script, plus one stubbed theme sheet.
+const realFiles = { readFile: p => (p === '/themes/acme.css' ? 'body { color: red }' : fs.promises.readFile(p)) }
+
+test('the harness page takes its title and brand from cfg.theme, escaped, and defaults to PR QA / PR-QA', async () => {
+  const plain = makeWorld({ fsx: realFiles })
+  try {
+    const port = await harnessPort(plain.c)
+    const html = (await raw(port, { path: '/qa' })).body
+    assert.ok(html.includes('<title>PR QA</title>'), 'default title')
+    assert.ok(html.includes('</span> PR-QA <span id="statusPill"'), 'default brand')
+    assert.ok(!html.includes('{{'), 'no placeholder left')
+    assert.ok(html.includes('<link rel="stylesheet" href="/qa/theme.css">'), 'the theme sheet is linked')
+    const css = await raw(port, { path: '/qa/theme.css' })
+    assert.equal(css.status, 200)
+    assert.equal(css.headers['content-type'], 'text/css; charset=utf-8')
+    assert.equal(css.body, '', 'no theme: an empty sheet')
+  } finally { plain.c.stop() }
+  const themed = makeWorld({ fsx: realFiles, cfg: { theme: { title: 'Acme <QA>', brand: 'Acme & Co', css: '/themes/acme.css' } } })
+  try {
+    const port = await harnessPort(themed.c)
+    const html = (await raw(port, { path: '/qa' })).body
+    assert.ok(html.includes('<title>Acme &lt;QA&gt;</title>'), html.match(/<title>.*<\/title>/)[0])
+    assert.ok(html.includes('</span> Acme &amp; Co <span id="statusPill"'), 'brand escaped')
+    assert.equal((await raw(port, { path: '/qa/theme.css' })).body, 'body { color: red }')
+  } finally { themed.c.stop() }
+})
+
+test('a theme stylesheet that cannot be read serves an empty sheet and is logged once', async () => {
+  const w = makeWorld({ fsx: realFiles, cfg: { theme: { css: '/no/such/theme.css' } } })
+  try {
+    const port = await harnessPort(w.c)
+    for (let i = 0; i < 2; i++) {
+      const css = await raw(port, { path: '/qa/theme.css' })
+      assert.equal(css.status, 200)
+      assert.equal(css.body, '')
+    }
+    assert.equal(w.errorLines.filter(l => l.includes('theme: cannot read /no/such/theme.css')).length, 1, 'logged once')
+    // the page itself still serves
+    assert.ok((await raw(port, { path: '/qa' })).body.includes('<title>PR QA</title>'))
+  } finally { w.c.stop() }
+})
+
+test('startConductor refuses a cfg.harnessFrameAncestors entry that is not an origin, and a cfg.theme that is not strings, before anything listens', () => {
   const cfg = {
     publicHost: 'h.ts.net', operatorEmail: 'op@example.com', idleMinutes: 30,
     ports: { harness: 0, base: 0, pr: 0 }, paneOrigins: { base: 'https://h.ts.net:8443', pr: 'https://h.ts.net:10000' },
@@ -653,6 +699,9 @@ test('startConductor refuses a cfg.harnessFrameAncestors entry that is not an ht
     let started = null
     assert.throws(() => { started = startConductor({ cfg: { ...cfg, harnessFrameAncestors: bad }, github: {}, fsx: {}, adapters, log: quiet }) }, /cfg\.harnessFrameAncestors/, JSON.stringify(bad))
     started?.stop() // never: a conductor that started by mistake must not hold the test process
+  }
+  for (const theme of ['dark', { title: 7 }, { css: {} }, { brand: ['x'] }]) {
+    assert.throws(() => startConductor({ cfg: { ...cfg, theme }, github: {}, fsx: {}, adapters, log: quiet }), /cfg\.theme/, JSON.stringify(theme))
   }
 })
 

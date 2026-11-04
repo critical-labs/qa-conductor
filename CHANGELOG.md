@@ -8,6 +8,11 @@ What changed in each release, newest first. A 0.x minor version may break the in
 
 - **A page of your own may frame the harness.** `QA_HARNESS_FRAME_ANCESTORS` (`cfg.harnessFrameAncestors`), comma-separated origins, opens the harness frame lock to them: every harness response then carries `frame-ancestors 'self' <origins>` and no `X-Frame-Options` (it can't name an origin), and the origins join the panes' policy, since a page that frames the harness frames the panes through it. The embedded page marks its `<body>` with the class `framed`. Name only origins you operate: a page there can lay its own controls over the harness (README's [Security](README.md#security)). Without the key nothing changes.
   - **New:** the key and `cfg.harnessFrameAncestors`; `startConductor` and `loadConfig` throw on an entry that isn't an http(s) origin.
+### Theme
+
+- **The harness can be restyled.** Every colour, radius, shadow and font the page uses is a custom property on `:root` (README's [Theme](README.md#theme) lists them with the dark defaults), and the page links `/theme.css` after its own styles. `QA_THEME_CSS` (`cfg.theme.css`) names a stylesheet to serve there, read on every request; `QA_TITLE` and `QA_BRAND` (`cfg.theme.title`, `cfg.theme.brand`) set the page title and the header's name, escaped as text. Without them the harness looks as before.
+  - **New:** `GET /theme.css` (an empty sheet with no theme), `cfg.theme`, and `startConductor` throws on a `cfg.theme` value that isn't a string.
+  - **What breaks:** a consumer test that compares the served `index.html` with the file sees `PR QA` and `PR-QA` where the file now has `{{title}}` and `{{brand}}`; a consumer whose own `publicDir` page lacks the placeholders is served unchanged.
 
 ## [0.4.0] — 2026-11-01
 
