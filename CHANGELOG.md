@@ -4,6 +4,11 @@ What changed in each release, newest first. A 0.x minor version may break the in
 
 ## [Unreleased]
 
+### Embedding the harness
+
+- **A page of your own may frame the harness.** `QA_HARNESS_FRAME_ANCESTORS` (`cfg.harnessFrameAncestors`), comma-separated origins, opens the harness frame lock to them: every harness response then carries `frame-ancestors 'self' <origins>` and no `X-Frame-Options` (it can't name an origin), and the origins join the panes' policy, since a page that frames the harness frames the panes through it. The embedded page marks its `<body>` with the class `framed`. Name only origins you operate: a page there can lay its own controls over the harness (README's [Security](README.md#security)). Without the key nothing changes.
+  - **New:** the key and `cfg.harnessFrameAncestors`; `startConductor` and `loadConfig` throw on an entry that isn't an http(s) origin.
+
 ## [0.4.0] — 2026-11-01
 
 The conductor answers only browsers it has enrolled, each session says whether its PR pane can reach the base pane, the Docker Provisioner gives each pane a network and a database password of its own, and the harness gains Change Review, a walk over the pull requests still waiting for a verdict. It is a minor release and it breaks consumers in several places: read [Migrating from 0.3.1](#migrating-from-031) before upgrading.

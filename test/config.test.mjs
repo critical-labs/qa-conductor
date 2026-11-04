@@ -83,6 +83,13 @@ test('loadConfig: a comment after a quoted list never adds entries to it', () =>
   }
 })
 
+test('QA_HARNESS_FRAME_ANCESTORS: comma-separated origins that may frame the harness; none by default; a non-origin throws', () => {
+  const base = ['GITHUB_QA_TOKEN=t', 'QA_REPO=o/r', 'QA_PUBLIC_HOST=h.ts.net', 'QA_ALLOWED_LOGINS=a@github']
+  assert.deepEqual(loadConfig(envFile(base)).harnessFrameAncestors, [])
+  assert.deepEqual(loadConfig(envFile([...base, 'QA_HARNESS_FRAME_ANCESTORS=https://h.ts.net:8444, https://admin.example'])).harnessFrameAncestors, ['https://h.ts.net:8444', 'https://admin.example'])
+  assert.throws(() => loadConfig(envFile([...base, 'QA_HARNESS_FRAME_ANCESTORS=h.ts.net:8444'])), /QA_HARNESS_FRAME_ANCESTORS/)
+})
+
 test('generic defaults: ports, pane origins from public host, verdict labels', () => {
   const c = loadConfig(envFile(REQUIRED))
   assert.equal(c.githubToken, 'tok')

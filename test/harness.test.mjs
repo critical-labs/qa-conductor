@@ -130,6 +130,11 @@ test('harnessOriginNotice: null at the configured origin or with none configured
 // "Open in new tab" must send the harness origin as the Referer the panes
 // check: rel="noopener" keeps it, and noreferrer would get every new tab a
 // 403 cross-site navigation refused.
+// An embedding page (QA_HARNESS_FRAME_ANCESTORS) gets a hook to style for.
+test('the page marks its body framed when it is not the top window, and never throws on a cross-origin top', () => {
+  assert.match(harnessSrc, /let framed = false\n\s*try \{ framed = window\.self !== window\.top \} catch \{ framed = true \}\n\s*document\.body\.classList\.toggle\('framed', framed\)/)
+})
+
 test('the "Open in new tab" links keep the Referer: rel="noopener", never noreferrer', () => {
   const html = readFileSync(join(dirname(harnessPath), 'index.html'), 'utf8')
   for (const id of ['baseOpen', 'prOpen']) {
