@@ -46,7 +46,7 @@ The demo runs the real conductor against fixture PRs and fake adapters, so it ne
 npm install @critical-labs/qa-conductor
 ```
 
-To pin a git tag instead: `npm install github:critical-labs/qa-conductor#v0.5.0`.
+To pin a git tag instead: `npm install github:critical-labs/qa-conductor#v0.5.1`.
 
 ## Quickstart: QA your own app
 
