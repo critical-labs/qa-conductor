@@ -967,22 +967,46 @@ Some built-ins need more than this token:
 | `QA_FORWARD_CLIENT_COOKIES` | `forwardClientCookies` | *(none)* | comma-separated names of the browser's own cookies the pane proxies pass to the pane apps, beside each pane's jar, whose value wins on a name both have. Unset, the apps get only the jar's cookies (see [Security](#security)). Each must be a cookie name (an RFC 6265 token); `*` and other wildcards throw. A single quote is part of a name, so quote the whole list or nothing, never each name: `'a','b'` names `a'` and `'b`. Any page on the panes' hostname can set these cookies, the other pane's scripts included, so a value that isn't an RFC 6265 cookie-value (one with a space, a comma, a backslash or a stray double quote) isn't passed. On one hostname both pane apps get the browser's one value of each, so name only cookies both panes may share, such as a preference, never a session. A name starting with `qa-` (in any case, after `__Host-` or `__Secure-` too) throws: those are the conductor's own pane cookies |
 | `QA_LABEL_ACCEPT` / `QA_LABEL_REJECT` | `verdictLabels.accept` / `verdictLabels.reject` | `qa-approved` / `qa-changes-requested` | verdict label pair |
 | `QA_IDLE_MINUTES` | `idleMinutes` | `30` | idle sessions are torn down |
+| `QA_THEME_CSS` | `theme.css` | *(none)* | a stylesheet the harness serves at `/theme.css` and links after its own styles, read on every request; relative to the env file's directory. See [Theme](#theme) |
+| `QA_TITLE` | `theme.title` | `PR QA` | the harness page's title, as text |
+| `QA_BRAND` | `theme.brand` | `PR-QA` | the name in the harness header, as text |
 
 Every origin key must be an http(s) URL with a plain hostname. It is normalized to an origin (lowercased, a default port and any path dropped), and anything else throws. An `http:` harness or pane origin must be loopback (`127.0.0.0/8`, `::1`, `localhost`): browsers send the `Sec-Fetch-*` headers the request guards rely on only to https and loopback origins (see [Security](#security)). The harness and the two panes must be three different origins: a page that is same-origin with another could act for the reviewer there.
 
 Unset, `QA_EXPOSURE` is `none` only when all of these are loopback, and `tailscale` otherwise: the harness origin (as derived above; when none can be derived, on a loopback bind on port `0` with no `QA_HARNESS_ORIGIN` or `QA_PUBLIC_HOST`, it adds nothing), both pane origins, `QA_PUBLIC_HOST` and every `QA_ALLOWED_HOSTS` entry (both widen the `Host` allowlist), and `QA_BIND_HOST`. So a non-loopback bind alone makes the mode `tailscale`, which then refuses that bind: behind another authenticating front door, set `QA_EXPOSURE=none`. In tailscale mode, `loadConfig` throws on a non-loopback `QA_BIND_HOST` and on an empty `QA_ALLOWED_LOGINS`, and each error says why the mode is `tailscale`.
 
+### Theme
+
+The harness page draws everything from custom properties on `:root`, and links `/theme.css` after its own styles, so a stylesheet named by `QA_THEME_CSS` (`cfg.theme.css`) can restyle it by setting any of them, and may add rules of its own. `QA_TITLE` and `QA_BRAND` set the page title and the header's name; both are text, never markup. The properties, with the default dark look:
+
+| Property | Default | |
+|---|---|---|
+| `--bg`, `--surface`, `--surface-2` | `#14171a`, `#1e2328`, `#262c33` | the page, cards and bars, raised controls |
+| `--line`, `--line-strong` | `#2c333a`, `#3a434d` | borders |
+| `--text`, `--text-dim`, `--text-faint` | `#e6e9ec`, `#9aa4ad`, `#6b757f` | text, secondary text, metadata |
+| `--accent`, `--accent-hover`, `--accent-soft`, `--on-accent` | `#4e8f68`, `#5da37a`, `rgba(78,143,104,.15)`, `#fff` | the brand colour, its hover, its tint, text on it |
+| `--danger`, `--danger-soft`, `--on-danger` | `#c05b5b`, `rgba(192,91,91,.12)`, `#fff` | reject and end-session controls |
+| `--warn`, `--warn-soft`, `--on-warn` | `#d9a441`, `rgba(217,164,65,.12)`, `#14171a` | building, divergence, the origin notice |
+| `--focus` | `#7fc19e` | the focus ring |
+| `--pane-bg`, `--pane-page`, `--backdrop` | `#0d0f11`, `#fff`, `rgba(0,0,0,.5)` | around the pane frames, the frames before a page loads, behind dialogs |
+| `--shadow` | `0 6px 20px rgba(0,0,0,.35)` | menus |
+| `--radius`, `--radius-button`, `--radius-small` | `8px`, `6px`, `4px` | cards and dialogs, buttons and inputs, keycaps |
+| `--font`, `--mono` | `14px/1.45 system-ui, sans-serif`, `12px/1.5 ui-monospace, …` | the `font` shorthand for text and for tags, paths and chips |
+
+A sheet that can't be read serves as empty and is logged once at the first request. The theme is served behind the same identity gate as the page, so it is as private as the harness.
+
 ### A `cfg` built in code
 
 A platform that builds `cfg` in code instead of with `loadConfig` must set `ports`, `paneOrigins`, `verdictLabels` and `idleMinutes`, in the shapes the table's `cfg` column shows. Without `idleMinutes`, the idle reaper silently never ends a session. The core never reads `githubToken`, `ghcrToken`, `repo` or `env`: they are for the platform's own `createGithub` and adapters. `readBaseEnv` is optional too (see [Use](#use)).
 
-It can leave out `operatorEmail`, `publicHost`, `host` (loopback is the default), `allowedHosts`, `harnessOrigin` (derived as above), `frameAncestors`, `forwardClientCookies` (none: `false` or an array of cookie names), `exposure`, `allowedLogins`, `exposureIntervalMinutes` (`5`) and `requireIsolation` (`false`). Without `exposure`, `startConductor` resolves the mode as `loadConfig` does, with `defaultExposure({ harnessOrigin, paneOrigins, publicHost, allowedHosts, host })` from `./config`, where a missing or unparseable pane origin counts as off loopback. The mode is fixed at start, so a `cfg` whose non-loopback origins are assigned after start must set `exposure` itself. `startConductor` refuses an unknown `exposure`, a `host` in brackets (write `::1`, not `[::1]`), tailscale mode on a non-loopback `host`, a `harnessOrigin` or `frameAncestors` entry that isn't an http(s) origin, an `http:` harness origin or pane origin (set at start) whose host isn't loopback, a harness origin equal to a pane origin, an `exposureIntervalMinutes` that isn't a number above `0` and at most `35791`, a `forwardClientCookies` that isn't `false` or an array of cookie names, or that names one starting with `qa-`, a pane origin (set at start) on another hostname than the harness origin (known at start), and an `adapters.exposure` in none mode. Two equal pane origins count as placeholders and aren't checked against the harness origin until the harness enters a pane, when `/api/pane-entry` answers `409` for one on another hostname. Startup logs whether the gate is on and, for a defaulted mode, what made it `tailscale`. In tailscale mode with no `allowedLogins` it logs an error, and every request is refused. The core reads `cfg.paneOrigins` per request, so it may be assigned once the proxies are listening.
+It can leave out `theme` (`{ css, title, brand }`, each optional; a value that isn't a string throws), `operatorEmail`, `publicHost`, `host` (loopback is the default), `allowedHosts`, `harnessOrigin` (derived as above), `frameAncestors`, `forwardClientCookies` (none: `false` or an array of cookie names), `exposure`, `allowedLogins`, `exposureIntervalMinutes` (`5`) and `requireIsolation` (`false`). Without `exposure`, `startConductor` resolves the mode as `loadConfig` does, with `defaultExposure({ harnessOrigin, paneOrigins, publicHost, allowedHosts, host })` from `./config`, where a missing or unparseable pane origin counts as off loopback. The mode is fixed at start, so a `cfg` whose non-loopback origins are assigned after start must set `exposure` itself. `startConductor` refuses an unknown `exposure`, a `host` in brackets (write `::1`, not `[::1]`), tailscale mode on a non-loopback `host`, a `harnessOrigin` or `frameAncestors` entry that isn't an http(s) origin, an `http:` harness origin or pane origin (set at start) whose host isn't loopback, a harness origin equal to a pane origin, an `exposureIntervalMinutes` that isn't a number above `0` and at most `35791`, a `forwardClientCookies` that isn't `false` or an array of cookie names, or that names one starting with `qa-`, a pane origin (set at start) on another hostname than the harness origin (known at start), and an `adapters.exposure` in none mode. Two equal pane origins count as placeholders and aren't checked against the harness origin until the harness enters a pane, when `/api/pane-entry` answers `409` for one on another hostname. Startup logs whether the gate is on and, for a defaulted mode, what made it `tailscale`. In tailscale mode with no `allowedLogins` it logs an error, and every request is refused. The core reads `cfg.paneOrigins` per request, so it may be assigned once the proxies are listening.
 
 ## HTTP API (harness port)
 
 | | |
 |---|---|
-| `GET /` | harness UI |
+| `GET /` | harness UI, with `QA_TITLE` and `QA_BRAND` in place |
+| `GET /theme.css` | the `QA_THEME_CSS` stylesheet, or an empty one ([Theme](#theme)) |
 | `GET /api/state` | session status, tags, `buildRun: {url, status, conclusion, message}`, pane login URLs + origins, `harnessOrigin`, `isolation: {verdict, reasons, checkedAt}` ([Isolation verdicts](#isolation-verdicts); `null` until known for this session), `requireIsolation`, `verdictLabels: {accept, reject}` |
 | `GET /api/prs` | open PRs with build readiness (`imageStatus`, `runUrl`, `reason`), each with its `labels` (names) and `createdAt` (or `null`) |
 | `GET /api/build-status?pr=N` | `{pr, status, exists, runUrl}`, plus `reason` when `status` is `blocked` |

@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -81,6 +82,16 @@ test('loadConfig: a comment after a quoted list never adds entries to it', () =>
     const file = envFile([...REQUIRED, line])
     assert.throws(() => loadConfig(file), /:6: QA_ALLOWED_(LOGINS|HOSTS) has a comment after its quoted value/, line)
   }
+})
+
+test('theme keys: a stylesheet path resolved from the env file\'s directory, a title and a brand; none by default', () => {
+  const base = ['GITHUB_QA_TOKEN=t', 'QA_REPO=o/r', 'QA_PUBLIC_HOST=h.ts.net', 'QA_ALLOWED_LOGINS=a@github']
+  assert.deepEqual(loadConfig(envFile(base)).theme, { css: null, title: null, brand: null })
+  const file = envFile([...base, 'QA_THEME_CSS=theme/acme.css', 'QA_TITLE=Acme QA', 'QA_BRAND=Acme'])
+  const cfg = loadConfig(file)
+  assert.equal(cfg.theme.css, path.join(path.dirname(file), 'theme', 'acme.css'))
+  assert.deepEqual([cfg.theme.title, cfg.theme.brand], ['Acme QA', 'Acme'])
+  assert.equal(loadConfig(envFile([...base, 'QA_THEME_CSS=/abs/t.css'])).theme.css, '/abs/t.css')
 })
 
 test('generic defaults: ports, pane origins from public host, verdict labels', () => {
