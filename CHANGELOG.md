@@ -4,6 +4,10 @@ What changed in each release, newest first. A 0.x minor version may break the in
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-04
+
+The harness can wear a consumer's look, and a page of the consumer's own may embed it. Both are opt-in: without `QA_THEME_CSS`, `QA_TITLE`, `QA_BRAND` or `QA_HARNESS_FRAME_ANCESTORS`, 0.5.0 behaves as 0.4.0 did. [Migrating from 0.4.0](#migrating-from-040) has the one thing a consumer test may notice.
+
 ### Embedding the harness
 
 - **A page of your own may frame the harness.** `QA_HARNESS_FRAME_ANCESTORS` (`cfg.harnessFrameAncestors`), comma-separated origins, opens the harness frame lock to them: every harness response then carries `frame-ancestors 'self' <origins>` and no `X-Frame-Options` (it can't name an origin), and the origins join the panes' policy, since a page that frames the harness frames the panes through it. The embedded page marks its `<body>` with the class `framed`. Name only origins you operate: a page there can lay its own controls over the harness (README's [Security](README.md#security)). Without the key nothing changes.
@@ -13,6 +17,12 @@ What changed in each release, newest first. A 0.x minor version may break the in
 - **The harness can be restyled.** Every colour, radius, shadow and font the page uses is a custom property on `:root` (README's [Theme](README.md#theme) lists them with the dark defaults), and the page links `/theme.css` after its own styles. `QA_THEME_CSS` (`cfg.theme.css`) names a stylesheet to serve there, read on every request; `QA_TITLE` and `QA_BRAND` (`cfg.theme.title`, `cfg.theme.brand`) set the page title and the header's name, escaped as text. Without them the harness looks as before.
   - **New:** `GET /theme.css` (an empty sheet with no theme), `cfg.theme`, and `startConductor` throws on a `cfg.theme` value that isn't a string.
   - **What breaks:** a consumer test that compares the served `index.html` with the file sees `PR QA` and `PR-QA` where the file now has `{{title}}` and `{{brand}}`; a consumer whose own `publicDir` page lacks the placeholders is served unchanged.
+
+### Migrating from 0.4.0
+
+1. **Additive.** No export is gone or renamed, and no default changed. New: `QA_THEME_CSS`, `QA_TITLE`, `QA_BRAND` (`cfg.theme`), `QA_HARNESS_FRAME_ANCESTORS` (`cfg.harnessFrameAncestors`), `GET /theme.css`, and the `framed` body class. `startConductor` and `loadConfig` throw on a `cfg.theme` value that isn't a string and on a frame-ancestor entry that isn't an http(s) origin.
+2. **A test that compares the served page with `public/index.html`** sees `PR QA` and `PR-QA` in place of the file's `{{title}}` and `{{brand}}`.
+3. **A `publicDir` of your own** keeps serving as before; add the placeholders and the `<link rel="stylesheet" href="/qa/theme.css">` to its page to take the theme.
 
 ## [0.4.0] — 2026-11-01
 
@@ -362,7 +372,8 @@ The first standalone release, extracted from homefree's platform code. It instal
 - **`loadConfig`** reads `.env.qa` into the settings the core needs, with a platform's own `defaults`. It has no app defaults, and the verdict labels are configurable.
 - **Built in:** a Docker Provisioner (`adapters/provisioner-docker`): a postgres container and an app container per pane, `0600` env files, registry login and a sweep of labelled orphans. And the effect wrappers for it: `docker`, `github` and `exec`.
 
-[Unreleased]: https://github.com/critical-labs/qa-conductor/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/critical-labs/qa-conductor/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/critical-labs/qa-conductor/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/critical-labs/qa-conductor/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/critical-labs/qa-conductor/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/critical-labs/qa-conductor/compare/v0.2.1...v0.3.0
