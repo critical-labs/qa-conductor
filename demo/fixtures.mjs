@@ -82,3 +82,106 @@ export function appSpecFor(ref, prs = DEMO_PRS) {
   if (!pr || prLabel(pr) !== ref) throw new Error(`unknown demo app ref: ${ref}`)
   return { variant: 'pr', label: ref, crashes: pr.failsAt === 'starting' }
 }
+
+// What the harness's PR context pane shows for each fixture: a description,
+// reviews, inline review comments, the conversation and checks, as
+// github.prContext gives them. #101 is the rich one; #105's conversation holds
+// a comment built to attack the pane, which shows as text. Links stay on the
+// reserved .invalid TLD.
+const REPO_URL = `https://example.invalid/${DEMO_REPO}`
+const at = (day, hour) => `2026-10-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}:00:00Z`
+const say = (author, created, body, extra = {}) => ({ author, createdAt: created, url: `${REPO_URL}/pull/0#c-${author}-${created}`, body, truncated: false, ...extra })
+
+export const DEMO_CONTEXT = {
+  101: {
+    labels: ['ui', 'design'],
+    body: [
+      '<!-- PR template: describe the change, link the issue, list how to test it -->',
+      '## What',
+      'Refreshes the storefront **header**: a new heading, the purple accent from the brand refresh, and a tighter nav.',
+      '',
+      '## Why',
+      'The old header predates the brand guide. Closes #42.',
+      '',
+      '## How to test',
+      '- [x] Open *Home* and *Products* in both panes',
+      '- [ ] Check the accent on links and buttons',
+      '- [ ] Resize to 375 px: the nav should wrap, not overflow',
+      '',
+      '```css',
+      ':root { --accent: #7c4dff }',
+      '```',
+      '',
+      '> Screenshots: ![header before and after](https://example.invalid/demo/widgets/assets/header.png)',
+      '',
+      'Design notes: https://example.invalid/design/header-refresh cc @grace',
+    ].join('\n'),
+    linkedIssues: [42],
+    reviews: [
+      say('grace', at(1, 14), 'Looks great on desktop. One question on the mobile nav, inline.', { state: 'COMMENTED' }),
+      say('linus', at(2, 9), 'The accent contrast fails AA on the grey footer. Please darken it.', { state: 'CHANGES_REQUESTED' }),
+    ],
+    reviewComments: [
+      say('grace', at(1, 14), 'Does this wrap at 375? `flex-wrap` is missing here.', { path: 'src/header.css', line: 18, outdated: false, reply: false }),
+      say('ada', at(1, 16), 'Good catch: added in the next commit.', { path: 'src/header.css', line: 18, outdated: false, reply: true }),
+      say('linus', at(2, 9), 'Contrast ratio here is 3.9:1.', { path: 'src/theme.css', line: 4, outdated: true, reply: false }),
+    ],
+    comments: [
+      say('ada', at(1, 10), 'Ready for review. The preview build is up in the QA harness.'),
+      say('ci-bot', at(1, 11), 'Bundle size: **+0.4 kB** (header.css)'),
+    ],
+    checks: { total: 4, passed: 3, failed: 0, pending: 1, other: 0, failing: [], error: null },
+  },
+  102: {
+    labels: ['feature'],
+    body: 'Adds a **Sort by** control to *Products*: name, price (low to high), price (high to low).\n\nThe choice is kept in the URL (`?sort=price`), so a shared link keeps it.\n\nFixes #37',
+    linkedIssues: [37],
+    reviews: [say('ada', at(3, 10), 'Works for me.', { state: 'APPROVED' })],
+    reviewComments: [],
+    comments: [say('grace', at(2, 12), 'QA: please check the sort survives a reload.')],
+    checks: { total: 3, passed: 3, failed: 0, pending: 0, other: 0, failing: [], error: null },
+  },
+  103: {
+    labels: ['backend'],
+    body: 'Validates the contact form on the server as well as in the browser: required fields, an email that parses, a message under 2,000 characters.',
+    linkedIssues: [],
+    reviews: [],
+    reviewComments: [],
+    comments: [],
+    checks: { total: 3, passed: 1, failed: 0, pending: 2, other: 0, failing: [], error: null },
+  },
+  104: {
+    labels: ['dependencies'],
+    body: 'Upgrades `tmpl-engine` from 4.x to 5.0. Layouts are now registered by name; see the [migration guide](https://example.invalid/tmpl-engine/v5-migration).',
+    linkedIssues: [],
+    reviews: [],
+    reviewComments: [],
+    comments: [say('linus', at(4, 15), 'The boot crashes for me locally too: `registry.layouts.get(name)` is undefined.')],
+    checks: { total: 3, passed: 1, failed: 2, pending: 0, other: 0, error: null, failing: [
+      { name: 'test', conclusion: 'failure', url: `${REPO_URL}/actions/runs/104-test` },
+      { name: 'smoke', conclusion: 'timed_out', url: `${REPO_URL}/actions/runs/104-smoke` },
+    ] },
+  },
+  105: {
+    labels: [],
+    body: 'Tweaks the checkout copy.\n\n<script>alert("the PR context pane shows this as text")</script>',
+    linkedIssues: [],
+    reviews: [],
+    reviewComments: [],
+    comments: [say('mallory', at(5, 11), [
+      'Shown as text, never run, by the PR context pane:',
+      '<img src=x onerror=alert(1)> [a javascript: link](javascript:alert(1)) <a href="javascript:alert(2)" onclick="alert(3)">raw HTML</a>',
+      '![a tracking pixel](https://example.invalid/pixel.png)',
+    ].join('\n'))],
+    checks: { total: 0, passed: 0, failed: 0, pending: 0, other: 0, failing: [], error: null },
+  },
+  106: {
+    labels: [],
+    body: 'Groups the footer links and drops the dead *Press* page.',
+    linkedIssues: [],
+    reviews: [say('ada', at(30, 12), '', { state: 'APPROVED' })],
+    reviewComments: [],
+    comments: [],
+    checks: { total: 2, passed: 2, failed: 0, pending: 0, other: 0, failing: [], error: null },
+  },
+}

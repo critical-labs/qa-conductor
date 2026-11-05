@@ -12,10 +12,11 @@ const harnessPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'public'
 const cjsModule = { exports: {} }
 new Function('module', 'exports', readFileSync(harnessPath, 'utf8'))(cjsModule, cjsModule.exports)
 const { esc, isHttpsUrl, LABELS, harnessOriginNotice, buildSummary, buildFromEvent, inviteFromHash, isCapabilityRefusal, isolationLabel, hasVerdictLabel, reviewQueue } = cjsModule.exports
+// safeHref, mdParse, mdRender and renderPrContext: test/pr-context.test.mjs
 const harnessSrc = readFileSync(harnessPath, 'utf8')
 
 test('the CJS guard exports the pure helpers only', () => {
-  assert.deepEqual(Object.keys(cjsModule.exports).sort(), ['LABELS', 'buildFromEvent', 'buildSummary', 'esc', 'harnessOriginNotice', 'hasVerdictLabel', 'inviteFromHash', 'isCapabilityRefusal', 'isHttpsUrl', 'isolationLabel', 'reviewQueue'])
+  assert.deepEqual(Object.keys(cjsModule.exports).sort(), ['LABELS', 'buildFromEvent', 'buildSummary', 'esc', 'harnessOriginNotice', 'hasVerdictLabel', 'inviteFromHash', 'isCapabilityRefusal', 'isHttpsUrl', 'isolationLabel', 'mdParse', 'mdRender', 'renderPrContext', 'reviewQueue', 'safeHref'])
 })
 
 test('hasVerdictLabel: either verdict label, whatever its case; nothing else', () => {
@@ -235,7 +236,7 @@ function fakeBrowser({ hash = '#/', stored = null, routes = {}, elements = {}, c
     fetch: async (url, opts = {}) => {
       const method = opts.method ?? 'GET'
       const path = String(url).split('?')[0]
-      log.push(['fetch', method, path, { ...(opts.headers ?? {}) }, opts.body ? JSON.parse(opts.body) : null])
+      log.push(['fetch', method, path, { ...(opts.headers ?? {}) }, opts.body ? JSON.parse(opts.body) : null, String(url)])
       const answer = routes[`${method} ${path}`]
       const out = typeof answer === 'function' ? answer(opts.body ? JSON.parse(opts.body) : null, opts.headers ?? {}) : (answer ?? { status: 404 })
       const { status = 200, body = {}, headers = {}, ticks = 0 } = out
@@ -1144,4 +1145,150 @@ test('Stop leaves Change Review for the picker and keeps the session; a session 
   assert.deepEqual(sessions(held), [])
   await confirmClick(held.byId('holdPrimary')); await held.settle()
   assert.deepEqual(sessions(held), [{ pr: 7, takeover: true }])
+})
+
+
+// --- the PR context pane ---------------------------------------------------------
+// A side pane (an overlay below 900 px) with the PR's description, comments,
+// reviews and checks. Closed by default; the header's button or `c` toggles
+// it, and whether it is open lives in the tab's session storage.
+
+// A container that keeps what is appended to it.
+function fakeBox() {
+  const box = {
+    children: [], text: '',
+    append(...xs) { box.children.push(...xs) },
+    get textContent() { return box.text },
+    set textContent(v) { box.children = []; box.text = String(v) },
+  }
+  return box
+}
+const CONTEXT_ANSWER = { number: 7, title: 'seven', body: 'Hello', comments: { items: [], total: 0, error: null } }
+const contextFetches = b => b.log.filter(e => e[0] === 'fetch' && e[2] === '/qa/api/pr-context').map(e => [new URL(e[5], 'https://h.ts.net').search, e[3]['x-qa-cap']])
+// The document's keydown listener, as the harness chrome gets a key.
+const press = (b, key, extra = {}) => {
+  const [, , fn] = b.listeners.find(([name, type]) => name === 'document' && type === 'keydown')
+  let prevented = false
+  fn({ key, target: { tagName: 'BODY' }, preventDefault() { prevented = true }, ...extra })
+  return prevented
+}
+const DIALOGS = { inviteDialog: { open: false }, shortcuts: { open: false } }
+const readySession = extra => ({
+  'GET /qa/api/state': { body: { status: 'ready', pr: 7, startedAt: 1, panes: PANES } },
+  'POST /qa/api/pane-entry': entryRoute,
+  ...extra,
+})
+
+test('the PR context pane is closed by default, and its button opens it in a session: it reads /api/pr-context for the PR with the token, and is remembered', async () => {
+  const ctxBody = fakeBox()
+  const b = fakeBrowser({ hash: '#/pr/7', stored: 'tok', elements: { ctxBody, ...DIALOGS }, routes: readySession({ 'GET /qa/api/pr-context': { body: CONTEXT_ANSWER } }) })
+  await b.settle()
+  assert.equal(b.byId('contextBtn').hidden, false, 'the button shows in a session')
+  assert.equal(b.byId('prContext').hidden, true, 'closed by default: it covers nothing')
+  assert.deepEqual(contextFetches(b), [], 'nothing read until it opens')
+
+  b.byId('contextBtn').onclick(); await b.settle()
+  assert.equal(b.byId('prContext').hidden, false)
+  assert.deepEqual(contextFetches(b), [['?pr=7', 'tok']])
+  assert.equal(b.session.get('qa-context'), 'open')
+  assert.equal(ctxBody.children.length, 1, 'the rendered context')
+  assert.equal(b.byId('ctxStatus').hidden, true)
+  assert.ok(b.log.some(e => e[0] === 'set' && e[1] === 'prContext' && e[2] === 'hidden' && e[3] === false))
+
+  b.byId('ctxClose').onclick(); await b.settle()
+  assert.equal(b.byId('prContext').hidden, true)
+  assert.equal(b.session.get('qa-context'), 'closed')
+  // opened again soon after, it shows what it read; ↻ reads it again
+  b.byId('contextBtn').onclick(); await b.settle()
+  assert.equal(contextFetches(b).length, 1)
+  b.byId('ctxRefresh').onclick(); await b.settle()
+  assert.equal(contextFetches(b).length, 2)
+})
+
+test('`c` toggles the PR context pane in a session or a boot, but not with a modifier, in a text field, or on the picker', async () => {
+  const b = fakeBrowser({ hash: '#/pr/7', stored: 'tok', elements: { ...DIALOGS }, routes: readySession({ 'GET /qa/api/pr-context': { body: CONTEXT_ANSWER } }) })
+  await b.settle()
+  assert.equal(press(b, 'c', { metaKey: true }), false, 'Cmd-C copies')
+  assert.equal(press(b, 'c', { ctrlKey: true }), false)
+  assert.equal(press(b, 'c', { target: { tagName: 'TEXTAREA' } }), false, 'typing notes')
+  assert.equal(b.byId('prContext').hidden, true)
+  assert.equal(press(b, 'c'), true)
+  await b.settle()
+  assert.equal(b.byId('prContext').hidden, false)
+  assert.equal(contextFetches(b).length, 1)
+  press(b, 'c'); await b.settle()
+  assert.equal(b.byId('prContext').hidden, true)
+
+  const boot = fakeBrowser({ hash: '#/pr/7', stored: 'tok', elements: { ...DIALOGS }, routes: { 'GET /qa/api/state': { body: { status: 'starting', pr: 7 } }, 'GET /qa/api/pr-context': { body: CONTEXT_ANSWER } } })
+  await boot.settle()
+  assert.equal(boot.byId('contextBtn').hidden, false, 'a boot has its PR too')
+  press(boot, 'c'); await boot.settle()
+  assert.deepEqual(contextFetches(boot).map(f => f[0]), ['?pr=7'])
+
+  const picker = fakeBrowser({ stored: 'tok', elements: { ...DIALOGS }, routes: { 'GET /qa/api/state': { body: { status: 'idle' } }, 'GET /qa/api/prs': { body: { prs: [], session: null } } } })
+  await picker.settle()
+  assert.equal(picker.byId('contextBtn').hidden, true)
+  assert.equal(press(picker, 'c'), false)
+  assert.deepEqual(contextFetches(picker), [])
+})
+
+test('a tab that left the pane open opens it again for the next PR, Change Review included, without a click', async () => {
+  const session = new Map([['qa-context', 'open']])
+  const b = fakeBrowser({
+    hash: '#/review', stored: 'tok', session, elements: { ...DIALOGS },
+    routes: {
+      'GET /qa/api/state': { body: { status: 'idle', ...VERDICT_STATE } },
+      'GET /qa/api/prs': { body: { prs: QUEUE_PRS, session: null } },
+      'POST /qa/api/session': { status: 202, body: { ok: true } },
+      'GET /qa/api/pr-context': { body: CONTEXT_ANSWER },
+    },
+  })
+  await b.settle()
+  assert.deepEqual(sessions(b), [{ pr: 7 }])
+  assert.equal(b.byId('prContext').hidden, false)
+  assert.deepEqual(contextFetches(b).map(f => f[0]), ['?pr=7'])
+})
+
+test('a PR context GitHub refuses shows its error in the pane, with Try again, and leaves the session alone', async () => {
+  let fail = true
+  const b = fakeBrowser({
+    hash: '#/pr/7', stored: 'tok', session: new Map([['qa-context', 'open']]), elements: { ...DIALOGS },
+    routes: readySession({ 'GET /qa/api/pr-context': () => (fail ? { status: 502, body: { error: 'github GET /repos/acme/widget/pulls/7 -> 403: no' } } : { body: CONTEXT_ANSWER }) }),
+  })
+  await b.settle()
+  assert.equal(b.byId('ctxStatus').hidden, false)
+  assert.equal(b.byId('ctxStatus').textContent, "Couldn't load the PR context: github GET /repos/acme/widget/pulls/7 -> 403: no")
+  assert.equal(b.byId('ctxRetry').hidden, false)
+  assert.equal(posts(b, '/qa/api/teardown'), 0)
+  assert.equal(b.byId('session').hidden, false)
+  fail = false
+  b.byId('ctxRetry').onclick(); await b.settle()
+  assert.equal(b.byId('ctxStatus').hidden, true)
+  assert.equal(b.byId('ctxRetry').hidden, true)
+})
+
+test('the pane is a labelled region beside the panes, and a modal dialog that Esc closes below 900 px', async () => {
+  const html = readFileSync(join(dirname(harnessPath), 'index.html'), 'utf8')
+  const tag = html.match(/<section\b[^>]*\bid="prContext"[^>]*>/)?.[0]
+  assert.ok(tag)
+  assert.match(tag, /role="region"/)
+  assert.match(tag, /aria-labelledby="ctxHeading"/)
+  assert.match(html, /<h2 id="ctxHeading" tabindex="-1">/)
+  assert.match(html, /<button id="contextBtn"[^>]*aria-controls="prContext"[^>]*aria-expanded="false"/)
+  assert.match(html, /<kbd>c<\/kbd>/)
+  // the overlay form: the compact media query flips the role
+  assert.match(harnessSrc, /pane\.setAttribute\('role', compact \? 'dialog' : 'region'\)/)
+  assert.match(harnessSrc, /if \(compact\) pane\.setAttribute\('aria-modal', 'true'\); else pane\.removeAttribute\('aria-modal'\)/)
+  // behind the overlay, the page is inert, so a screen reader's cursor stays in the dialog
+  assert.match(harnessSrc, /\$\('main'\)\.inert = compact && CTX\.open/)
+  for (const id of ['main', 'appHeader', 'verdictBar', 'reviewStrip']) assert.match(html, new RegExp(`id="${id}"`), id)
+
+  const b = fakeBrowser({ hash: '#/pr/7', stored: 'tok', session: new Map([['qa-context', 'open']]), elements: { ...DIALOGS }, routes: readySession({ 'GET /qa/api/pr-context': { body: CONTEXT_ANSWER } }) })
+  await b.settle()
+  const [, , onPaneKey] = b.listeners.find(([name, type]) => name === 'prContext' && type === 'keydown')
+  let stopped = false
+  onPaneKey({ key: 'Escape', stopPropagation() { stopped = true }, preventDefault() {} })
+  assert.equal(stopped, true)
+  assert.equal(b.byId('prContext').hidden, true)
+  assert.equal(b.session.get('qa-context'), 'closed')
 })

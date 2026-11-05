@@ -606,7 +606,7 @@ test('every /api/* request from another page gets 403, reads and the event strea
       }
     }
     const reads = [
-      '/qa/api/prs', '/api/prs', '/qa/api/build-status?pr=7', '/qa/api/state', '/qa/api/progress',
+      '/qa/api/prs', '/api/prs', '/qa/api/build-status?pr=7', '/qa/api/pr-context?pr=7', '/qa/api/state', '/qa/api/progress',
       '/qa/api/verdict/preview?verdict=accept', '/qa/api/nope',
     ]
     for (const headers of [
@@ -1641,6 +1641,51 @@ test('/api/prs passes a blocked reason through', async () => {
   } finally { c.stop() }
 })
 
+// The harness's PR context pane reads GitHub through the conductor's client:
+// what github.prContext gives, never cached by the browser, with the PR's
+// text left as the client gave it (the page renders it as text). It fails
+// soft: a GitHub error is an answer the pane shows, not a 500.
+test('/api/pr-context answers github.prContext for the PR, no-store and nosniff', async () => {
+  const { c, github } = makeWorld()
+  const asked = []
+  const ctx = { number: 7, title: '<script>alert(1)</script>', body: '<img src=x onerror=alert(1)>', comments: { items: [], total: 0, error: null } }
+  github.prContext = async pr => { asked.push(pr); return ctx }
+  try {
+    const port = await harnessPort(c)
+    const res = await raw(port, { path: '/qa/api/pr-context?pr=7' })
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), ctx)
+    assert.equal(res.headers['content-type'], 'application/json')
+    assert.equal(res.headers['cache-control'], 'no-store')
+    assert.equal(res.headers['x-content-type-options'], 'nosniff')
+    assert.deepEqual(asked, [7])
+    for (const bad of ['', 'x', '7.5', '-1', '0']) {
+      const r = await raw(port, { path: `/api/pr-context?pr=${bad}` })
+      assert.equal(r.status, 400, bad)
+      assert.match(JSON.parse(r.body).error, /pr \(a positive integer\) required/)
+    }
+    assert.deepEqual(asked, [7], 'a bad pr never reaches GitHub')
+  } finally { c.stop() }
+})
+
+test('/api/pr-context fails soft: a GitHub error is a 502 with its message, and a github without prContext a 501', async () => {
+  const { c, github, errorLines } = makeWorld()
+  github.prContext = async () => { throw new Error('github GET /repos/acme/widget/pulls/7 -> 404: Not Found') }
+  try {
+    const port = await harnessPort(c)
+    const res = await raw(port, { path: '/api/pr-context?pr=7' })
+    assert.equal(res.status, 502)
+    assert.deepEqual(JSON.parse(res.body), { error: 'github GET /repos/acme/widget/pulls/7 -> 404: Not Found' })
+    assert.ok(errorLines.some(l => l.includes('pr-context #7')), errorLines.join('\n'))
+    delete github.prContext
+    const none = await raw(port, { path: '/api/pr-context?pr=7' })
+    assert.equal(none.status, 501)
+    assert.match(JSON.parse(none.body).error, /cannot read a pull request's context/)
+    // the session is untouched either way
+    assert.equal((await api(port, 'GET', '/api/state')).status, 'idle')
+  } finally { c.stop() }
+})
+
 test('/api/build-status uses github.prInfo when available and adds reason only when blocked', async () => {
   const { c, adapters, github } = makeWorld()
   github.prInfo = async num => ({
@@ -2413,7 +2458,7 @@ function prCode(port, origin, gated) {
 }
 
 const API_ROUTES = [
-  { path: '/api/state' }, { path: '/api/prs' }, { path: '/api/exposure' }, { path: '/api/build-status?pr=7' },
+  { path: '/api/state' }, { path: '/api/prs' }, { path: '/api/exposure' }, { path: '/api/build-status?pr=7' }, { path: '/api/pr-context?pr=7' },
   { path: '/api/progress' }, { path: '/api/verdict/preview?verdict=accept' }, { path: '/api/nope' },
   { method: 'POST', path: '/api/session', body: '{"pr":8,"takeover":true}' },
   { method: 'POST', path: '/api/verdict', body: '{"verdict":"accept","notes":"x"}' },

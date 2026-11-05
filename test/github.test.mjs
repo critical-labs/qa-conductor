@@ -925,3 +925,158 @@ test('an abort during the runs lookup ends the wait as an abort, not a build fai
   )
   assert.deepEqual(heard, [])
 })
+
+// --- PR context: what the harness's side pane shows ------------------------
+
+const CTX_PR = {
+  number: 41, title: 'Add widgets', state: 'open', draft: true, merged: false, html_url: 'https://github.com/acme/widget/pull/41',
+  user: { login: 'alice' }, labels: [{ name: 'ui' }, { name: '' }, { color: 'fff' }], body: 'Adds widgets.\n\nCloses #12, fixes acme/widget#13 and resolves other/repo#14. Fixes: #12',
+  base: { ref: 'main', repo: { html_url: 'https://github.com/acme/widget' } }, head: { ref: 'feat/widgets', sha: 'abc123' },
+  created_at: '2026-10-01T10:00:00Z', updated_at: '2026-10-02T10:00:00Z', comments: 3, review_comments: 2,
+}
+const CTX_ROUTES = {
+  [`/repos/${REPO}/pulls/41`]: () => CTX_PR,
+  [`/repos/${REPO}/issues/41/comments?per_page=100`]: () => [
+    { user: { login: 'bob' }, body: 'Looks good', created_at: '2026-10-01T11:00:00Z', html_url: 'https://github.com/acme/widget/pull/41#issuecomment-1' },
+    { user: null, body: null, created_at: '2026-10-01T12:00:00Z', html_url: 'https://github.com/acme/widget/pull/41#issuecomment-2' },
+  ],
+  [`/repos/${REPO}/pulls/41/reviews?per_page=100`]: () => [
+    { user: { login: 'carol' }, state: 'APPROVED', body: 'Ship it', submitted_at: '2026-10-02T09:00:00Z', html_url: 'https://github.com/acme/widget/pull/41#pullrequestreview-1' },
+    // a review that only holds inline comments, and one still pending: left out
+    { user: { login: 'dan' }, state: 'COMMENTED', body: '', submitted_at: '2026-10-02T09:30:00Z', html_url: 'x' },
+    { user: { login: 'erin' }, state: 'PENDING', body: 'draft', html_url: 'y' },
+    { user: { login: 'dan' }, state: 'CHANGES_REQUESTED', body: 'Fix the colour', submitted_at: '2026-10-02T09:40:00Z', html_url: 'https://github.com/acme/widget/pull/41#pullrequestreview-3' },
+  ],
+  [`/repos/${REPO}/pulls/41/comments?per_page=100`]: () => [
+    { user: { login: 'dan' }, path: 'src/widget.js', line: 12, original_line: 10, body: 'Off by one?', created_at: '2026-10-02T09:31:00Z', html_url: 'https://github.com/acme/widget/pull/41#discussion_r1', in_reply_to_id: undefined, id: 1 },
+    { user: { login: 'alice' }, path: 'src/widget.js', line: null, original_line: 10, body: 'Fixed', created_at: '2026-10-02T09:35:00Z', html_url: 'https://github.com/acme/widget/pull/41#discussion_r2', in_reply_to_id: 1, id: 2 },
+  ],
+  [`/repos/${REPO}/commits/abc123/check-runs?per_page=100`]: () => ({
+    total_count: 5,
+    check_runs: [
+      { name: 'test', status: 'completed', conclusion: 'success', html_url: 'https://github.com/acme/widget/runs/1' },
+      { name: 'lint', status: 'completed', conclusion: 'failure', html_url: 'https://github.com/acme/widget/runs/2' },
+      { name: 'e2e', status: 'in_progress', conclusion: null, html_url: 'https://github.com/acme/widget/runs/3' },
+      { name: 'docs', status: 'completed', conclusion: 'skipped', html_url: 'https://github.com/acme/widget/runs/4' },
+      { name: 'deploy', status: 'completed', conclusion: 'timed_out', html_url: 'https://github.com/acme/widget/runs/5' },
+    ],
+  }),
+}
+function contextFetch(routes = CTX_ROUTES) {
+  return makeFetch(url => {
+    const path = url.slice(API.length)
+    const route = routes[path]
+    if (!route) return response(404, { message: 'Not Found' })
+    const out = route()
+    return out instanceof Error ? response(403, { message: out.message }) : response(200, out)
+  })
+}
+
+test('prContext reads the PR, its conversation, reviews, inline comments and checks in five calls', async () => {
+  const { calls, fetchFn } = contextFetch()
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn })
+  const ctx = await gh.prContext(41)
+  assert.deepEqual(calls.map(c => c.url.slice(API.length)).sort(), Object.keys(CTX_ROUTES).sort())
+  for (const c of calls) { assert.equal(c.options.method, 'GET'); assertGithubHeaders(c.options) }
+  assert.deepEqual(ctx, {
+    number: 41, title: 'Add widgets', url: 'https://github.com/acme/widget/pull/41', repoUrl: 'https://github.com/acme/widget',
+    state: 'open', draft: true, merged: false, author: 'alice', labels: ['ui'],
+    base: 'main', head: 'feat/widgets', headSha: 'abc123', createdAt: '2026-10-01T10:00:00Z', updatedAt: '2026-10-02T10:00:00Z',
+    body: CTX_PR.body, bodyTruncated: false,
+    // same-repo closing keywords only, once each
+    linkedIssues: [12, 13],
+    comments: {
+      items: [
+        { author: 'bob', createdAt: '2026-10-01T11:00:00Z', url: 'https://github.com/acme/widget/pull/41#issuecomment-1', body: 'Looks good', truncated: false },
+        { author: 'ghost', createdAt: '2026-10-01T12:00:00Z', url: 'https://github.com/acme/widget/pull/41#issuecomment-2', body: '', truncated: false },
+      ],
+      total: 3, error: null,
+    },
+    reviews: {
+      items: [
+        { author: 'carol', state: 'APPROVED', submittedAt: '2026-10-02T09:00:00Z', url: 'https://github.com/acme/widget/pull/41#pullrequestreview-1', body: 'Ship it', truncated: false },
+        { author: 'dan', state: 'CHANGES_REQUESTED', submittedAt: '2026-10-02T09:40:00Z', url: 'https://github.com/acme/widget/pull/41#pullrequestreview-3', body: 'Fix the colour', truncated: false },
+      ],
+      total: 2, error: null,
+    },
+    reviewComments: {
+      items: [
+        { author: 'dan', createdAt: '2026-10-02T09:31:00Z', url: 'https://github.com/acme/widget/pull/41#discussion_r1', path: 'src/widget.js', line: 12, outdated: false, reply: false, body: 'Off by one?', truncated: false },
+        { author: 'alice', createdAt: '2026-10-02T09:35:00Z', url: 'https://github.com/acme/widget/pull/41#discussion_r2', path: 'src/widget.js', line: 10, outdated: true, reply: true, body: 'Fixed', truncated: false },
+      ],
+      total: 2, error: null,
+    },
+    checks: {
+      total: 5, passed: 1, failed: 2, pending: 1, other: 1, error: null,
+      failing: [
+        { name: 'lint', conclusion: 'failure', url: 'https://github.com/acme/widget/runs/2' },
+        { name: 'deploy', conclusion: 'timed_out', url: 'https://github.com/acme/widget/runs/5' },
+      ],
+    },
+  })
+})
+
+test('prContext caps long bodies and full pages, and says how many there are', async () => {
+  const long = 'x'.repeat(70000)
+  const page = n => Array.from({ length: n }, (_, i) => ({ user: { login: `u${i}` }, body: long, created_at: null, html_url: null, state: 'COMMENTED', path: 'a', line: 1 }))
+  const { fetchFn } = contextFetch({
+    ...CTX_ROUTES,
+    [`/repos/${REPO}/pulls/41`]: () => ({ ...CTX_PR, body: long, comments: 250, review_comments: 400 }),
+    [`/repos/${REPO}/issues/41/comments?per_page=100`]: () => page(100),
+    [`/repos/${REPO}/pulls/41/reviews?per_page=100`]: () => page(100),
+    [`/repos/${REPO}/pulls/41/comments?per_page=100`]: () => page(100),
+  })
+  const ctx = await createGithub({ token: TOKEN, repo: REPO, fetchFn }).prContext(41)
+  assert.equal(ctx.body.length, 65536)
+  assert.equal(ctx.bodyTruncated, true)
+  assert.equal(ctx.comments.items.length, 100)
+  assert.equal(ctx.comments.total, 250)
+  assert.equal(ctx.comments.items[0].body.length, 16384)
+  assert.equal(ctx.comments.items[0].truncated, true)
+  assert.equal(ctx.reviewComments.total, 400)
+  // GitHub gives no review count: a full page may have more behind it
+  assert.equal(ctx.reviews.items.length, 100)
+  assert.equal(ctx.reviews.total, null)
+})
+
+test('prContext fails soft: a list or the checks GitHub refuses carry an error, and only the PR itself is required', async () => {
+  const { fetchFn } = contextFetch({
+    ...CTX_ROUTES,
+    [`/repos/${REPO}/pulls/41/reviews?per_page=100`]: () => new Error('Resource not accessible by personal access token'),
+    [`/repos/${REPO}/commits/abc123/check-runs?per_page=100`]: () => new Error('Resource not accessible by personal access token'),
+  })
+  const ctx = await createGithub({ token: TOKEN, repo: REPO, fetchFn }).prContext(41)
+  assert.equal(ctx.comments.items.length, 2)
+  assert.deepEqual(ctx.reviews.items, [])
+  assert.match(ctx.reviews.error, /403/)
+  assert.equal(ctx.checks.total, null)
+  assert.match(ctx.checks.error, /403/)
+  const down = contextFetch({})
+  await assert.rejects(createGithub({ token: TOKEN, repo: REPO, fetchFn: down.fetchFn }).prContext(41), /github GET \/repos\/acme\/widget\/pulls\/41 -> 404/)
+})
+
+test('prContext caches per PR: none within contextTtlMs, then the PR and checks, and the lists again only when the head or updated_at moved', async () => {
+  let pr = CTX_PR
+  const { calls, fetchFn } = contextFetch({ ...CTX_ROUTES, [`/repos/${REPO}/pulls/41`]: () => pr })
+  let now = 1000
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn, contextTtlMs: 30000, now: () => now })
+  const first = await gh.prContext(41)
+  assert.equal(calls.length, 5)
+  now += 29999
+  assert.deepEqual(await gh.prContext(41), first)
+  assert.equal(calls.length, 5, 'fresh: no call')
+  now += 2
+  await gh.prContext(41)
+  assert.deepEqual(calls.slice(5).map(c => c.url.slice(API.length)).sort(), [`/repos/${REPO}/commits/abc123/check-runs?per_page=100`, `/repos/${REPO}/pulls/41`])
+  // a new comment moves updated_at: the lists are read again
+  pr = { ...CTX_PR, updated_at: '2026-10-03T10:00:00Z' }
+  now += 30001
+  const moved = await gh.prContext(41)
+  assert.equal(calls.length, 12)
+  assert.equal(moved.updatedAt, '2026-10-03T10:00:00Z')
+  // two reads at once share their calls
+  now += 30001
+  pr = { ...pr, head: { ...pr.head, sha: 'abc123' }, updated_at: '2026-10-04T10:00:00Z' }
+  await Promise.all([gh.prContext(41), gh.prContext(41)])
+  assert.equal(calls.length, 17)
+})
