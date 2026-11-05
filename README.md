@@ -785,7 +785,7 @@ Its limits:
 - `prInfo(num)` → `{ number, headSha, author, authorAssociation, isDraft, headRepo, headOwner }`, or without it `prHead(num)` → `headSha`, for `/api/build-status`;
 - `postComment(num, body)` → the comment's URL, and `setQaLabel(num, label)`, for the verdict.
 
-`adapters/build-worktree` also needs `prInfo` and `authorPermission(login)`. `createGithub(options)` makes one on GitHub's REST API:
+`adapters/build-worktree` also needs `prInfo` and `authorPermission(login)`. A BuildConvention's `eligible` may use `listPrFiles(num)` → `{ files, complete }`, the paths the PR changes, from one page of at most 100 (`complete` is `false` when the page is full and there may be more). `createGithub(options)` makes one on GitHub's REST API:
 
 | Option | Default | |
 |---|---|---|

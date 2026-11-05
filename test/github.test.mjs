@@ -73,6 +73,31 @@ test('listOpenPrs fetches open PRs and maps the fields, including the trust data
   ])
 })
 
+// For a BuildConvention's eligible(pr): which files a PR changes, in one call.
+test('listPrFiles reads one page of a PR\'s changed files and says whether that was all of them', async () => {
+  const names = n => Array.from({ length: n }, (_, i) => ({ filename: `docs/${i}.md`, status: 'modified' }))
+  let page = [{ filename: 'README.md', status: 'modified' }, { filename: 'docs/a.md', status: 'added' }, { filename: 'old/b.md', status: 'renamed', previous_filename: 'b.md' }]
+  const { calls, fetchFn } = makeFetch(() => response(200, page))
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn })
+  assert.deepEqual(await gh.listPrFiles(41), { files: ['README.md', 'docs/a.md', 'old/b.md'], complete: true })
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].url, `${API}/repos/${REPO}/pulls/41/files?per_page=100`)
+  assert.equal(calls[0].options.method, 'GET')
+  assertGithubHeaders(calls[0].options)
+  // a full page may have more behind it
+  page = names(100)
+  const full = await gh.listPrFiles(42)
+  assert.equal(full.files.length, 100)
+  assert.equal(full.complete, false)
+  assert.equal(calls.length, 2, 'still one call')
+})
+
+test('listPrFiles throws on an error answer', async () => {
+  const { fetchFn } = makeFetch(() => response(404, { message: 'Not Found' }))
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn })
+  await assert.rejects(gh.listPrFiles(41), /github GET \/repos\/acme\/widget\/pulls\/41\/files\?per_page=100 -> 404/)
+})
+
 test('prInfo returns the PR trust data from GET /pulls/{num}', async () => {
   const { calls, fetchFn } = makeFetch(() => response(200, {
     number: 41, draft: true, author_association: 'COLLABORATOR', user: { login: 'alice' },
