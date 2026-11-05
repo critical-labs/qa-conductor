@@ -50,9 +50,25 @@ test('reviewQueue: no verdict label (whatever its case), blocked out and counted
 })
 
 test('reviewQueue: nothing to walk gives an empty queue, and bad input is just empty', () => {
-  assert.deepEqual(reviewQueue([], { verdictLabels: VERDICTS }), { queue: [], blocked: 0 })
-  assert.deepEqual(reviewQueue(null, { verdictLabels: VERDICTS }), { queue: [], blocked: 0 })
-  assert.deepEqual(reviewQueue([{ number: 'x' }, null, { number: 5, imageStatus: 'blocked' }], {}), { queue: [], blocked: 1 })
+  assert.deepEqual(reviewQueue([], { verdictLabels: VERDICTS }), { queue: [], blocked: 0, notForReview: 0 })
+  assert.deepEqual(reviewQueue(null, { verdictLabels: VERDICTS }), { queue: [], blocked: 0, notForReview: 0 })
+  assert.deepEqual(reviewQueue([{ number: 'x' }, null, { number: 5, imageStatus: 'blocked' }], {}), { queue: [], blocked: 1, notForReview: 0 })
+})
+
+// The BuildConvention's eligible(pr) marks a PR review: false: it is left out
+// and counted apart from those that can't boot. A verdict or a done PR isn't
+// counted at all, and review: true or no field at all is queued as before.
+test('reviewQueue: a PR marked review false is left out and counted as not for review, apart from blocked', () => {
+  const prs = [
+    { number: 1, imageStatus: 'built', labels: [], review: true },
+    { number: 2, imageStatus: 'none', labels: [], review: false, skipReason: 'docs only' },
+    { number: 3, imageStatus: 'blocked', labels: [], review: false, skipReason: 'draft' },
+    { number: 4, imageStatus: 'blocked', labels: [] },
+    { number: 5, imageStatus: 'none', labels: ['qa-approved'], review: false },
+    { number: 6, imageStatus: 'none', labels: [], review: false },
+    { number: 7, imageStatus: 'none', labels: [] },
+  ]
+  assert.deepEqual(reviewQueue(prs, { verdictLabels: VERDICTS, done: [6] }), { queue: [prs[0], prs[6]], blocked: 1, notForReview: 2 })
 })
 
 test('isolationLabel: nothing before a verdict, else what it says, its reasons as the title', () => {
@@ -922,6 +938,69 @@ test('an empty queue ends the walk\'s own last session and shows Queue clear, wi
   assert.equal(b.byId('reviewCount').textContent, '1 of 1 done')
   // #4's label is in the list now, so the cover for it is dropped
   assert.deepEqual(reviewStored(b), { skipped: [], done: [], reviewed: 1 })
+})
+
+test('PRs not for review are left out of the walk and counted apart, in the strip and on Queue clear', async () => {
+  const prs = [
+    { number: 7, title: 'seven', imageStatus: 'built', labels: [] },
+    { number: 8, title: 'docs', imageStatus: 'none', labels: [], review: false, skipReason: 'docs only' },
+    { number: 9, title: 'draft', imageStatus: 'blocked', reason: 'fork', labels: [], review: false, skipReason: 'draft' },
+    { number: 10, title: 'fork', imageStatus: 'blocked', reason: 'fork', labels: [] },
+  ]
+  const b = fakeBrowser({
+    hash: '#/review', stored: 'tok',
+    routes: {
+      'GET /qa/api/state': { body: { status: 'idle', ...VERDICT_STATE } },
+      'GET /qa/api/prs': { body: { prs, session: null } },
+      'POST /qa/api/session': { status: 202, body: { ok: true } },
+    },
+  })
+  await b.settle()
+  assert.deepEqual(sessions(b), [{ pr: 7 }])
+  assert.equal(b.byId('reviewNext').textContent, 'last one')
+  assert.equal(b.byId('reviewBlocked').textContent, "1 can't boot · 2 not for review")
+
+  for (const [list, want] of [
+    [prs.slice(1), "1 can't boot and is left out. 2 not for review are left out; open them from the pull requests."],
+    [[prs[1]], '1 not for review is left out; open it from the pull requests.'],
+  ]) {
+    const c = fakeBrowser({
+      hash: '#/review', stored: 'tok',
+      routes: {
+        'GET /qa/api/state': { body: { status: 'idle', ...VERDICT_STATE } },
+        'GET /qa/api/prs': { body: { prs: list, session: null } },
+      },
+    })
+    await c.settle()
+    assert.deepEqual(sessions(c), [])
+    assert.equal(c.byId('queueClear').hidden, false)
+    assert.equal(c.byId('queueClearBlocked').hidden, false)
+    assert.equal(c.byId('queueClearBlocked').textContent, want)
+  }
+})
+
+// A PR not for review is still in the picker, and says so, so a person can
+// open it by hand.
+test('the picker lists a PR not for review, with its reason, and opens it', async () => {
+  const prList = fakeList()
+  const prs = [
+    { number: 7, title: 'a', imageStatus: 'built' },
+    { number: 8, title: 'b', imageStatus: 'none', review: false, skipReason: 'type <chore>' },
+  ]
+  const b = fakeBrowser({
+    stored: 'tok',
+    elements: { prList },
+    routes: {
+      'GET /qa/api/state': { body: { status: 'idle' } },
+      'GET /qa/api/prs': { body: { prs, session: null } },
+    },
+  })
+  await b.settle()
+  assert.deepEqual(prList.children.map(row => row.dataset.pr), [7, 8])
+  const [seven, eight] = prList.children
+  assert.ok(!/not for review/.test(seven.innerHTML), seven.innerHTML)
+  assert.ok(eight.innerHTML.includes('not for review: type &lt;chore&gt;'), eight.innerHTML)
+  assert.ok(eight.innerHTML.includes('data-open="8"'), 'it still opens')
 })
 
 // A session the reviewer opened from the picker, on a PR the queue is done

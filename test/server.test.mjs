@@ -370,6 +370,72 @@ test('/api/prs passes each PR\'s labels and creation time through, and gives a l
   } finally { c.stop() }
 })
 
+// Change Review queues only the PRs the BuildConvention's optional
+// eligible(pr) calls worth a review; without it the list is as before.
+test('/api/prs asks build.eligible once per PR per read and marks each review and skipReason; without eligible the items are unchanged', async () => {
+  const { c, adapters, github, errorLines } = makeWorld()
+  try {
+    const port = await harnessPort(c)
+    const plain = (await api(port, 'GET', '/api/prs')).prs[0]
+    assert.ok(!('review' in plain) && !('skipReason' in plain), JSON.stringify(plain))
+    github.listOpenPrs = async () => [
+      { number: 7, title: 'feat: a', headSha: 'abc', isDraft: false, labels: [] },
+      { number: 8, title: 'docs: b', headSha: 'def', isDraft: false, labels: [] },
+      { number: 9, title: 'c', headSha: 'fed', isDraft: true, labels: [] },
+      { number: 10, title: 'd', headSha: '012', isDraft: false, labels: [] },
+    ]
+    const asked = []
+    adapters.build.eligible = async pr => {
+      asked.push([pr.number, pr.headSha, pr.isDraft])
+      if (pr.number === 8) return { review: false, reason: 'docs only' }
+      if (pr.number === 9) return { review: false }
+      if (pr.number === 10) throw new Error('GitHub down')
+      return { review: true }
+    }
+    const prs = (await api(port, 'GET', '/api/prs')).prs
+    assert.deepEqual(prs.map(p => [p.number, p.review, p.skipReason]), [
+      [7, true, null],
+      [8, false, 'docs only'],
+      [9, false, 'not for review'],
+      // an adapter that throws leaves the PR in the queue, and says why in the log
+      [10, true, null],
+    ])
+    assert.deepEqual(asked, [[7, 'abc', false], [8, 'def', false], [9, 'fed', true], [10, '012', false]], 'the listOpenPrs item, once each')
+    assert.ok(errorLines.some(l => l.includes('eligible(#10)') && l.includes('GitHub down')), errorLines.join('\n'))
+  } finally { c.stop() }
+})
+
+test('/api/prebuild refuses a PR eligible() says is not for review, without asking prebuild; an eligible() that throws lets it through', async () => {
+  const w = makeWorld()
+  try {
+    const port = await harnessPort(w.c)
+    w.github.listOpenPrs = async () => [
+      { number: 8, title: 'docs: b', headSha: 'def', isDraft: false, labels: [] },
+      { number: 9, title: 'feat: c', headSha: 'fed', isDraft: false, labels: [] },
+    ]
+    const asked = []
+    w.adapters.build.prebuild = async pr => { asked.push(pr); return { started: true } }
+    let eligibleThrows = false
+    w.adapters.build.eligible = async pr => {
+      if (eligibleThrows) throw new Error('GitHub down')
+      return pr.number === 8 ? { review: false, reason: 'docs only' } : { review: true }
+    }
+    assert.deepEqual(await api(port, 'POST', '/api/prebuild', { pr: 8 }), { pr: 8, started: false, reason: 'not for review: docs only' })
+    assert.deepEqual(await api(port, 'POST', '/api/prebuild', { pr: 9 }), { pr: 9, started: true, reason: null })
+    assert.deepEqual(asked, [9])
+    // a PR not in the open list is left to prebuild, as before
+    assert.deepEqual(await api(port, 'POST', '/api/prebuild', { pr: 11 }), { pr: 11, started: true, reason: null })
+    eligibleThrows = true
+    assert.deepEqual(await api(port, 'POST', '/api/prebuild', { pr: 8 }), { pr: 8, started: true, reason: null })
+    assert.deepEqual(asked, [9, 11, 8])
+    // the list itself failing lets it through too
+    w.github.listOpenPrs = async () => { throw new Error('list down') }
+    assert.deepEqual(await api(port, 'POST', '/api/prebuild', { pr: 12 }), { pr: 12, started: true, reason: null })
+    assert.ok(w.errorLines.some(l => l.includes('eligible(#8)') && l.includes('GitHub down')), w.errorLines.join('\n'))
+    assert.ok(w.errorLines.some(l => l.includes('list down')), w.errorLines.join('\n'))
+  } finally { w.c.stop() }
+})
+
 test('/api/build-status asks describePrs about the PR head', async () => {
   const { c, adapters } = makeWorld()
   try {

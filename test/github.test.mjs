@@ -42,13 +42,13 @@ function version(id, tags, updatedAt) {
   return { id, updated_at: updatedAt, metadata: { container: { tags } } }
 }
 
-test('listOpenPrs fetches open PRs and maps the fields, including the trust data', async () => {
+test('listOpenPrs fetches open PRs and maps the fields, including the trust data and whether each is a draft', async () => {
   const { calls, fetchFn } = makeFetch(() =>
     response(200, [
       {
         number: 41, title: 'Add widgets', author_association: 'MEMBER', user: { login: 'alice' },
         head: { sha: 'abc123', ref: 'feat/widgets', repo: { full_name: 'acme/widget', owner: { login: 'acme' } } },
-        labels: [{ name: 'qa-approved' }, { name: 'bug' }], created_at: '2026-10-01T10:00:00Z',
+        labels: [{ name: 'qa-approved' }, { name: 'bug' }], created_at: '2026-10-01T10:00:00Z', draft: true,
       },
       {
         number: 42, title: 'Fix bug', author_association: 'CONTRIBUTOR', user: { login: 'bob' },
@@ -66,11 +66,36 @@ test('listOpenPrs fetches open PRs and maps the fields, including the trust data
   assert.equal(calls[0].options.method, 'GET')
   assertGithubHeaders(calls[0].options)
   assert.deepEqual(prs, [
-    { number: 41, title: 'Add widgets', headSha: 'abc123', headRef: 'feat/widgets', author: 'alice', labels: ['qa-approved', 'bug'], createdAt: '2026-10-01T10:00:00Z', authorAssociation: 'MEMBER', headRepo: 'acme/widget', headOwner: 'acme' },
-    { number: 42, title: 'Fix bug', headSha: 'def456', headRef: 'fix/bug', author: 'bob', labels: [], createdAt: '2026-10-02T10:00:00Z', authorAssociation: 'CONTRIBUTOR', headRepo: 'bob/widget', headOwner: 'bob' },
+    { number: 41, title: 'Add widgets', headSha: 'abc123', headRef: 'feat/widgets', author: 'alice', labels: ['qa-approved', 'bug'], createdAt: '2026-10-01T10:00:00Z', isDraft: true, authorAssociation: 'MEMBER', headRepo: 'acme/widget', headOwner: 'acme' },
+    { number: 42, title: 'Fix bug', headSha: 'def456', headRef: 'fix/bug', author: 'bob', labels: [], createdAt: '2026-10-02T10:00:00Z', isDraft: false, authorAssociation: 'CONTRIBUTOR', headRepo: 'bob/widget', headOwner: 'bob' },
     // no labels and no created_at in the answer: an empty list and null
-    { number: 43, title: 'Orphan', headSha: 'fed789', headRef: 'x', author: 'eve', labels: [], createdAt: null, authorAssociation: 'NONE', headRepo: null, headOwner: null },
+    { number: 43, title: 'Orphan', headSha: 'fed789', headRef: 'x', author: 'eve', labels: [], createdAt: null, isDraft: false, authorAssociation: 'NONE', headRepo: null, headOwner: null },
   ])
+})
+
+// For a BuildConvention's eligible(pr): which files a PR changes, in one call.
+test('listPrFiles reads one page of a PR\'s changed files and says whether that was all of them', async () => {
+  const names = n => Array.from({ length: n }, (_, i) => ({ filename: `docs/${i}.md`, status: 'modified' }))
+  let page = [{ filename: 'README.md', status: 'modified' }, { filename: 'docs/a.md', status: 'added' }, { filename: 'old/b.md', status: 'renamed', previous_filename: 'b.md' }]
+  const { calls, fetchFn } = makeFetch(() => response(200, page))
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn })
+  assert.deepEqual(await gh.listPrFiles(41), { files: ['README.md', 'docs/a.md', 'old/b.md'], complete: true })
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].url, `${API}/repos/${REPO}/pulls/41/files?per_page=100`)
+  assert.equal(calls[0].options.method, 'GET')
+  assertGithubHeaders(calls[0].options)
+  // a full page may have more behind it
+  page = names(100)
+  const full = await gh.listPrFiles(42)
+  assert.equal(full.files.length, 100)
+  assert.equal(full.complete, false)
+  assert.equal(calls.length, 2, 'still one call')
+})
+
+test('listPrFiles throws on an error answer', async () => {
+  const { fetchFn } = makeFetch(() => response(404, { message: 'Not Found' }))
+  const gh = createGithub({ token: TOKEN, repo: REPO, fetchFn })
+  await assert.rejects(gh.listPrFiles(41), /github GET \/repos\/acme\/widget\/pulls\/41\/files\?per_page=100 -> 404/)
 })
 
 test('prInfo returns the PR trust data from GET /pulls/{num}', async () => {

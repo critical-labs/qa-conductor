@@ -83,7 +83,8 @@ function markType(event) {
 // hold neither verdict label (GitHub label names are case-insensitive) and
 // whose number isn't in `done` (verdicts this visit posted, should the list
 // lag the label). Out, and counted: PRs the build reports as blocked, which
-// would fail every boot. Order: built, then building, then the rest; within a
+// would fail every boot; and, counted apart, PRs the build's eligible() marks
+// `review: false` (not for review: a draft, say, or docs only). Order: built, then building, then the rest; within a
 // group the oldest first (createdAt, undated ones after dated ones, then by
 // number). PRs in `skipped` come last, in the order they were skipped.
 const READINESS_RANK = new Map([['built', 0], ['building', 1]])
@@ -98,11 +99,13 @@ function reviewQueue(prs, { verdictLabels, skipped = [], done = [] } = {}) {
   const finished = new Set(done.map(Number))
   const skipOrder = new Map(skipped.map((n, i) => [Number(n), i]))
   let blocked = 0
+  let notForReview = 0
   const waiting = []
   for (const pr of Array.isArray(prs) ? prs : []) {
     if (!pr || !Number.isInteger(pr.number)) continue
     if (hasVerdictLabel(pr, verdictLabels)) continue
     if (finished.has(pr.number)) continue
+    if (pr.review === false) { notForReview++; continue }
     if (pr.imageStatus === 'blocked') { blocked++; continue }
     waiting.push(pr)
   }
@@ -111,7 +114,7 @@ function reviewQueue(prs, { verdictLabels, skipped = [], done = [] } = {}) {
   const byAge = (a, b) => rank(a) - rank(b) || age(a) - age(b) || a.number - b.number
   const fresh = waiting.filter(pr => !skipOrder.has(pr.number)).sort(byAge)
   const again = waiting.filter(pr => skipOrder.has(pr.number)).sort((a, b) => skipOrder.get(a.number) - skipOrder.get(b.number))
-  return { queue: fresh.concat(again), blocked }
+  return { queue: fresh.concat(again), blocked, notForReview }
 }
 
 // The ticket an invite link carries in its fragment (#enrol=<ticket>), else
@@ -175,7 +178,7 @@ function inviteFromHash(hash) {
     // `posted` the last verdict's PR and comment URL, shown until the next
     // session is ready; `error` the last failed queue read.
     // `warming` the PR whose build /api/prebuild started for the queue
-    review: { on: false, queue: [], blocked: 0, current: null, posted: null, error: null, warming: null },
+    review: { on: false, queue: [], blocked: 0, notForReview: 0, current: null, posted: null, error: null, warming: null },
   }
 
   // What this visit skipped, the PRs it posted a verdict for whose label the
@@ -412,6 +415,8 @@ function inviteFromHash(hash) {
       row.innerHTML = `<span class="num">#${num}</span>`
         + `<span class="main"><span class="title">${esc(pr.title)}</span>`
         + `<span class="submeta">${esc(pr.headRef || '')}${pr.author ? ' · ' + esc(pr.author) : ''} </span>`
+        // left out of Change Review by the build's eligible(), but open by hand
+        + (pr.review === false ? `<span class="skipNote">not for review${pr.skipReason ? ': ' + esc(pr.skipReason) : ''}</span>` : '')
         + `<span class="rowErr" hidden></span></span>${action}`
       row.querySelector('.submeta').appendChild(imageBadge(pr))
     }
@@ -525,8 +530,8 @@ function inviteFromHash(hash) {
     const done = stored.done.filter(n => !prs.some(p => p.number === n && hasVerdictLabel(p, S.verdictLabels)))
     if (done.length !== stored.done.length) reviewStore.set({ ...stored, done })
     const { skipped } = stored
-    const { queue, blocked } = reviewQueue(prs, { verdictLabels: S.verdictLabels, skipped, done })
-    S.review.queue = queue; S.review.blocked = blocked
+    const { queue, blocked, notForReview } = reviewQueue(prs, { verdictLabels: S.verdictLabels, skipped, done })
+    S.review.queue = queue; S.review.blocked = blocked; S.review.notForReview = notForReview
     const active = state.status !== 'idle' && state.status !== 'error'
     const previous = S.review.current // null on a fresh entry, or after a verdict or skip
     if (queue.length === 0) {
@@ -539,8 +544,12 @@ function inviteFromHash(hash) {
         if (left()) return
       }
       renderStrip(); showView('queueClear'); setPill('queue clear')
-      const b = $('queueClearBlocked'); b.hidden = blocked === 0
-      b.textContent = blocked === 0 ? '' : `${blocked} can't boot and ${blocked === 1 ? 'is' : 'are'} left out.`
+      const b = $('queueClearBlocked'); b.hidden = blocked === 0 && notForReview === 0
+      const one = notForReview === 1
+      b.textContent = [
+        blocked === 0 ? '' : `${blocked} can't boot and ${blocked === 1 ? 'is' : 'are'} left out.`,
+        notForReview === 0 ? '' : `${notForReview} not for review ${one ? 'is' : 'are'} left out; open ${one ? 'it' : 'them'} from the pull requests.`,
+      ].filter(Boolean).join(' ')
       return
     }
     const queued = active && queue.some(p => p.number === state.pr)
@@ -573,7 +582,7 @@ function inviteFromHash(hash) {
     }).catch(() => {})
   }
 
-  // The strip: the PR, the count, what's next, the blocked count, the last
+  // The strip: the PR, the count, what's next, the blocked and not-for-review counts, the last
   // verdict, and a failed queue read. Titles and errors are text.
   function renderStrip() {
     const r = S.review
@@ -586,7 +595,7 @@ function inviteFromHash(hash) {
     const next = r.queue.filter(p => p.number !== r.current)[0]
     const warming = next && r.warming === next.number ? ' · warming' : ''
     $('reviewNext').textContent = r.queue.length === 0 ? '' : next ? `next #${next.number}${warming}` : 'last one'
-    $('reviewBlocked').textContent = r.blocked ? `${r.blocked} can't boot` : ''
+    $('reviewBlocked').textContent = [r.blocked ? `${r.blocked} can't boot` : '', r.notForReview ? `${r.notForReview} not for review` : ''].filter(Boolean).join(' · ')
     const posted = $('reviewPosted'); posted.textContent = ''
     if (r.posted) {
       posted.append(`Posted to #${r.posted.pr}`)
