@@ -4,11 +4,20 @@ What changed in each release, newest first. A 0.x minor version may break the in
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-11-05
+
+Change Review walks only the pull requests worth a review, and never starts a build for the rest. Additive: a BuildConvention without `eligible` behaves as before. One new field may show in a consumer's tests: [Migrating from 0.5.1](#migrating-from-051).
+
 ### Review eligibility
 
 - **Change Review walks only the PRs worth a review, and never builds the rest.** The BuildConvention's new optional `eligible(pr) → {review, reason?}` says whether a PR is worth a visual QA pass: a consumer can leave out drafts, docs-only changes or a `chore:` title, say. The core asks it once per PR on each read of the open-PR list, with the `listOpenPrs()` item. A PR with `review: false` is left out of the queue and counted apart from those that can't boot (`N not for review` in the strip and on **Queue clear**), and `/api/prebuild` refuses it (`started: false, reason: "not for review: <reason>"`) without calling `prebuild`. It stays in the picker, marked `not for review: <reason>`, so a person can still open it. An `eligible` that throws is logged and the PR counts as for review. Additive: a BuildConvention without `eligible` behaves as before.
   - **New:** `createGithub`'s `listPrFiles(num)` → `{files, complete}`, the paths a PR changes in one call (at most 100; `complete: false` when there may be more), for an `eligible` that looks at what a PR touches.
   - **New fields:** `listOpenPrs()` items carry `isDraft`; with `eligible`, `/api/prs` items carry `review` and `skipReason`. A consumer test that compares a `listOpenPrs()` item whole must add `isDraft`; a `github` of your own that lacks it still works.
+
+### Migrating from 0.5.1
+
+1. **Additive.** No export is gone or renamed, and no default changed. New: the BuildConvention's optional `eligible(pr)`, `createGithub`'s `listPrFiles(num)`, and, with `eligible`, `review` and `skipReason` on `/api/prs` items.
+2. **A test that compares a `listOpenPrs()` item whole** sees `isDraft` and must add it. A `github` of your own that lacks it still works.
 
 ## [0.5.1] — 2026-11-04
 
@@ -386,7 +395,8 @@ The first standalone release, extracted from homefree's platform code. It instal
 - **`loadConfig`** reads `.env.qa` into the settings the core needs, with a platform's own `defaults`. It has no app defaults, and the verdict labels are configurable.
 - **Built in:** a Docker Provisioner (`adapters/provisioner-docker`): a postgres container and an app container per pane, `0600` env files, registry login and a sweep of labelled orphans. And the effect wrappers for it: `docker`, `github` and `exec`.
 
-[Unreleased]: https://github.com/critical-labs/qa-conductor/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/critical-labs/qa-conductor/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/critical-labs/qa-conductor/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/critical-labs/qa-conductor/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/critical-labs/qa-conductor/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/critical-labs/qa-conductor/compare/v0.3.1...v0.4.0
