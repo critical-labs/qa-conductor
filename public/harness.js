@@ -117,6 +117,427 @@ function reviewQueue(prs, { verdictLabels, skipped = [], done = [] } = {}) {
   return { queue: fresh.concat(again), blocked, notForReview }
 }
 
+// --- PR context: safe rendering ----------------------------------------------
+// The PR context pane shows text anyone who can open a pull request writes:
+// its title, description, comments, file paths, labels and logins. None of it
+// ever reaches the HTML parser. A safe subset of Markdown (headings, lists,
+// quotes, code, emphasis, links) is parsed here into plain nodes, and those
+// become DOM through createElement, createTextNode and setAttribute alone,
+// from a fixed list of tags and attributes. Raw HTML in a body shows as the
+// text it is. A link is made only for an absolute http(s) URL, and opens in a
+// new tab with no opener and no Referer. An image is never loaded: a tracking
+// pixel would tell its author who reviews the PR, from where and when, so it
+// becomes a link the reviewer can choose to open. The parser runs in linear
+// time, near enough, on any input: no regular expression that can backtrack
+// over a body, and every closing delimiter found through a lookup table.
+
+// An absolute http(s) URL, normalized by the URL parser (which drops tabs and
+// newlines, so `java\tscript:` is `javascript:` and refused), or null.
+function safeHref(raw) {
+  if (typeof raw !== 'string') return null
+  let u
+  try { u = new URL(raw.trim()) } catch { return null }
+  return u.protocol === 'https:' || u.protocol === 'http:' ? u.href : null
+}
+
+const MD_MAX = 200000 // characters of one body the parser looks at
+const MD_DEPTH = 3 // nested quotes, and nested emphasis, beyond which it's text
+
+// Without HTML comments, as GitHub hides them (a PR template's notes); an
+// unterminated one is left as text.
+function stripComments(s) {
+  let out = ''
+  let i = 0
+  for (;;) {
+    const open = s.indexOf('<!--', i)
+    if (open === -1) break
+    const close = s.indexOf('-->', open + 4)
+    if (close === -1) break
+    out += s.slice(i, open)
+    i = close + 3
+  }
+  return out + s.slice(i)
+}
+
+const isBlank = line => line.trim() === ''
+// The run of `ch` at the start of `s`, after up to three spaces: its length, or 0.
+function leadRun(s, ch) {
+  let i = 0
+  while (i < 3 && s[i] === ' ') i++
+  let n = 0
+  while (s[i + n] === ch) n++
+  return n
+}
+function headingOf(line) {
+  const trimmed = line.replace(/^ {0,3}/, '')
+  let n = 0
+  while (n < 7 && trimmed[n] === '#') n++
+  if (n < 1 || n > 6 || (trimmed.length > n && trimmed[n] !== ' ' && trimmed[n] !== '\t')) return null
+  let text = trimmed.slice(n).trim()
+  // a closing run of #s
+  let end = text.length
+  while (end > 0 && text[end - 1] === '#') end--
+  if (end < text.length && (end === 0 || text[end - 1] === ' ')) text = text.slice(0, end).trim()
+  return { level: n, text }
+}
+function isRule(line) {
+  const t = line.trim()
+  if (t.length < 3 || line.length - line.trimStart().length > 3) return false
+  const ch = t[0]
+  if (ch !== '-' && ch !== '*' && ch !== '_') return false
+  let count = 0
+  for (const c of t) { if (c === ch) count++; else if (c !== ' ' && c !== '\t') return false }
+  return count >= 3
+}
+// A list item's marker: { ordered, indent, rest }, or null.
+function listItemOf(line) {
+  let i = 0
+  while (i < line.length && line[i] === ' ') i++
+  const indent = i
+  let ordered = false
+  if (line[i] === '-' || line[i] === '*' || line[i] === '+') i++
+  else {
+    const start = i
+    while (i - start < 9 && line[i] >= '0' && line[i] <= '9') i++
+    if (i === start || (line[i] !== '.' && line[i] !== ')')) return null
+    i++; ordered = true
+  }
+  if (line[i] !== ' ' && line[i] !== '\t') return null
+  return { ordered, indent, rest: line.slice(i).trim() }
+}
+const quoteOf = line => { const m = /^ {0,3}> ?/.exec(line); return m ? line.slice(m[0].length) : null }
+const fenceOf = line => { const n = leadRun(line, '`') >= 3 ? leadRun(line, '`') : leadRun(line, '~'); return n >= 3 ? { ch: line.trimStart()[0], n } : null }
+
+// Markdown text → block nodes: {t:'h', level, text} {t:'p', text}
+// {t:'pre', text, cls?} {t:'list', ordered, items:[text]} {t:'quote', blocks}
+// {t:'hr'}. Inline text is parsed when rendered.
+function mdParse(src, depth = 0) {
+  const text = depth === 0 ? stripComments(String(src ?? '').slice(0, MD_MAX).replace(/\r\n?/g, '\n')) : String(src)
+  const lines = text.split('\n')
+  const blocks = []
+  let para = []
+  const flush = () => { if (para.length) { blocks.push({ t: 'p', text: para.join('\n') }); para = [] } }
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (isBlank(line)) { flush(); continue }
+    const fence = fenceOf(line)
+    if (fence) {
+      flush()
+      const body = []
+      for (i++; i < lines.length; i++) {
+        const close = fenceOf(lines[i])
+        if (close && close.ch === fence.ch && close.n >= fence.n && lines[i].trim().length === close.n) break
+        body.push(lines[i])
+      }
+      blocks.push({ t: 'pre', text: body.join('\n') })
+      continue
+    }
+    const heading = headingOf(line)
+    if (heading) { flush(); blocks.push({ t: 'h', level: heading.level, text: heading.text }); continue }
+    if (isRule(line)) { flush(); blocks.push({ t: 'hr' }); continue }
+    if (quoteOf(line) !== null) {
+      flush()
+      const inner = []
+      while (i < lines.length && quoteOf(lines[i]) !== null) inner.push(quoteOf(lines[i++]))
+      i--
+      blocks.push(depth < MD_DEPTH ? { t: 'quote', blocks: mdParse(inner.join('\n'), depth + 1) } : { t: 'p', text: inner.join('\n') })
+      continue
+    }
+    if (line.trimStart()[0] === '|') {
+      flush()
+      const rows = []
+      while (i < lines.length && !isBlank(lines[i]) && lines[i].trimStart()[0] === '|') rows.push(lines[i++].trim())
+      i--
+      blocks.push({ t: 'pre', text: rows.join('\n'), cls: 'table' })
+      continue
+    }
+    const item = listItemOf(line)
+    if (item) {
+      flush()
+      const list = { t: 'list', ordered: item.ordered, items: [] }
+      while (i < lines.length) {
+        const it = listItemOf(lines[i])
+        if (it && it.ordered === list.ordered) { list.items.push(it.rest); i++; continue }
+        // a nested item, or a line that continues the last item
+        if (it || (!isBlank(lines[i]) && /^\s/.test(lines[i]))) { list.items[list.items.length - 1] += `\n${it ? it.rest : lines[i].trim()}`; i++; continue }
+        break
+      }
+      i--
+      blocks.push(list)
+      continue
+    }
+    para.push(line.trim())
+  }
+  flush()
+  return blocks
+}
+
+// For each position, the next index at or after it where `tok` starts, or -1:
+// so finding a closing delimiter is one lookup, never a scan.
+function nextTable(s, tok) {
+  const t = new Int32Array(s.length + 1).fill(-1)
+  for (let i = s.length - 1; i >= 0; i--) t[i] = s.startsWith(tok, i) ? i : t[i + 1]
+  return t
+}
+const isWord = c => c !== undefined && /[A-Za-z0-9]/.test(c)
+const ASCII_PUNCT = '!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'
+
+// Inline Markdown → nodes: {t:'text', v} {t:'code', v} {t:'br'}
+// {t:'strong'|'em'|'del', c} {t:'link', href, c} {t:'image', href, alt}.
+// A link's href is already safe, or the link is just its text.
+function mdInline(s, opts = {}, depth = 0) {
+  const out = []
+  let buf = ''
+  const push = node => { if (buf) { out.push({ t: 'text', v: buf }); buf = '' } out.push(node) }
+  const tables = new Map()
+  const next = (tok, from) => {
+    if (from > s.length) return -1
+    if (!tables.has(tok)) tables.set(tok, nextTable(s, tok))
+    return tables.get(tok)[from]
+  }
+  const inner = text => (depth < MD_DEPTH ? mdInline(text, opts, depth + 1) : [{ t: 'text', v: text }])
+  const repo = safeHref(opts.repoUrl)
+  let i = 0
+  while (i < s.length) {
+    const c = s[i]
+    if (c === '\\' && ASCII_PUNCT.includes(s[i + 1] ?? 'x')) { buf += s[i + 1]; i += 2; continue }
+    if (c === '\n') { push({ t: 'br' }); i++; continue }
+    if (c === '`') {
+      let n = 0
+      while (s[i + n] === '`') n++
+      const close = s.indexOf('`'.repeat(n), i + n)
+      if (close === -1) { buf += '`'.repeat(n); i += n; continue }
+      push({ t: 'code', v: s.slice(i + n, close).replace(/\n/g, ' ') })
+      i = close + n
+      continue
+    }
+    // [text](url) and ![alt](url); a title after the URL is dropped
+    if ((c === '[' || (c === '!' && s[i + 1] === '[')) && !opts.inLink) {
+      const open = c === '!' ? i + 1 : i
+      const close = next(']', open + 1)
+      if (close !== -1 && s[close + 1] === '(') {
+        // a URL may hold balanced parentheses: javascript:alert(1)
+        let end = next(')', close + 2)
+        for (let tries = 0; end !== -1 && end - close < 2048 && tries < 4; tries++) {
+          const url = s.slice(close + 2, end)
+          if (url.split('(').length <= url.split(')').length) break
+          end = next(')', end + 1)
+        }
+        if (end !== -1 && end - close < 2048) {
+          const label = s.slice(open + 1, close)
+          const href = safeHref(s.slice(close + 2, end).trim().split(/\s/)[0] ?? '')
+          if (c === '!') push({ t: 'image', href, alt: label })
+          else if (href) push({ t: 'link', href, c: mdInline(label, { ...opts, inLink: true }, depth + 1) })
+          else out.push(...(buf ? [{ t: 'text', v: buf }] : []), ...mdInline(label, { ...opts, inLink: true }, depth + 1)), (buf = '')
+          i = end + 1
+          continue
+        }
+      }
+    }
+    // <https://…>
+    if (c === '<' && !opts.inLink) {
+      const end = next('>', i + 1)
+      if (end !== -1 && end - i < 2048) {
+        const inside = s.slice(i + 1, end)
+        const href = /\s/.test(inside) ? null : safeHref(inside)
+        if (href && /^https?:\/\//i.test(inside)) { push({ t: 'link', href, c: [{ t: 'text', v: inside }] }); i = end + 1; continue }
+      }
+    }
+    // a bare URL, without trailing punctuation
+    if ((c === 'h' || c === 'H') && !opts.inLink && !isWord(s[i - 1]) && /^https?:\/\//i.test(s.slice(i, i + 8))) {
+      let end = i
+      while (end < s.length && !/[\s<>]/.test(s[end])) end++
+      while (end > i && '.,;:!?)\'"*_~'.includes(s[end - 1])) end--
+      const href = safeHref(s.slice(i, end))
+      if (href) { push({ t: 'link', href, c: [{ t: 'text', v: s.slice(i, end) }] }); i = end; continue }
+    }
+    // #123, a reference to an issue or pull request in this repository
+    if (c === '#' && repo && !opts.inLink && !isWord(s[i - 1]) && s[i - 1] !== '&' && /[0-9]/.test(s[i + 1] ?? '')) {
+      let end = i + 1
+      while (end < s.length && end - i <= 9 && /[0-9]/.test(s[end])) end++
+      if (!isWord(s[end])) {
+        const href = safeHref(`${repo.replace(/\/$/, '')}/issues/${s.slice(i + 1, end)}`)
+        if (href) { push({ t: 'link', href, c: [{ t: 'text', v: s.slice(i, end) }] }); i = end; continue }
+      }
+    }
+    // @login, a GitHub user
+    if (c === '@' && !opts.inLink && !isWord(s[i - 1]) && isWord(s[i + 1])) {
+      let end = i + 1
+      while (end < s.length && end - i <= 39 && (isWord(s[end]) || s[end] === '-')) end++
+      if (!isWord(s[end]) && s[end] !== '-' && s[end] !== '@' && s[end] !== '.' || (s[end] === '.' && !isWord(s[end + 1]))) {
+        push({ t: 'link', href: `https://github.com/${s.slice(i + 1, end)}`, c: [{ t: 'text', v: s.slice(i, end) }] })
+        i = end
+        continue
+      }
+    }
+    // **strong**, __strong__, *em*, _em_, ~~del~~
+    if (c === '*' || c === '_' || c === '~') {
+      const double = s[i + 1] === c
+      const marks = double ? [c + c, c] : [c]
+      let done = false
+      for (const mark of marks) {
+        if (mark === '~') continue // one tilde is text
+        if (c === '_' && isWord(s[i - 1])) break // snake_case
+        if (/\s/.test(s[i + mark.length] ?? ' ')) continue
+        const close = next(mark, i + mark.length + 1)
+        if (close === -1 || /\s/.test(s[close - 1])) continue
+        if (c === '_' && isWord(s[close + mark.length])) continue
+        const kind = mark === '~~' ? 'del' : mark.length === 2 ? 'strong' : 'em'
+        push({ t: kind, c: inner(s.slice(i + mark.length, close)) })
+        i = close + mark.length
+        done = true
+        break
+      }
+      if (done) continue
+      const run = double ? 2 : 1
+      buf += s.slice(i, i + run)
+      i += run
+      continue
+    }
+    buf += c
+    i++
+  }
+  if (buf) out.push({ t: 'text', v: buf })
+  return out
+}
+
+// Elements with only safe attributes: a link always opens apart.
+function el(doc, tag, attrs = {}, ...children) {
+  const e = doc.createElement(tag)
+  for (const [k, v] of Object.entries(attrs)) if (v !== null && v !== undefined) e.setAttribute(k, v)
+  for (const child of children) e.append(typeof child === 'string' ? doc.createTextNode(child) : child)
+  return e
+}
+function link(doc, href, ...children) {
+  const safe = safeHref(href)
+  if (!safe) return el(doc, 'span', {}, ...children)
+  return el(doc, 'a', { href: safe, target: '_blank', rel: 'noopener noreferrer' }, ...children)
+}
+
+function inlineNodes(nodes, doc) {
+  return nodes.map(n => {
+    if (n.t === 'text') return doc.createTextNode(n.v)
+    if (n.t === 'br') return el(doc, 'br')
+    if (n.t === 'code') return el(doc, 'code', {}, n.v)
+    if (n.t === 'link') return link(doc, n.href, ...inlineNodes(n.c, doc))
+    if (n.t === 'image') return n.href ? link(doc, n.href, `image: ${n.alt}`) : doc.createTextNode(`image: ${n.alt}`)
+    return el(doc, n.t, {}, ...inlineNodes(n.c, doc))
+  })
+}
+
+// Block nodes → a div.md. Headings sit below the pane's own: # is an h4.
+function mdRender(blocks, doc, opts = {}) {
+  const root = el(doc, 'div', { class: 'md' })
+  const inline = text => inlineNodes(mdInline(text, opts), doc)
+  const render = (list, into) => {
+    for (const b of list) {
+      if (b.t === 'h') into.append(el(doc, `h${Math.min(6, b.level + 3)}`, {}, ...inline(b.text)))
+      else if (b.t === 'p') into.append(el(doc, 'p', {}, ...inline(b.text)))
+      else if (b.t === 'pre') into.append(b.cls ? el(doc, 'pre', { class: b.cls }, b.text) : el(doc, 'pre', {}, el(doc, 'code', {}, b.text)))
+      else if (b.t === 'hr') into.append(el(doc, 'hr'))
+      else if (b.t === 'quote') { const q = el(doc, 'blockquote'); render(b.blocks, q); into.append(q) }
+      else if (b.t === 'list') {
+        const l = el(doc, b.ordered ? 'ol' : 'ul')
+        for (const item of b.items) {
+          const task = /^\[([ xX])\][ \t]/.exec(item)
+          l.append(el(doc, 'li', {}, ...(task ? [task[1] === ' ' ? '☐ ' : '☑ '] : []), ...inline(task ? item.slice(4) : item)))
+        }
+        into.append(l)
+      }
+    }
+  }
+  render(Array.isArray(blocks) ? blocks : [], root)
+  return root
+}
+
+// The pane's content for an /api/pr-context answer: the PR at a glance, then
+// its description, reviews, conversation and inline review comments, each a
+// collapsible section. Every string in it is the PR's, and untrusted.
+function renderPrContext(data, doc) {
+  const d = data && typeof data === 'object' ? data : {}
+  const s = v => (typeof v === 'string' ? v : '')
+  const opts = { repoUrl: safeHref(d.repoUrl) }
+  const root = el(doc, 'div', { class: 'ctx' })
+  const when = iso => {
+    const t = Date.parse(s(iso))
+    if (!Number.isFinite(t)) return null
+    return el(doc, 'time', { datetime: new Date(t).toISOString() }, new Date(t).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }))
+  }
+  const words = v => s(v).toLowerCase().replace(/_/g, ' ')
+  const note = text => el(doc, 'p', { class: 'ctxNote' }, text)
+  const CUT = '(cut short: open it on GitHub for the rest)'
+  const body = (text, truncated) => {
+    const out = [s(text).trim() ? mdRender(mdParse(text), doc, opts) : null, truncated ? note(CUT) : null]
+    return out.filter(Boolean)
+  }
+
+  // at a glance
+  root.append(el(doc, 'h3', { class: 'ctxTitle' }, `#${Number.isInteger(d.number) ? d.number : '?'} ${s(d.title)}`))
+  const state = d.merged ? 'merged' : d.draft ? 'draft' : words(d.state) || 'open'
+  const meta = el(doc, 'p', { class: 'ctxMeta' }, el(doc, 'span', { class: 'ctxState' }, state), ' · ', s(d.author) || 'ghost', ' · ', `${s(d.base)} ← ${s(d.head)}`)
+  root.append(meta)
+  const labels = Array.isArray(d.labels) ? d.labels.filter(l => typeof l === 'string') : []
+  if (labels.length) root.append(el(doc, 'p', { class: 'ctxLabels' }, ...labels.map(l => el(doc, 'span', { class: 'ctxLabel' }, l))))
+  if (safeHref(d.url)) root.append(el(doc, 'p', {}, link(doc, d.url, 'Open on GitHub ↗')))
+
+  const c = d.checks && typeof d.checks === 'object' ? d.checks : null
+  if (c && c.error) root.append(note(`Couldn't read the checks: ${s(c.error)}`))
+  else if (c && Number.isInteger(c.total)) {
+    const n = k => (Number.isInteger(c[k]) ? c[k] : 0)
+    const parts = [n('passed') && `${n('passed')} passed`, n('failed') && `${n('failed')} failed`, n('pending') && `${n('pending')} pending`, n('other') && `${n('other')} other`].filter(Boolean)
+    const p = el(doc, 'p', { class: 'ctxChecks' }, `Checks: ${c.total === 0 ? 'none' : parts.join(' · ')}`)
+    const failing = Array.isArray(c.failing) ? c.failing : []
+    if (failing.length) {
+      const ul = el(doc, 'ul', { class: 'ctxFailing' })
+      for (const f of failing) ul.append(el(doc, 'li', {}, link(doc, f && f.url, `${s(f && f.name)} (${words(f && f.conclusion)})`)))
+      p.append(ul)
+    }
+    root.append(p)
+  }
+  const issues = (Array.isArray(d.linkedIssues) ? d.linkedIssues : []).filter(Number.isInteger)
+  if (issues.length) {
+    const p = el(doc, 'p', { class: 'ctxIssues' }, 'Closes ')
+    issues.forEach((n, i) => {
+      if (i) p.append(', ')
+      p.append(opts.repoUrl ? link(doc, `${opts.repoUrl.replace(/\/$/, '')}/issues/${n}`, `#${n}`) : `#${n}`)
+    })
+    root.append(p)
+  }
+
+  const section = (title, ...children) => el(doc, 'details', { open: '' }, el(doc, 'summary', {}, title), ...children)
+  root.append(section('Description', ...(s(d.body).trim() ? body(d.body, d.bodyTruncated) : [note('No description.'), ...(d.bodyTruncated ? [note(CUT)] : [])])))
+
+  // a list section: its count, what it couldn't read, and its items
+  const listSection = (key, title, what, empty, item) => {
+    const list = d[key] && typeof d[key] === 'object' ? d[key] : {}
+    const items = Array.isArray(list.items) ? list.items.filter(x => x && typeof x === 'object') : []
+    const total = Number.isInteger(list.total) ? list.total : null
+    const count = total === null ? (items.length >= 100 ? `showing the first ${items.length}` : `${items.length}`)
+      : total > items.length ? `showing ${items.length} of ${total}` : `${items.length}`
+    const kids = []
+    if (list.error) kids.push(note(`Couldn't read the ${what}: ${s(list.error)}`))
+    else if (items.length === 0) kids.push(note(empty))
+    for (const it of items) kids.push(item(it))
+    root.append(section(`${title} (${count})`, ...kids))
+  }
+  const head = (it, ...extra) => {
+    const h = el(doc, 'p', { class: 'ctxWho' }, el(doc, 'strong', {}, s(it.author) || 'ghost'), ...extra)
+    const t = when(it.createdAt || it.submittedAt)
+    if (t) h.append(' · ', safeHref(it.url) ? link(doc, it.url, t) : t)
+    else if (safeHref(it.url)) h.append(' · ', link(doc, it.url, 'link ↗'))
+    return h
+  }
+  listSection('reviews', 'Reviews', 'reviews', 'No reviews.', it => el(doc, 'div', { class: 'ctxItem' },
+    head(it, ' ', el(doc, 'span', { class: `ctxVerdict ${/^[A-Z_]{1,30}$/.test(s(it.state)) ? s(it.state).toLowerCase() : ''}` }, words(it.state))),
+    ...body(it.body, it.truncated)))
+  listSection('comments', 'Conversation', 'conversation', 'No comments.', it => el(doc, 'div', { class: 'ctxItem' }, head(it), ...body(it.body, it.truncated)))
+  listSection('reviewComments', 'Inline review comments', 'inline review comments', 'No inline review comments.', it => el(doc, 'div', { class: 'ctxItem' },
+    el(doc, 'p', { class: 'ctxPath' }, el(doc, 'code', {}, `${s(it.path)}${Number.isInteger(it.line) ? `:${it.line}` : ''}`), it.outdated ? ' (outdated)' : '', it.reply ? ' · reply' : ''),
+    head(it), ...body(it.body, it.truncated)))
+  return root
+}
+// --- end PR context rendering ------------------------------------------------
+
 // The ticket an invite link carries in its fragment (#enrol=<ticket>), else
 // null. The fragment never reaches a server or a Referer.
 function inviteFromHash(hash) {
@@ -225,6 +646,8 @@ function inviteFromHash(hash) {
     $('reviewStrip').hidden = !review
     $('reviewBar').hidden = !(S.review.on && id === 'session')
     document.body.classList.toggle('review', S.review.on)
+    // the PR context pane belongs to a PR's boot and session
+    if (id !== 'boot' && id !== 'session') contextFor(null)
     const heading = { boot: 'bootHeading', session: 'sessionHeading', reviewHold: 'holdHeading' }[id]
     const h = heading ? $(heading) : document.querySelector(`#${id} h1`)
     if (h) setTimeout(() => h.focus(), 0)
@@ -682,6 +1105,7 @@ function inviteFromHash(hash) {
     showView('boot'); setPill(`booting #${pr}`)
     if (bootPr !== pr) { bootPr = pr; for (const k of Object.keys(stepAt)) delete stepAt[k]; resetBootUi() }
     $('bootPr').textContent = pr
+    contextFor(pr)
     if (state && state.buildRun) setBuildSub(state.buildRun)
     attachSse()
   }
@@ -790,6 +1214,7 @@ function inviteFromHash(hash) {
     }
     $('sessionMeta').innerHTML = meta.baseTag ? `#${pr} · <span class="tag">${esc(tagOf(meta.baseTag))}</span> vs <span class="tag">${esc(tagOf(meta.prTag))}</span>` : `#${pr}`
     $('sessionHeading').textContent = `QA session for PR ${pr}`
+    contextFor(pr)
   }
 
   function teardownSessionUi() {
@@ -993,6 +1418,115 @@ function inviteFromHash(hash) {
     return false
   }
 
+  // --- PR context pane -------------------------------------------------------
+  // A side pane beside the panes, or below 900 pixels a modal overlay, with
+  // the PR's description, comments, reviews and checks (/api/pr-context,
+  // drawn by renderPrContext, which never parses HTML). It is there while a
+  // PR boots or its session is up, closed by default: the header's button or
+  // `c` toggles it, and whether it is open lives in the tab's session storage,
+  // so the next PR of a walk opens with it as the last was left.
+  const CTX_KEY = 'qa-context'
+  const CTX_FRESH_MS = 60000 // how long a read is shown again without asking
+  let ctxMemory = false
+  const ctxStore = {
+    get() { try { const v = sessionStorage.getItem(CTX_KEY); return v === null ? ctxMemory : v === 'open' } catch { return ctxMemory } },
+    set(open) { ctxMemory = open; try { sessionStorage.setItem(CTX_KEY, open ? 'open' : 'closed') } catch { /* memory only */ } },
+  }
+  const CTX = { pr: null, open: false, cache: new Map(), loading: null, opener: null }
+  let compact = false
+
+  // The PR the pane is about, from the boot or session view; null hides the
+  // pane and its button, and leaves the stored choice alone.
+  function contextFor(pr) {
+    const changed = CTX.pr !== pr
+    CTX.pr = pr
+    $('contextBtn').hidden = pr === null
+    if (pr === null || !ctxStore.get()) return showContext(false)
+    if (changed || !CTX.open) showContext(true)
+  }
+
+  function showContext(open, { focus = false } = {}) {
+    const pane = $('prContext')
+    CTX.open = open
+    pane.hidden = !open
+    $('contextBtn').setAttribute('aria-expanded', String(open))
+    $('contextBtn').classList.toggle('on', open)
+    if (!open) return
+    $('ctxNum').textContent = `#${CTX.pr}`
+    loadContext(CTX.pr)
+    // the overlay is modal: focus goes into it
+    if (focus || compact) setTimeout(() => $('ctxHeading').focus(), 0)
+  }
+
+  function toggleContext() {
+    if (CTX.pr === null) return
+    if (!CTX.open) {
+      CTX.opener = document.activeElement
+      ctxStore.set(true); showContext(true, { focus: true })
+      return
+    }
+    closeContext()
+  }
+  function closeContext() {
+    ctxStore.set(false); showContext(false)
+    // focus back where it was, or to the button that opens the pane
+    const back = CTX.opener && CTX.opener !== document.body && CTX.opener.isConnected ? CTX.opener : $('contextBtn')
+    CTX.opener = null
+    if (back && typeof back.focus === 'function') back.focus()
+  }
+
+  async function loadContext(pr, force = false) {
+    if (pr === null) return
+    const hit = CTX.cache.get(pr)
+    if (hit && !force && Date.now() - hit.at < CTX_FRESH_MS) return drawContext(hit.data)
+    if (CTX.loading === pr) return
+    CTX.loading = pr
+    setCtxStatus('Loading…', false)
+    if (!hit) $('ctxBody').textContent = ''
+    try {
+      const data = await api(`/pr-context?pr=${encodeURIComponent(pr)}`)
+      CTX.cache.set(pr, { at: Date.now(), data })
+      if (CTX.pr === pr) drawContext(data)
+    } catch (err) {
+      if (err && err.capability) return // enrolment takes over
+      if (CTX.pr === pr) setCtxStatus(`Couldn't load the PR context: ${err.message}`, true)
+    } finally {
+      if (CTX.loading === pr) CTX.loading = null
+    }
+  }
+  function setCtxStatus(text, failed) {
+    $('ctxStatus').textContent = text; $('ctxStatus').hidden = !text
+    $('ctxRetry').hidden = !failed
+  }
+  function drawContext(data) {
+    setCtxStatus('', false)
+    const body = $('ctxBody'); body.textContent = ''
+    body.append(renderPrContext(data, document))
+  }
+
+  $('contextBtn').onclick = () => toggleContext()
+  $('ctxClose').onclick = () => closeContext()
+  $('ctxRefresh').onclick = () => loadContext(CTX.pr, true)
+  $('ctxRetry').onclick = () => loadContext(CTX.pr, true)
+  // Esc closes the pane from inside it; the overlay keeps Tab inside itself.
+  $('prContext').addEventListener('keydown', e => {
+    if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); return closeContext() }
+    if (e.key !== 'Tab' || !compact) return
+    const items = [...$('prContext').querySelectorAll('a[href], button, summary')].filter(x => !x.hidden && x.offsetParent !== null)
+    if (!items.length) return
+    const first = items[0], last = items[items.length - 1]
+    if (e.shiftKey && (document.activeElement === first || document.activeElement === $('ctxHeading'))) { e.preventDefault(); last.focus() }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
+  })
+  // Below 900 pixels the pane is an overlay, a modal dialog; above, a region.
+  function applyContextLayout(isCompact) {
+    compact = isCompact
+    const pane = $('prContext')
+    pane.setAttribute('role', compact ? 'dialog' : 'region')
+    if (compact) pane.setAttribute('aria-modal', 'true'); else pane.removeAttribute('aria-modal')
+  }
+  // --- end PR context pane ---------------------------------------------------
+
   // --- keyboard ------------------------------------------------------------
   document.addEventListener('keydown', e => {
     if ($('inviteDialog').open) return // its own keys; Escape closes it
@@ -1000,6 +1534,9 @@ function inviteFromHash(hash) {
     if (e.key === '?') { e.preventDefault(); return $('shortcuts').showModal() }
     const t = e.target
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return
+    // the PR context pane, in a boot or a session; not Cmd-C or Ctrl-C
+    if (e.key === 'c' && !e.metaKey && !e.ctrlKey && !e.altKey && !$('contextBtn').hidden) { e.preventDefault(); return toggleContext() }
+    if (e.key === 'Escape' && CTX.open && compact) return closeContext()
     if ($('session').hidden) return
     const keys = ['m', 's', 'r', '1', '2', '3', 'v', 'e', 'n']
     if (keys.includes(e.key)) e.preventDefault()
@@ -1020,7 +1557,7 @@ function inviteFromHash(hash) {
 
   // --- compact <900px ------------------------------------------------------
   const mq = window.matchMedia('(max-width: 900px)')
-  function applyCompact() { document.body.classList.toggle('compact', mq.matches); $('tabs').hidden = !mq.matches; if (mq.matches) selectTab(currentTab) }
+  function applyCompact() { document.body.classList.toggle('compact', mq.matches); $('tabs').hidden = !mq.matches; if (mq.matches) selectTab(currentTab); applyContextLayout(mq.matches) }
   let currentTab = 'base'
   $('tabs').addEventListener('click', e => { const t = e.target.closest('.tab'); if (t) selectTab(t.dataset.tab) })
   function selectTab(which) {
@@ -1061,5 +1598,5 @@ function inviteFromHash(hash) {
 // --- test exports (node --test evaluates this file through a CJS wrapper) ---
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { esc, isHttpsUrl, LABELS, harnessOriginNotice, buildSummary, buildFromEvent, inviteFromHash, isCapabilityRefusal, isolationLabel, hasVerdictLabel, reviewQueue }
+  module.exports = { esc, isHttpsUrl, LABELS, harnessOriginNotice, buildSummary, buildFromEvent, inviteFromHash, isCapabilityRefusal, isolationLabel, hasVerdictLabel, reviewQueue, safeHref, mdParse, mdRender, renderPrContext }
 }

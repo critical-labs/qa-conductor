@@ -73,7 +73,8 @@
   /* a blocked reason is a sentence: keep its case */
   .badge.blocked { color: var(--text-faint); text-transform: none; letter-spacing: 0 }
 
-  main { flex: 1; display: flex; flex-direction: column; min-height: 0 }
+  #work { flex: 1; display: flex; min-height: 0 }
+  main { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0 }
   .view[hidden] { display: none }
   #picker, #boot, #verdictDone, #enrol { max-width: 780px; width: 100%; margin: 28px auto; padding: 0 16px }
   #enrol p { color: var(--text-dim) }
@@ -169,7 +170,39 @@
   #reviewBar .switch button.on { background: var(--accent-soft); border-color: var(--accent); color: var(--text) }
   #reviewBar > button { min-height: 44px }
 
+  /* PR context: a pane beside the panes; below 900px an overlay */
+  #prContext { flex: none; width: 400px; max-width: 45vw; display: flex; flex-direction: column; min-height: 0; background: var(--surface); border-left: 1px solid var(--line) }
+  .ctxBar { display: flex; align-items: center; gap: 4px; padding: 4px 6px 4px 14px; border-bottom: 1px solid var(--line) }
+  .ctxBar h2 { margin: 0; font-size: 14px; display: flex; gap: 6px; align-items: baseline }
+  .ctxBar h2:focus { outline: none }
+  .ctxBar .tag { font: var(--mono); color: var(--text-faint) }
+  .ctxScroll { flex: 1; overflow: auto; padding: 10px 14px 24px; overflow-wrap: anywhere }
+  #ctxStatus { color: var(--text-dim); margin: 0 0 8px }
+  .ctx h3.ctxTitle { font-size: 15px; margin: 0 0 4px }
+  .ctx p { margin: 6px 0 }
+  .ctxMeta, .ctxNote, .ctxWho, .ctxPath, .ctxIssues, .ctxChecks { color: var(--text-dim); font-size: 12px }
+  .ctxState { text-transform: uppercase; font: var(--mono); color: var(--text) }
+  .ctxLabels { display: flex; flex-wrap: wrap; gap: 4px }
+  .ctxLabel { font: var(--mono); border: 1px solid var(--line-strong); border-radius: 999px; padding: 0 8px; color: var(--text-dim) }
+  .ctxFailing { margin: 4px 0 0; padding-left: 18px }
+  .ctxVerdict { font: var(--mono); text-transform: uppercase }
+  .ctxVerdict.approved { color: var(--accent-hover) } .ctxVerdict.changes_requested { color: var(--danger) }
+  .ctx details { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 6px }
+  .ctx summary { cursor: pointer; font-weight: 600; padding: 2px 0 }
+  .ctxItem { border-left: 2px solid var(--line); padding: 2px 0 2px 10px; margin: 10px 0 }
+  .ctx a, .md a { color: var(--accent-hover) }
+  .md { font-size: 13px }
+  .md h4, .md h5, .md h6 { font-size: 13px; margin: 10px 0 4px }
+  .md pre { background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-small); padding: 8px; overflow: auto; white-space: pre; font: var(--mono) }
+  .md code { font: var(--mono); background: var(--surface-2); border-radius: var(--radius-small); padding: 0 3px }
+  .md pre code { background: none; padding: 0 }
+  .md blockquote { margin: 6px 0; padding-left: 10px; border-left: 3px solid var(--line-strong); color: var(--text-dim) }
+  .md ul, .md ol { padding-left: 20px; margin: 6px 0 }
+  .md hr { border: 0; border-top: 1px solid var(--line) }
+
   /* compact <900px */
+  body.compact #prContext { position: fixed; inset: 0; width: auto; max-width: none; z-index: 30; border-left: 0; box-shadow: var(--shadow) }
+  body.compact .ctxBar button { min-width: 44px; min-height: 44px }
   body.compact #tabs { display: flex }
   body.compact.review #tabs { display: none !important }
   body.compact.review #reviewBar { display: flex }
@@ -209,6 +242,7 @@
     <span id="idleChip" class="chip" title="Auto-end when idle">auto-end —</span>
     <button id="teardownBtn" class="danger-ghost" title="End session (e)">End session</button>
   </div>
+  <button id="contextBtn" class="ghost toggle" aria-controls="prContext" aria-expanded="false" title="The pull request's description, comments, reviews and checks (c)" hidden>PR context</button>
   <button id="inviteBtn" class="ghost" title="A link that enrols another browser" hidden>Invite</button>
 </header>
 <p id="originNotice" role="alert" hidden></p>
@@ -230,6 +264,7 @@
 <div id="announcer" class="sr" role="status" aria-live="polite"></div>
 <div id="announcerAssertive" class="sr" role="alert" aria-live="assertive"></div>
 
+<div id="work">
 <main>
   <section id="enrol" class="view" hidden>
     <h1 tabindex="-1">This browser isn't enrolled</h1>
@@ -330,6 +365,23 @@
   </section>
 </main>
 
+<!-- The PR's own words, from GitHub: rendered as text with a safe subset of
+     Markdown (harness.js renderPrContext), never as HTML. -->
+<section id="prContext" role="region" aria-labelledby="ctxHeading" hidden>
+  <div class="ctxBar">
+    <h2 id="ctxHeading" tabindex="-1">PR context <span id="ctxNum" class="tag"></span></h2>
+    <span class="spacer"></span>
+    <button id="ctxRefresh" class="ghost" title="Read it from GitHub again" aria-label="Reload the PR context">↻</button>
+    <button id="ctxClose" class="ghost" title="Close (c or Esc)" aria-label="Close the PR context">✕</button>
+  </div>
+  <div class="ctxScroll">
+    <p id="ctxStatus" role="status" hidden></p>
+    <button id="ctxRetry" class="secondary" hidden>Try again</button>
+    <div id="ctxBody"></div>
+  </div>
+</section>
+</div>
+
 <footer id="verdictBar" hidden>
   <button id="verdictToggle" aria-expanded="false">Verdict ▔</button>
   <div id="verdictBody" hidden>
@@ -369,8 +421,9 @@
     <kbd>v</kbd><span>Toggle verdict drawer</span>
     <kbd>e</kbd><span>End session (starts confirm)</span>
     <kbd>n</kbd><span>Skip to the next pull request (Change Review; starts confirm)</span>
+    <kbd>c</kbd><span>PR context: the description, comments, reviews and checks</span>
     <kbd>?</kbd><span>This overlay</span>
-    <kbd>Esc</kbd><span>Close drawer / overlay / cancel confirm</span>
+    <kbd>Esc</kbd><span>Close drawer / overlay / PR context / cancel confirm</span>
   </div>
   <p class="stepSub" style="margin-top:14px">Shortcuts work when the harness chrome has focus. Click outside a pane to return focus from an iframe.</p>
   <button id="shortcutsClose" class="secondary" style="margin-top:8px">Close</button>
