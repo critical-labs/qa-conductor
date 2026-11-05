@@ -421,6 +421,42 @@ test('demo github: PR fields, trust data, and in-memory comments and labels', as
   assert.ok(lines.some(l => l.includes('comment on #101')))
 })
 
+// The harness's PR context pane, in the demo: a description, reviews,
+// comments and checks for each fixture, a verdict the demo posted in the
+// conversation, and on #105 a comment built to attack the pane, which shows
+// as text. Every link stays on the reserved .invalid TLD.
+test('demo github: each PR has a context for the PR context pane, and a posted verdict joins its conversation', async () => {
+  const gh = createDemoGithub({ log: captureLog().log })
+  for (const { number, title } of DEMO_PRS) {
+    const ctx = await gh.prContext(number)
+    assert.equal(ctx.number, number)
+    assert.equal(ctx.title, title)
+    for (const key of ['url', 'repoUrl', 'author', 'labels', 'base', 'head', 'headSha', 'body', 'linkedIssues', 'comments', 'reviews', 'reviewComments', 'checks']) assert.ok(key in ctx, `${number} ${key}`)
+    for (const list of [ctx.comments, ctx.reviews, ctx.reviewComments]) assert.ok(Array.isArray(list.items) && 'total' in list && 'error' in list)
+    assert.doesNotMatch(JSON.stringify(ctx), /https?:\/\/(?![a-z0-9.-]*example\.invalid\/)/i, 'only .invalid links')
+  }
+  const rich = await gh.prContext(101)
+  assert.ok(rich.body.length > 200 && rich.reviews.items.length > 0 && rich.reviewComments.items.length > 0 && rich.comments.items.length > 0)
+  assert.match((await gh.prContext(105)).comments.items.map(c => c.body).join('\n'), /<img src=x onerror=/)
+  await assert.rejects(() => gh.prContext(999), /404/)
+  const before = (await gh.prContext(102)).comments.items.length
+  await gh.postComment(102, 'QA: accepted')
+  const after = (await gh.prContext(102)).comments
+  assert.equal(after.items.length, before + 1)
+  assert.equal(after.items.at(-1).body, 'QA: accepted')
+  assert.equal(after.total, after.items.length)
+})
+
+test('the demo harness answers /api/pr-context from its fake GitHub', async () => {
+  const demo = await startDemo({ port: 0, speed: 0, log: captureLog().log })
+  try {
+    const { status, body } = await api(demo.ports.harness, 'GET', '/api/pr-context?pr=101')
+    assert.equal(status, 200)
+    assert.equal(body.number, 101)
+    assert.equal((await api(demo.ports.harness, 'GET', '/api/pr-context?pr=999')).status, 502)
+  } finally { await demo.stop() }
+})
+
 test('demo build: progress messages, labels, readiness, the trust block and abort', async () => {
   const build = createDemoBuild({ pause: makePause({ speed: 0 }) })
   const messages = []
