@@ -4,6 +4,12 @@ What changed in each release, newest first. A 0.x minor version may break the in
 
 ## [Unreleased]
 
+### PR context
+
+- **The harness shows a pull request's context beside the panes.** While a PR boots or its session is up, **PR context** (`c`, or the header's button) opens a side pane, an overlay below 900 pixels, with the PR's title, author, state, base and head, labels, checks, the issues it closes, its description, reviews, conversation and inline review comments with their file and line, and a link to it on GitHub. It is closed by default, and whether it is open is kept in the tab's session storage, so a Change Review walk opens each PR as the last was left. A read GitHub refuses shows its error in the pane and touches nothing else. README's [Using the harness](README.md#using-the-harness) has the details.
+  - **Security:** the PR's text is never parsed as HTML. The pane is built from DOM nodes with a safe subset of Markdown; links only for http(s) URLs, opened with `noopener noreferrer`; images never loaded, only linked. README's [Security](README.md#security) says why.
+  - **New:** `GET /api/pr-context?pr=N`; `createGithub`'s `prContext(num)`, with the options `contextTtlMs` and `now`. A `github` of your own without `prContext` still works: the route answers `501` and the pane says so. Its checks need Checks: read on the token; without it the pane shows the rest.
+
 ## [0.6.0] — 2026-11-05
 
 Change Review walks only the pull requests worth a review, and never starts a build for the rest. Additive: a BuildConvention without `eligible` behaves as before. One new field may show in a consumer's tests: [Migrating from 0.5.1](#migrating-from-051).
