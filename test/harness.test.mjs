@@ -1279,6 +1279,9 @@ test('the pane is a labelled region beside the panes, and a modal dialog that Es
   // the overlay form: the compact media query flips the role
   assert.match(harnessSrc, /pane\.setAttribute\('role', compact \? 'dialog' : 'region'\)/)
   assert.match(harnessSrc, /if \(compact\) pane\.setAttribute\('aria-modal', 'true'\); else pane\.removeAttribute\('aria-modal'\)/)
+  // behind the overlay, the page is inert, so a screen reader's cursor stays in the dialog
+  assert.match(harnessSrc, /\$\('main'\)\.inert = compact && CTX\.open/)
+  for (const id of ['main', 'appHeader', 'verdictBar', 'reviewStrip']) assert.match(html, new RegExp(`id="${id}"`), id)
 
   const b = fakeBrowser({ hash: '#/pr/7', stored: 'tok', session: new Map([['qa-context', 'open']]), elements: { ...DIALOGS }, routes: readySession({ 'GET /qa/api/pr-context': { body: CONTEXT_ANSWER } }) })
   await b.settle()

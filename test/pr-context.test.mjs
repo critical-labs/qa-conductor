@@ -94,7 +94,9 @@ test('safeHref: only absolute http(s) URLs, normalized; nothing else', () => {
   for (const bad of [
     'javascript:alert(1)', 'JaVaScRiPt:alert(1)', ' javascript:alert(1)', 'java\tscript:alert(1)', 'java\nscript:alert(1)',
     '\u0000javascript:alert(1)', 'data:text/html,<script>alert(1)</script>', 'vbscript:msgbox(1)', 'file:///etc/passwd',
-    '//evil.example/x', '/relative', 'docs/x.md', '#frag', 'mailto:a@b.example', 'https:', '', null, undefined, 42, {},
+    '//evil.example/x', '/relative',
+    // userinfo: reads like github.com, goes to evil.example
+    'https://github.com@evil.example/x', 'https://user:pass@example.com/', 'https://:x@example.com/', 'docs/x.md', '#frag', 'mailto:a@b.example', 'https:', '', null, undefined, 42, {},
   ]) assert.equal(safeHref(bad), null, JSON.stringify(bad))
 })
 
@@ -148,6 +150,26 @@ test('Markdown: an image is never loaded, only linked, and an unsafe one is text
   assert.deepEqual(links, [['https://evil.example/p.png?u=reviewer', 'image: a tracking pixel'], ['https://evil.example/q.png', 'https://evil.example/q.png']])
   assert.match(out, /image: x and/)
   assert.match(out, /&lt;img src="<a [^>]+>https:\/\/evil\.example\/q\.png<\/a>"&gt;/)
+})
+
+test('a link\'s title names where it really goes, and bidi controls never reach the page', () => {
+  const { root } = md('[github.com](https://xn--gthub-n2e.com/x) and https://g\u0456thub.com/y and [ok](https://example.com/a\u202Eb)')
+  assertSafe(root)
+  const links = []
+  walk(root, n => { if (n.tag === 'a') links.push([n.attrs.href, n.attrs.title]) })
+  assert.deepEqual(links, [
+    ['https://xn--gthub-n2e.com/x', 'https://xn--gthub-n2e.com/x'],
+    ['https://xn--gthub-n2e.com/y', 'https://xn--gthub-n2e.com/y'],
+    // the control is gone from the body before any URL is read
+    ['https://example.com/ab', 'https://example.com/ab'],
+  ])
+  const bidi = /[\u202A-\u202E\u2066-\u2069]/
+  for (const body of ['abc\u202Edcba', '[x\u2067y](https://example.com)', '`a\u202Eb`', '# h\u202Ei', '```\nx\u202Dy\n```']) {
+    assert.doesNotMatch(md(body).html, bidi, JSON.stringify(body))
+  }
+  const ctx = renderPrContext({ title: 't\u202Eitle', author: 'a\u2066b', labels: ['l\u202Eb'], base: 'm\u202Ea', head: 'h\u2069', comments: { items: [], total: 0 }, reviewComments: { items: [{ author: 'x', path: 'src/\u202Egpj.exe', line: 1, body: 'b' }], total: 1 } }, fakeDoc())
+  assert.doesNotMatch(html(ctx), bidi)
+  assert.match(html(ctx), /src\/gpj\.exe/)
 })
 
 const HOSTILE = [
@@ -205,7 +227,11 @@ test('the renderer stays fast on inputs built to make a parser backtrack', () =>
     '['.repeat(n), '*'.repeat(n), '_'.repeat(n), '~'.repeat(n), '`'.repeat(n), '<'.repeat(n), '<!--'.repeat(n / 4),
     '[a]('.repeat(n / 4), '**a'.repeat(n / 3), '# '.repeat(n / 2), '- '.repeat(n / 2), '> '.repeat(n / 2), ' '.repeat(n) + 'x',
     '`a'.repeat(n / 2), 'https://'.repeat(n / 8), '#'.repeat(n) + ' x', '-'.repeat(n), '- - - '.repeat(n / 6) + 'x',
-    '```\n'.repeat(n / 4), Array.from({ length: n / 10 }, (_, i) => '`'.repeat((i % 40) + 1) + 'x').join(' '),
+    '```\n'.repeat(n / 4),
+    // bare-URL candidates the URL parser refuses, back to back: each must be
+    // consumed once, not scanned again from every h
+    'http://['.repeat(n / 8), 'https://['.repeat(n / 9), 'http://%'.repeat(n / 8), 'hhttp://['.repeat(n / 9),
+    Array.from({ length: n / 10 }, (_, i) => '`'.repeat((i % 40) + 1) + 'x').join(' '),
   ]) {
     const started = process.hrtime.bigint()
     const { root } = md(body, { repoUrl: 'https://github.com/acme/widget' })

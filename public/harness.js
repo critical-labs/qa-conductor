@@ -137,8 +137,16 @@ function safeHref(raw) {
   if (typeof raw !== 'string') return null
   let u
   try { u = new URL(raw.trim()) } catch { return null }
-  return u.protocol === 'https:' || u.protocol === 'http:' ? u.href : null
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return null
+  // https://github.com@evil.example/ reads like GitHub and goes elsewhere
+  if (u.username || u.password) return null
+  return u.href
 }
+
+// Bidirectional controls (U+202A–202E, U+2066–2069) reorder what is shown, so
+// src/\u202Egpj.exe reads as src/exe.jpg: the pane never shows them.
+const BIDI = /[\u202A-\u202E\u2066-\u2069]/g
+const unbidi = s => String(s).replace(BIDI, '')
 
 const MD_MAX = 200000 // characters of one body the parser looks at
 const MD_DEPTH = 3 // nested quotes, and nested emphasis, beyond which it's text
@@ -212,7 +220,7 @@ const fenceOf = line => { const n = leadRun(line, '`') >= 3 ? leadRun(line, '`')
 // {t:'pre', text, cls?} {t:'list', ordered, items:[text]} {t:'quote', blocks}
 // {t:'hr'}. Inline text is parsed when rendered.
 function mdParse(src, depth = 0) {
-  const text = depth === 0 ? stripComments(String(src ?? '').slice(0, MD_MAX).replace(/\r\n?/g, '\n')) : String(src)
+  const text = depth === 0 ? stripComments(unbidi(String(src ?? '').slice(0, MD_MAX)).replace(/\r\n?/g, '\n')) : String(src)
   const lines = text.split('\n')
   const blocks = []
   let para = []
@@ -350,6 +358,10 @@ function mdInline(s, opts = {}, depth = 0) {
       while (end > i && '.,;:!?)\'"*_~'.includes(s[end - 1])) end--
       const href = safeHref(s.slice(i, end))
       if (href) { push({ t: 'link', href, c: [{ t: 'text', v: s.slice(i, end) }] }); i = end; continue }
+      // refused: the run it scanned is text, so no later h in it scans again
+      const to = Math.max(end, i + 1)
+      buf += s.slice(i, to); i = to
+      continue
     }
     // #123, a reference to an issue or pull request in this repository
     if (c === '#' && repo && !opts.inLink && !isWord(s[i - 1]) && s[i - 1] !== '&' && /[0-9]/.test(s[i + 1] ?? '')) {
@@ -405,18 +417,19 @@ function mdInline(s, opts = {}, depth = 0) {
 function el(doc, tag, attrs = {}, ...children) {
   const e = doc.createElement(tag)
   for (const [k, v] of Object.entries(attrs)) if (v !== null && v !== undefined) e.setAttribute(k, v)
-  for (const child of children) e.append(typeof child === 'string' ? doc.createTextNode(child) : child)
+  for (const child of children) e.append(typeof child === 'string' ? doc.createTextNode(unbidi(child)) : child)
   return e
 }
 function link(doc, href, ...children) {
   const safe = safeHref(href)
   if (!safe) return el(doc, 'span', {}, ...children)
-  return el(doc, 'a', { href: safe, target: '_blank', rel: 'noopener noreferrer' }, ...children)
+  // the title names where it really goes: a look-alike host shows punycode
+  return el(doc, 'a', { href: safe, title: safe, target: '_blank', rel: 'noopener noreferrer' }, ...children)
 }
 
 function inlineNodes(nodes, doc) {
   return nodes.map(n => {
-    if (n.t === 'text') return doc.createTextNode(n.v)
+    if (n.t === 'text') return doc.createTextNode(unbidi(n.v))
     if (n.t === 'br') return el(doc, 'br')
     if (n.t === 'code') return el(doc, 'code', {}, n.v)
     if (n.t === 'link') return link(doc, n.href, ...inlineNodes(n.c, doc))
@@ -1451,6 +1464,7 @@ function inviteFromHash(hash) {
     pane.hidden = !open
     $('contextBtn').setAttribute('aria-expanded', String(open))
     $('contextBtn').classList.toggle('on', open)
+    syncInert()
     if (!open) return
     $('ctxNum').textContent = `#${CTX.pr}`
     loadContext(CTX.pr)
@@ -1524,6 +1538,13 @@ function inviteFromHash(hash) {
     const pane = $('prContext')
     pane.setAttribute('role', compact ? 'dialog' : 'region')
     if (compact) pane.setAttribute('aria-modal', 'true'); else pane.removeAttribute('aria-modal')
+    syncInert()
+  }
+  // Behind the overlay the page is inert, so neither Tab nor a screen
+  // reader's cursor leaves the dialog.
+  function syncInert() {
+    $('main').inert = compact && CTX.open
+    for (const id of ['appHeader', 'reviewStrip', 'verdictBar']) $(id).inert = compact && CTX.open
   }
   // --- end PR context pane ---------------------------------------------------
 
