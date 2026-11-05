@@ -4,6 +4,11 @@ What changed in each release, newest first. A 0.x minor version may break the in
 
 ## [Unreleased]
 
+### Review eligibility
+
+- **Change Review walks only the PRs worth a review, and never builds the rest.** The BuildConvention's new optional `eligible(pr) → {review, reason?}` says whether a PR is worth a visual QA pass: a consumer can leave out drafts, docs-only changes or a `chore:` title, say. The core asks it once per PR on each read of the open-PR list, with the `listOpenPrs()` item. A PR with `review: false` is left out of the queue and counted apart from those that can't boot (`N not for review` in the strip and on **Queue clear**), and `/api/prebuild` refuses it (`started: false, reason: "not for review: <reason>"`) without calling `prebuild`. It stays in the picker, marked `not for review: <reason>`, so a person can still open it. An `eligible` that throws is logged and the PR counts as for review. Additive: a BuildConvention without `eligible` behaves as before.
+  - **New fields:** `listOpenPrs()` items carry `isDraft`; with `eligible`, `/api/prs` items carry `review` and `skipReason`. A consumer test that compares a `listOpenPrs()` item whole must add `isDraft`; a `github` of your own that lacks it still works.
+
 ## [0.5.1] — 2026-11-04
 
 Change Review warms the next pull request's build. Additive: a BuildConvention without `prebuild` behaves as before.
